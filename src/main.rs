@@ -3,6 +3,8 @@
 mod net;
 mod ppt;
 mod render;
+#[cfg(windows)]
+mod mpv;
 mod video;
 
 use std::collections::{HashMap, HashSet};

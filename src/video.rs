@@ -1,5 +1,6 @@
-//! Встроенный видеопроигрыватель на Windows Media Foundation (MFPlay) — входит в Windows,
-//! ничего докладывать не нужно.
+//! Встроенный видеопроигрыватель. Основной движок — libmpv (FFmpeg внутри, играет практически
+//! любые форматы, вшит в exe, см. `mpv.rs`); если он недоступен — Windows Media Foundation (MFPlay),
+//! который есть в самой Windows. Ничего докладывать не нужно.
 //!
 //! Видео играет в собственном окне на весь экран. При открытии окно лежит под сценой с фоном,
 //! а видео загружено и стоит на паузе — поэтому по команде «старт» оно начинается сразу:
@@ -88,6 +89,7 @@ impl Drop for Video {
 #[cfg(windows)]
 mod win {
     use super::{VCmd, VideoEvent};
+    use crate::mpv;
     use std::path::Path;
     use std::sync::mpsc::{Receiver, Sender};
     use windows::core::{w, HSTRING, PCWSTR, PROPVARIANT};
@@ -99,9 +101,185 @@ mod win {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    const TICK_MS: u32 = 200;
+    const TICK_MS: u32 = 100;
     /// Сколько ждать загрузки файла, прежде чем сообщить об ошибке.
-    const OPEN_TIMEOUT_TICKS: u32 = 15_000 / TICK_MS;
+    const OPEN_TIMEOUT_TICKS: u32 = 20_000 / TICK_MS;
+
+    /// Что движок сообщает на очередном такте.
+    #[derive(Default)]
+    struct Tick {
+        /// Файл загружен, первый кадр готов; длительность.
+        ready: Option<f64>,
+        pos: f64,
+        dur: f64,
+        playing: bool,
+        /// Воспроизведение дошло до конца.
+        eof: bool,
+        error: Option<String>,
+    }
+
+    /// Движок воспроизведения: libmpv или MFPlay.
+    trait Engine {
+        fn tick(&mut self) -> Tick;
+        fn play(&mut self);
+        fn toggle(&mut self);
+        fn seek(&mut self, secs: f64, relative: bool);
+    }
+
+    // ------------------------------------------------------------ libmpv
+
+    struct MpvEngine {
+        mpv: mpv::Mpv,
+        ready: bool,
+    }
+
+    impl MpvEngine {
+        fn new(hwnd: HWND, src: &Path) -> Result<MpvEngine, String> {
+            let wid = (hwnd.0 as isize).to_string();
+            let mpv = mpv::Mpv::new(&[
+                ("wid", &wid),
+                ("pause", "yes"),     // загружаем и ждём команды «старт»
+                ("keep-open", "yes"), // в конце остаёмся на последнем кадре, закрываем сами
+                ("hwdec", "auto-safe"),
+                ("osc", "no"),
+                ("osd-level", "0"),
+                ("input-default-bindings", "no"),
+                ("input-vo-keyboard", "no"),
+                ("input-cursor", "no"),
+                ("cursor-autohide", "always"),
+                ("audio-display", "no"),
+                ("force-window", "yes"),
+                ("terminal", "no"),
+            ])?;
+            mpv.command(&["loadfile", &src.to_string_lossy()])?;
+            Ok(MpvEngine { mpv, ready: false })
+        }
+    }
+
+    impl Engine for MpvEngine {
+        fn tick(&mut self) -> Tick {
+            let mut t = Tick::default();
+            for (id, _, end) in self.mpv.events() {
+                match id {
+                    mpv::EVENT_PLAYBACK_RESTART if !self.ready => {
+                        self.ready = true;
+                        t.ready = Some(self.mpv.get_f64("duration").unwrap_or(0.0));
+                    }
+                    mpv::EVENT_END_FILE => {
+                        if let Some((mpv::END_FILE_REASON_ERROR, code)) = end {
+                            t.error = Some(format!("не удалось открыть видео: {}", self.mpv.error(code)));
+                        }
+                    }
+                    mpv::EVENT_SHUTDOWN => t.error = Some("проигрыватель завершился".into()),
+                    _ => {}
+                }
+            }
+            if self.ready {
+                t.pos = self.mpv.get_f64("time-pos").unwrap_or(0.0);
+                t.dur = self.mpv.get_f64("duration").unwrap_or(0.0);
+                t.playing = self.mpv.get_flag("pause") == Some(false);
+                t.eof = self.mpv.get_flag("eof-reached") == Some(true);
+            }
+            t
+        }
+
+        fn play(&mut self) {
+            let _ = self.mpv.set("pause", "no");
+        }
+
+        fn toggle(&mut self) {
+            let _ = self.mpv.command(&["cycle", "pause"]);
+        }
+
+        fn seek(&mut self, secs: f64, relative: bool) {
+            let _ = self.mpv.command(&["seek", &format!("{secs:.3}"), if relative { "relative" } else { "absolute" }]);
+        }
+    }
+
+    // ------------------------------------------------------------ MFPlay (запасной)
+
+    struct MfEngine {
+        player: IMFPMediaPlayer,
+        ready: bool,
+        started: bool,
+    }
+
+    fn secs(p: windows::core::Result<PROPVARIANT>) -> f64 {
+        p.ok().and_then(|v| i64::try_from(&v).ok()).map_or(0.0, |t| t as f64 / 1e7)
+    }
+
+    impl MfEngine {
+        unsafe fn new(hwnd: HWND, src: &Path) -> windows::core::Result<MfEngine> {
+            let mut player: Option<IMFPMediaPlayer> = None;
+            MFPCreateMediaPlayer(PCWSTR::null(), BOOL::from(false), MFP_OPTION_NONE, None, hwnd, Some(&mut player))?;
+            let player = player.ok_or_else(windows::core::Error::empty)?;
+            let mut item: Option<IMFPMediaItem> = None;
+            player.CreateMediaItemFromURL(&HSTRING::from(src.as_os_str()), BOOL::from(true), 0, Some(&mut item))?;
+            player.SetMediaItem(&item.ok_or_else(windows::core::Error::empty)?)?;
+            Ok(MfEngine { player, ready: false, started: false })
+        }
+    }
+
+    impl Drop for MfEngine {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self.player.Shutdown();
+            }
+        }
+    }
+
+    impl Engine for MfEngine {
+        fn tick(&mut self) -> Tick {
+            let mut t = Tick::default();
+            unsafe {
+                let state = self.player.GetState().unwrap_or(MFP_MEDIAPLAYER_STATE_EMPTY);
+                let dur = secs(self.player.GetDuration(&MFP_POSITIONTYPE_100NS));
+                if !self.ready {
+                    if state == MFP_MEDIAPLAYER_STATE_STOPPED {
+                        // Файл открыт. Пауза выводит первый кадр и готовит воспроизведение.
+                        let _ = self.player.Pause();
+                        self.ready = true;
+                        t.ready = Some(dur);
+                    }
+                    return t;
+                }
+                t.pos = secs(self.player.GetPosition(&MFP_POSITIONTYPE_100NS));
+                t.dur = dur;
+                t.playing = state == MFP_MEDIAPLAYER_STATE_PLAYING;
+                // В конце файла MFPlay сам переходит в «остановлено».
+                t.eof = self.started && state == MFP_MEDIAPLAYER_STATE_STOPPED;
+            }
+            t
+        }
+
+        fn play(&mut self) {
+            self.started = true;
+            unsafe {
+                let _ = self.player.Play();
+            }
+        }
+
+        fn toggle(&mut self) {
+            unsafe {
+                if self.player.GetState().ok() == Some(MFP_MEDIAPLAYER_STATE_PLAYING) {
+                    let _ = self.player.Pause();
+                } else {
+                    let _ = self.player.Play();
+                }
+            }
+        }
+
+        fn seek(&mut self, d: f64, relative: bool) {
+            unsafe {
+                let dur = secs(self.player.GetDuration(&MFP_POSITIONTYPE_100NS));
+                let base = if relative { secs(self.player.GetPosition(&MFP_POSITIONTYPE_100NS)) } else { 0.0 };
+                let to = (base + d).clamp(0.0, (dur - 0.5).max(0.0));
+                let _ = self.player.SetPosition(&MFP_POSITIONTYPE_100NS, &PROPVARIANT::from((to * 1e7) as i64));
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ окно и цикл
 
     pub fn wake(thread: u32) {
         unsafe {
@@ -138,24 +316,7 @@ mod win {
         } else {
             (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
         };
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            class,
-            w!("Presentator — видео"),
-            WS_POPUP,
-            x,
-            y,
-            cx,
-            cy,
-            None,
-            None,
-            hinst,
-            None,
-        )
-    }
-
-    fn secs(p: windows::core::Result<PROPVARIANT>) -> f64 {
-        p.ok().and_then(|v| i64::try_from(&v).ok()).map_or(0.0, |t| t as f64 / 1e7)
+        CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class, w!("Presentator — видео"), WS_POPUP, x, y, cx, cy, None, None, hinst, None)
     }
 
     pub fn run(src: &Path, windowed: bool, rx: Receiver<VCmd>, id_tx: Sender<u32>, on_event: impl Fn(VideoEvent)) {
@@ -165,36 +326,31 @@ mod win {
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
             let _ = id_tx.send(GetCurrentThreadId());
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            if let Err(e) = play_loop(src, windowed, &rx, &on_event) {
-                on_event(VideoEvent::Error(e.message().to_string()));
+            match create_window(windowed) {
+                Ok(hwnd) => {
+                    // Окно видно, но лежит под сценой (она поверх всех окон): в него уже выводится первый кадр.
+                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    let engine: Result<Box<dyn Engine>, String> = match MpvEngine::new(hwnd, src) {
+                        Ok(e) => Ok(Box::new(e)),
+                        // libmpv недоступен — играем движком Windows.
+                        Err(mpv_err) => MfEngine::new(hwnd, src)
+                            .map(|e| Box::new(e) as Box<dyn Engine>)
+                            .map_err(|e| format!("{mpv_err}; Media Foundation: {}", e.message())),
+                    };
+                    match engine {
+                        Ok(mut e) => event_loop(e.as_mut(), hwnd, &rx, &on_event),
+                        Err(e) => on_event(VideoEvent::Error(e)),
+                    }
+                    let _ = DestroyWindow(hwnd);
+                }
+                Err(e) => on_event(VideoEvent::Error(e.message().to_string())),
             }
             CoUninitialize();
         }
     }
 
-    unsafe fn play_loop(src: &Path, windowed: bool, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) -> windows::core::Result<()> {
-        let hwnd = create_window(windowed)?;
-        // Окно видно, но лежит под сценой (она поверх всех окон): в него уже выводится первый кадр.
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        let result = (|| {
-            let mut player: Option<IMFPMediaPlayer> = None;
-            MFPCreateMediaPlayer(PCWSTR::null(), BOOL::from(false), MFP_OPTION_NONE, None, hwnd, Some(&mut player))?;
-            let player = player.ok_or_else(windows::core::Error::empty)?;
-            let mut item: Option<IMFPMediaItem> = None;
-            player.CreateMediaItemFromURL(&HSTRING::from(src.as_os_str()), BOOL::from(true), 0, Some(&mut item))?;
-            let item = item.ok_or_else(windows::core::Error::empty)?;
-            player.SetMediaItem(&item)?;
-            let r = event_loop(&player, hwnd, rx, on_event);
-            let _ = player.Shutdown();
-            r
-        })();
-        let _ = DestroyWindow(hwnd);
-        result
-    }
-
-    unsafe fn event_loop(player: &IMFPMediaPlayer, hwnd: HWND, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) -> windows::core::Result<()> {
+    unsafe fn event_loop(engine: &mut dyn Engine, hwnd: HWND, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
         let timer = SetTimer(None, 0, TICK_MS, None);
-        let pos_type = &MFP_POSITIONTYPE_100NS;
         let (mut ready, mut started, mut ended) = (false, false, false);
         let mut ticks = 0u32;
         let mut msg = MSG::default();
@@ -207,39 +363,30 @@ mod win {
                             started = true;
                             // Поверх сцены, не отнимая фокус, — и сразу воспроизведение.
                             let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                            let _ = player.Play();
+                            engine.play();
                         }
-                        VCmd::Start => {}
-                        VCmd::Toggle if started => {
-                            if player.GetState().ok() == Some(MFP_MEDIAPLAYER_STATE_PLAYING) {
-                                let _ = player.Pause();
-                            } else {
-                                let _ = player.Play();
-                            }
-                        }
-                        VCmd::Toggle => {}
-                        VCmd::Seek(d) | VCmd::SeekTo(d) if ready => {
-                            let dur = secs(player.GetDuration(pos_type));
-                            let base = if matches!(c, VCmd::Seek(_)) { secs(player.GetPosition(pos_type)) } else { 0.0 };
-                            let to = (base + d).clamp(0.0, (dur - 0.5).max(0.0));
-                            let _ = player.SetPosition(pos_type, &PROPVARIANT::from((to * 1e7) as i64));
-                        }
-                        VCmd::Seek(_) | VCmd::SeekTo(_) => {}
+                        VCmd::Toggle if started => engine.toggle(),
+                        VCmd::Seek(d) if ready => engine.seek(d, true),
+                        VCmd::SeekTo(d) if ready => engine.seek(d, false),
+                        _ => {}
                     }
                 }
                 continue;
             }
             if msg.hwnd.is_invalid() && msg.message == WM_TIMER && msg.wParam.0 == timer {
                 ticks += 1;
-                let state = player.GetState().unwrap_or(MFP_MEDIAPLAYER_STATE_EMPTY);
+                let t = engine.tick();
+                if let Some(e) = t.error {
+                    on_event(VideoEvent::Error(e));
+                    break;
+                }
+                if let Some(dur) = t.ready {
+                    ready = true;
+                    on_event(VideoEvent::Ready(dur));
+                }
                 if !ready {
-                    if state == MFP_MEDIAPLAYER_STATE_STOPPED {
-                        // Файл открыт. Пауза выводит первый кадр и готовит воспроизведение.
-                        let _ = player.Pause();
-                        ready = true;
-                        on_event(VideoEvent::Ready(secs(player.GetDuration(pos_type))));
-                    } else if ticks > OPEN_TIMEOUT_TICKS {
-                        on_event(VideoEvent::Error("не удалось открыть видео (формат не поддерживается?)".into()));
+                    if ticks > OPEN_TIMEOUT_TICKS {
+                        on_event(VideoEvent::Error("не удалось открыть видео".into()));
                         break;
                     }
                     continue;
@@ -248,11 +395,8 @@ mod win {
                     // Сцену могли поднять наверх — держим видео поверх неё.
                     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
-                let (pos, dur) = (secs(player.GetPosition(pos_type)), secs(player.GetDuration(pos_type)));
-                let playing = state == MFP_MEDIAPLAYER_STATE_PLAYING;
-                on_event(VideoEvent::Pos { pos, dur, playing });
-                // В конце файла MFPlay сам переходит в «остановлено».
-                if started && !ended && state == MFP_MEDIAPLAYER_STATE_STOPPED {
+                on_event(VideoEvent::Pos { pos: t.pos, dur: t.dur, playing: t.playing });
+                if started && !ended && t.eof {
                     ended = true;
                     on_event(VideoEvent::Ended);
                 }
@@ -262,6 +406,5 @@ mod win {
             DispatchMessageW(&msg);
         }
         let _ = KillTimer(None, timer);
-        Ok(())
     }
 }
