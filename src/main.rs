@@ -419,6 +419,11 @@ impl App {
         match (&ps.ppt, ps.phase) {
             (None, _) if waiting => ctx.request_repaint_after(Duration::from_millis(100)),
             (None, _) => {
+                let (tx, c) = (out_tx.clone(), ctx.clone());
+                ppt::install_esc_hook(move || {
+                    let _ = tx.send(Out::ShowEsc);
+                    c.request_repaint();
+                });
                 let c = ctx.clone();
                 match ppt::Ppt::start(&ps.src, windowed, move |ev| {
                     let _ = out_tx.send(Out::Ppt { gen, ev });
@@ -545,6 +550,7 @@ impl App {
                         }
                     }
                 }
+                Out::ShowEsc => self.esc_press(),
                 Out::Page { key, image } => {
                     self.requested.remove(&key);
                     if self.show.as_ref().is_some_and(|s| s.id == key.id) {
@@ -756,9 +762,9 @@ impl App {
             });
         });
         let hint = if self.connected {
-            "Вы управляете сервером. Стрелки влево и вправо листают слайды, Esc закрывает показ."
+            "Вы управляете сервером. Стрелки влево и вправо листают слайды."
         } else {
-            "Двойной щелчок запускает показ. Стрелки листают слайды, Esc закрывает показ, двойной Esc на фоне убирает фон."
+            "Двойной щелчок запускает показ. Стрелки листают слайды. На экране показа двойной Esc закрывает презентацию, а на фоне — убирает фон."
         };
         let text = if self.status.is_empty() { hint } else { self.status.as_str() };
         ui.label(RichText::new(text).size(11.5).color(Color32::from_gray(0x66)));
@@ -941,9 +947,10 @@ impl App {
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut wanted: Vec<PageKey> = Vec::new();
         let mut hide = false;
+        let mut esc = false;
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
-        let (textures, last_tex, error, bg, esc_at) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg, &mut self.esc_at);
+        let (textures, last_tex, error, bg) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
             if sent.is_none_or(|(_, fs)| fs == windowed) {
@@ -967,15 +974,9 @@ impl App {
                 }
             }
             cmds.extend(nav_keys(ctx, &view));
-            // Двойной Esc, когда на сцене только фон, убирает сцену.
-            if view.active.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if esc_at.is_some_and(|t| t.elapsed() <= DOUBLE_ESC) {
-                    hide = true;
-                    *esc_at = None;
-                } else {
-                    *esc_at = Some(Instant::now());
-                }
-            }
+            esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            // Пока на экране сцена (фон или презентация), курсора не видно.
+            ctx.set_cursor_icon(egui::CursorIcon::None);
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let mut page_tex = None;
@@ -1047,15 +1048,35 @@ impl App {
         for cmd in cmds {
             self.apply(cmd);
         }
+        if esc {
+            self.esc_press();
+        }
         if hide && self.show.is_none() {
+            self.stage = false;
+        }
+    }
+
+    /// Esc на сцене или в слайд-шоу PowerPoint. Одиночное нажатие ничего не делает.
+    /// Двойное: закрывает презентацию, а если её нет — убирает сцену с фоном.
+    fn esc_press(&mut self) {
+        if !self.esc_at.is_some_and(|t| t.elapsed() <= DOUBLE_ESC) {
+            self.esc_at = Some(Instant::now());
+            return;
+        }
+        self.esc_at = None;
+        if self.show.is_some() {
+            self.apply(Cmd::Close);
+        } else {
             self.stage = false;
         }
     }
 }
 
-/// Картинка фона рядом с exe (background.png / .jpg). Нет файла — None, сцена будет залита цветом.
+/// Картинка фона (background.png / .jpg) рядом с exe или в текущей папке. Нет файла — None, сцена будет залита цветом.
 fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let path = BG_FILES.iter().map(|n| app_dir().join(n)).find(|p| p.is_file())?;
+    // Сначала рядом с exe, затем в текущей папке (при `cargo run` это папка проекта).
+    let dirs = [Some(app_dir()), std::env::current_dir().ok()];
+    let path = dirs.iter().flatten().flat_map(|d| BG_FILES.iter().map(move |n| d.join(n))).find(|p| p.is_file())?;
     let img = image::open(&path).ok()?;
     let max = ctx.input(|i| i.max_texture_side).min(8192) as u32;
     let img = if img.width() > max || img.height() > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
@@ -1064,7 +1085,7 @@ fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("background", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR))
 }
 
-/// Клавиши управления показом — общие для главного окна и окна показа.
+/// Клавиши управления показом — общие для главного окна и сцены. Esc обрабатывает только сцена (`esc_press`).
 fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
     use egui::Key;
     let mut out = Vec::new();
@@ -1082,9 +1103,6 @@ fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
             }
             if i.key_pressed(Key::End) {
                 out.push(Cmd::GoTo { page: usize::MAX });
-            }
-            if i.key_pressed(Key::Escape) {
-                out.push(Cmd::Close);
             }
         }
         // Shift+1…9 — открыть презентацию с этим номером, Shift+0 — закрыть показ.
@@ -1143,6 +1161,7 @@ impl eframe::App for App {
         });
 
         self.tick_ppt(ctx);
+        ppt::grab_esc(self.show.as_ref().is_some_and(|s| matches!(s.kind, ShowKind::Ppt(_))));
         if !self.connected {
             self.stage_window(ctx);
         }

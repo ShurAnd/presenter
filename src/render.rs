@@ -25,6 +25,8 @@ pub struct RenderJob {
 pub enum Out {
     Prepared { id: u64, result: Result<(Option<PathBuf>, usize), String> },
     Ppt { gen: u64, ev: crate::ppt::PptEvent },
+    /// Esc, нажатый в слайд-шоу PowerPoint (перехвачен до PowerPoint).
+    ShowEsc,
     Page { key: PageKey, image: ColorImage },
     PageErr { key: PageKey, msg: String },
 }
