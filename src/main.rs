@@ -27,7 +27,7 @@ const OFF: Color32 = Color32::from_rgb(0x6c, 0x75, 0x7d);
 const TEAL: Color32 = Color32::from_rgb(0x17, 0xa2, 0xb8);
 /// Фон сцены, если картинки фона нет.
 const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
-/// Файлы фона рядом с exe — берётся первый найденный.
+/// Файлы фона рядом с exe — если есть, заменяют вшитую картинку. Берётся первый найденный.
 const BG_FILES: [&str; 3] = ["background.png", "background.jpg", "background.jpeg"];
 /// Сколько ждать после «ready» от PowerPoint, прежде чем убрать сцену: слайд-шоу должно успеть отрисоваться.
 const PPT_SETTLE: Duration = Duration::from_millis(500);
@@ -82,8 +82,12 @@ fn app_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+const CONFIG_FILE: &str = "presentator_settings.json";
+
+/// Настройки — в %APPDATA%\presenter\, как у обычных программ.
 fn config_path() -> PathBuf {
-    app_dir().join("presentator_settings.json")
+    let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(app_dir);
+    base.join("presenter").join(CONFIG_FILE)
 }
 
 enum Status {
@@ -227,7 +231,9 @@ impl App {
             s.spacing.button_padding = egui::vec2(12.0, 7.0);
             s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         });
+        // Если в %APPDATA% настроек ещё нет — берём прежний файл рядом с exe (старые версии хранили их там).
         let cfg: Config = std::fs::read_to_string(config_path())
+            .or_else(|_| std::fs::read_to_string(app_dir().join(CONFIG_FILE)))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
@@ -288,7 +294,11 @@ impl App {
 
     fn save_cfg(&self) {
         if let Ok(s) = serde_json::to_string_pretty(&self.cfg) {
-            let _ = std::fs::write(config_path(), s);
+            let path = config_path();
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(path, s);
         }
     }
 
@@ -1190,12 +1200,11 @@ impl App {
     }
 }
 
-/// Картинка фона (background.png / .jpg) рядом с exe или в текущей папке. Нет файла — None, сцена будет залита цветом.
+/// Картинка фона: background.png / .jpg рядом с exe, иначе вшитая assets/background.png. Не удалось — None, сцена будет залита цветом.
 fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    // Сначала рядом с exe, затем в текущей папке (при `cargo run` это папка проекта).
-    let dirs = [Some(app_dir()), std::env::current_dir().ok()];
-    let path = dirs.iter().flatten().flat_map(|d| BG_FILES.iter().map(move |n| d.join(n))).find(|p| p.is_file())?;
-    let img = image::open(&path).ok()?;
+    // Файл рядом с exe заменяет вшитую картинку (можно поменять фон без пересборки).
+    let file = BG_FILES.iter().map(|n| app_dir().join(n)).find(|p| p.is_file()).and_then(|p| image::open(p).ok());
+    let img = file.or_else(|| image::load_from_memory(include_bytes!("../assets/background.png")).ok())?;
     let max = ctx.input(|i| i.max_texture_side).min(8192) as u32;
     let img = if img.width() > max || img.height() > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
     let rgba = img.to_rgba8();
