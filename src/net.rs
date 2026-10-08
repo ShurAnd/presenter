@@ -28,6 +28,8 @@ pub enum Cmd {
     Remove { id: u64 },
     Move { id: u64, up: bool },
     Clear,
+    /// Закрыть показ (если есть) и вывести на сервере сцену с фоном.
+    Background,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]

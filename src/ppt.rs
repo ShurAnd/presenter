@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +54,9 @@ if ($win) {
                 $view.Previous()
             } elseif ($line -like 'goto *') {
                 $view.GotoSlide([int]$line.Substring(5))
+            } elseif ($line -eq 'show') {
+                # Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
+                try { $win.Activate() } catch {}
             }
             Say ('pos ' + $view.CurrentShowPosition + ' ' + $total)
         } catch {
@@ -68,9 +72,16 @@ try { if ($pres) { $pres.Close() } } catch {}
 try { if ($app -and $app.Presentations.Count -eq 0) { $app.Quit() } } catch {}
 "#;
 
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn AllowSetForegroundWindow(pid: u32) -> i32;
+}
+
 /// Пока жив этот объект — идёт показ. При уничтожении показ закрывается.
 pub struct Ppt {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    done: Arc<AtomicBool>,
 }
 
 impl Ppt {
@@ -99,8 +110,10 @@ impl Ppt {
             .map_err(|e| format!("не удалось запустить PowerShell: {e}"))?;
         let stdin = Arc::new(Mutex::new(child.stdin.take()));
         let stdout = child.stdout.take().ok_or("нет вывода процесса")?;
+        let done = Arc::new(AtomicBool::new(false));
 
         // Чтение событий.
+        let done_r = done.clone();
         std::thread::spawn(move || {
             let mut finished = false;
             let mut started = false;
@@ -131,6 +144,7 @@ impl Ppt {
                 }
             }
             let _ = child.wait();
+            done_r.store(true, Ordering::SeqCst);
             if !finished {
                 on_event(if started { PptEvent::Ended } else { PptEvent::Error("PowerPoint не запустился".into()) });
             }
@@ -147,7 +161,23 @@ impl Ppt {
             }
         });
 
-        Ok(Ppt { stdin })
+        Ok(Ppt { stdin, done })
+    }
+
+    /// Флаг «процесс моста завершился». Нужен, чтобы не запускать новый показ,
+    /// пока прежний ещё закрывает PowerPoint (иначе его Quit() убьёт новый).
+    pub fn done_flag(&self) -> Arc<AtomicBool> {
+        self.done.clone()
+    }
+
+    /// Вывести слайд-шоу на передний план (после того как сцена опустилась под него).
+    pub fn reveal(&self) {
+        // Разрешаем процессу PowerShell забрать фокус: сами мы сейчас активное окно.
+        #[cfg(windows)]
+        unsafe {
+            AllowSetForegroundWindow(u32::MAX); // ASFW_ANY
+        }
+        self.send("show");
     }
 
     pub fn send(&self, line: &str) {

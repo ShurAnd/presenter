@@ -6,7 +6,10 @@ mod render;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, ServerHandle, SrvEvent, StateMsg};
@@ -19,6 +22,18 @@ const RED: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
 const GRAY: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
 const OFF: Color32 = Color32::from_rgb(0x6c, 0x75, 0x7d);
 const TEAL: Color32 = Color32::from_rgb(0x17, 0xa2, 0xb8);
+/// Фон сцены, если картинки фона нет.
+const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
+/// Файлы фона рядом с exe — берётся первый найденный.
+const BG_FILES: [&str; 3] = ["background.png", "background.jpg", "background.jpeg"];
+/// Сколько ждать после «ready» от PowerPoint, прежде чем убрать сцену: слайд-шоу должно успеть отрисоваться.
+const PPT_SETTLE: Duration = Duration::from_millis(500);
+/// Пауза между опусканием сцены и выводом слайд-шоу на передний план.
+const PPT_LOWER: Duration = Duration::from_millis(120);
+/// Сколько минимум виден фон при открытии презентации (и при переключении между ними).
+const SWITCH_BG: Duration = Duration::from_millis(500);
+/// Два нажатия Esc с интервалом не больше этого скрывают сцену.
+const DOUBLE_ESC: Duration = Duration::from_millis(600);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -42,7 +57,7 @@ struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { ip: "127.0.0.1".into(), port: "14999".into(), password: "default_password".into(), windowed: true }
+        Self { ip: "127.0.0.1".into(), port: "14999".into(), password: "default_password".into(), windowed: false }
     }
 }
 
@@ -77,7 +92,41 @@ enum ShowKind {
     /// PDF рисуем сами в своём окне.
     Pdf(PathBuf),
     /// PPTX показывает PowerPoint; мы им управляем.
-    Ppt(ppt::Ppt),
+    Ppt(PptShow),
+}
+
+/// Показ PowerPoint запускается за сценой и выходит на экран, только когда готов.
+struct PptShow {
+    src: PathBuf,
+    /// None — ждём, пока завершится мост прежнего показа.
+    ppt: Option<ppt::Ppt>,
+    phase: PptPhase,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PptPhase {
+    /// PowerPoint запускается; сцена поверх всех окон и скрывает запуск.
+    Loading,
+    /// Слайд-шоу запущено, даём ему отрисоваться.
+    Ready(Instant),
+    /// Сцена опущена под обычные окна; следом выводим слайд-шоу вперёд.
+    Lowered(Instant),
+    /// Слайд-шоу на экране, сцена лежит под ним.
+    Shown,
+}
+
+impl Show {
+    fn ppt(&self) -> Option<&ppt::Ppt> {
+        match &self.kind {
+            ShowKind::Ppt(p) => p.ppt.as_ref(),
+            ShowKind::Pdf(_) => None,
+        }
+    }
+
+    /// Сцена должна быть поверх всех окон всегда, кроме времени, когда на экране PowerPoint.
+    fn stage_on_top(&self) -> bool {
+        !matches!(&self.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Lowered(_) | PptPhase::Shown))
+    }
 }
 
 struct Show {
@@ -86,11 +135,11 @@ struct Show {
     pages: usize,
     kind: ShowKind,
     gen: u64,
+    opened: Instant,
 }
 
 struct App {
     cfg: Config,
-    ctx: egui::Context,
     work_dir: PathBuf,
 
     // Локальное состояние (оно же состояние сервера)
@@ -99,6 +148,16 @@ struct App {
     show: Option<Show>,
     show_gen: u64,
     dirty: bool,
+    /// Мосты закрытых показов PowerPoint, которые ещё не завершились.
+    retiring: Vec<(Arc<AtomicBool>, Instant)>,
+
+    // Сцена — полноэкранное окно с фоном, на котором идут показы
+    stage: bool,
+    /// Что уже отправлено окну сцены: (поверх всех окон, на весь экран).
+    stage_sent: Option<(bool, bool)>,
+    bg: Option<egui::TextureHandle>,
+    bg_checked: bool,
+    esc_at: Option<Instant>,
 
     // Рендер
     job_tx: Sender<RenderJob>,
@@ -151,13 +210,18 @@ impl App {
 
         let mut app = Self {
             cfg,
-            ctx: cc.egui_ctx.clone(),
             work_dir: app_dir().join("presentator_files"),
             items: Vec::new(),
             next_id: 1,
             show: None,
             show_gen: 0,
             dirty: false,
+            retiring: Vec::new(),
+            stage: false,
+            stage_sent: None,
+            bg: None,
+            bg_checked: false,
+            esc_at: None,
             job_tx,
             out_tx,
             out_rx,
@@ -248,39 +312,33 @@ impl App {
                     return;
                 }
                 let (pages, pdf, src, name) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone());
-                self.close_show(); // прежний показ (и PowerPoint) закрываем до запуска нового
+                // Прежний показ закрываем: на экране остаётся сцена с фоном,
+                // новый показ появится на ней, только когда будет готов.
+                self.close_show();
+                self.stage = true;
                 self.show_gen += 1;
-                let gen = self.show_gen;
                 let kind = match pdf {
                     Some(pdf) => ShowKind::Pdf(pdf),
                     None => {
-                        let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
-                        let started = ppt::Ppt::start(&src, self.cfg.windowed, move |ev| {
-                            let _ = tx.send(Out::Ppt { gen, ev });
-                            ctx.request_repaint();
-                        });
-                        match started {
-                            Ok(p) => {
-                                self.status = format!("Запуск PowerPoint: «{name}»…");
-                                ShowKind::Ppt(p)
-                            }
-                            Err(e) => {
-                                self.status = format!("PowerPoint: {e}");
-                                return;
-                            }
-                        }
+                        self.status = format!("Запуск PowerPoint: «{name}»…");
+                        // Сам запуск — в tick_ppt, когда завершится мост прежнего показа.
+                        ShowKind::Ppt(PptShow { src, ppt: None, phase: PptPhase::Loading })
                     }
                 };
-                self.show = Some(Show { id, page: 0, pages, kind, gen });
+                self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now() });
             }
-            Cmd::Next => match self.show.as_ref().map(|s| &s.kind) {
-                Some(ShowKind::Ppt(p)) => p.send("next"),
+            Cmd::Next => match self.show.as_ref().map(|s| (matches!(s.kind, ShowKind::Ppt(_)), s.ppt())) {
+                Some((true, p)) => p.into_iter().for_each(|p| p.send("next")),
                 _ => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
             },
-            Cmd::Prev => match self.show.as_ref().map(|s| &s.kind) {
-                Some(ShowKind::Ppt(p)) => p.send("prev"),
+            Cmd::Prev => match self.show.as_ref().map(|s| (matches!(s.kind, ShowKind::Ppt(_)), s.ppt())) {
+                Some((true, p)) => p.into_iter().for_each(|p| p.send("prev")),
                 _ => self.go(|s| s.page.saturating_sub(1)),
             },
+            Cmd::Background => {
+                self.close_show();
+                self.stage = true;
+            }
             Cmd::GoTo { page } => self.go(|s| page.min(s.pages.saturating_sub(1))),
             Cmd::Close => self.close_show(),
             Cmd::Remove { id } => {
@@ -315,7 +373,7 @@ impl App {
             let p = f(s);
             match &s.kind {
                 // Позицию PowerPoint сообщит сам — в нём шаг может быть анимацией, а не слайдом.
-                ShowKind::Ppt(ppt) => {
+                ShowKind::Ppt(PptShow { ppt: Some(ppt), .. }) => {
                     if p == s.page + 1 {
                         ppt.send("next");
                     } else if p + 1 == s.page {
@@ -330,13 +388,66 @@ impl App {
                         self.requested.clear();
                     }
                 }
+                ShowKind::Ppt(_) => {} // PowerPoint ещё запускается
             }
         }
     }
 
+    /// Закрывает показ; сцена (если она есть) остаётся и показывает фон.
     fn close_show(&mut self) {
-        self.show = None;
+        if let Some(Show { kind: ShowKind::Ppt(PptShow { ppt: Some(p), .. }), .. }) = self.show.take() {
+            self.retiring.push((p.done_flag(), Instant::now()));
+            // Сцена лежит прямо под слайд-шоу, поэтому при его закрытии сразу виден фон.
+        }
         self.reset_pages(true);
+    }
+
+    /// Запуск PowerPoint и вывод слайд-шоу на экран — по шагам, чтобы запуск не был виден.
+    fn tick_ppt(&mut self, ctx: &egui::Context) {
+        // Мост, не завершившийся за 8 с, больше не ждём.
+        self.retiring.retain(|(done, t)| !done.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(8));
+        let waiting = !self.retiring.is_empty();
+        let (windowed, out_tx) = (self.cfg.windowed, self.out_tx.clone());
+        let Some(show) = &mut self.show else {
+            if waiting {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            return;
+        };
+        let gen = show.gen;
+        let ShowKind::Ppt(ps) = &mut show.kind else { return };
+        match (&ps.ppt, ps.phase) {
+            (None, _) if waiting => ctx.request_repaint_after(Duration::from_millis(100)),
+            (None, _) => {
+                let c = ctx.clone();
+                match ppt::Ppt::start(&ps.src, windowed, move |ev| {
+                    let _ = out_tx.send(Out::Ppt { gen, ev });
+                    c.request_repaint();
+                }) {
+                    Ok(p) => ps.ppt = Some(p),
+                    Err(e) => {
+                        self.status = format!("PowerPoint: {e}");
+                        self.close_show();
+                        self.dirty = true;
+                    }
+                }
+            }
+            (Some(_), PptPhase::Ready(t)) => {
+                if t.elapsed() >= PPT_SETTLE && show.opened.elapsed() >= SWITCH_BG {
+                    ps.phase = PptPhase::Lowered(Instant::now()); // сцена опустится в stage_window
+                }
+                ctx.request_repaint_after(Duration::from_millis(30));
+            }
+            (Some(p), PptPhase::Lowered(t)) => {
+                if t.elapsed() >= PPT_LOWER {
+                    p.reveal();
+                    ps.phase = PptPhase::Shown;
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(30));
+                }
+            }
+            _ => {}
+        }
     }
 
     fn reset_pages(&mut self, drop_last: bool) {
@@ -415,6 +526,9 @@ impl App {
                                 self.status.clear();
                                 if let Some(s) = &mut self.show {
                                     s.pages = total.max(1);
+                                    if let ShowKind::Ppt(p) = &mut s.kind {
+                                        p.phase = PptPhase::Ready(Instant::now());
+                                    }
                                 }
                             }
                             ppt::PptEvent::Pos(cur, total) => {
@@ -454,6 +568,7 @@ impl App {
             match ev {
                 SrvEvent::Started => {
                     self.server_online = true;
+                    self.stage = true; // сервер стоит у видеостены — сразу выводим фон
                     self.net_status = format!("Сервер запущен на порту {}", self.cfg.port);
                     self.dirty = true;
                 }
@@ -624,6 +739,9 @@ impl App {
             if ui.add_enabled(active, cbutton("■ Закрыть показ", RED)).clicked() {
                 self.act(Cmd::Close);
             }
+            if btn(ui, "Фон", GRAY).on_hover_text("Закрыть показ и вывести на экран сервера фон").clicked() {
+                self.act(Cmd::Background);
+            }
             if ui.add_enabled(self.selected.is_some(), cbutton("Удалить", GRAY)).clicked() {
                 if let Some(id) = self.selected.take() {
                     self.act(Cmd::Remove { id });
@@ -640,7 +758,7 @@ impl App {
         let hint = if self.connected {
             "Вы управляете сервером. Стрелки влево и вправо листают слайды, Esc закрывает показ."
         } else {
-            "Двойной щелчок запускает показ. Стрелки влево и вправо листают слайды, Esc закрывает показ."
+            "Двойной щелчок запускает показ. Стрелки листают слайды, Esc закрывает показ, двойной Esc на фоне убирает фон."
         };
         let text = if self.status.is_empty() { hint } else { self.status.as_str() };
         ui.label(RichText::new(text).size(11.5).color(Color32::from_gray(0x66)));
@@ -752,7 +870,7 @@ impl App {
                 });
             });
             ui.add_space(8.0);
-            ui.checkbox(&mut self.cfg.windowed, "Показ в окне, а не на весь экран (удобно для теста на одном компьютере)");
+            ui.checkbox(&mut self.cfg.windowed, "Сцена и показ в окне, а не на весь экран (только для теста на одном компьютере)");
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
@@ -780,74 +898,170 @@ impl App {
         }
     }
 
-    /// Окно показа: чёрный фон, страница вписана целиком, рендер под реальный размер окна.
-    fn show_window(&mut self, ctx: &egui::Context) {
-        let Some(show) = &self.show else { return };
-        let ShowKind::Pdf(pdf) = &show.kind else { return }; // PPTX показывает PowerPoint
-        let (id, page, pages, pdf) = (show.id, show.page, show.pages, pdf.clone());
+    /// Сцена: полноэкранное окно сервера. Показывает фон, а поверх — PDF;
+    /// PowerPoint выводит своё слайд-шоу поверх неё. Скрывается двойным Esc, когда на ней только фон.
+    fn stage_window(&mut self, ctx: &egui::Context) {
+        if !self.stage {
+            self.stage_sent = None;
+            self.bg_checked = false;
+            return;
+        }
+        if !self.bg_checked {
+            self.bg_checked = true;
+            self.bg = load_background(ctx);
+        }
+        let pdf = match &self.show {
+            Some(s) => match &s.kind {
+                ShowKind::Pdf(pdf) => Some((s.id, s.page, s.pages, pdf.clone())),
+                ShowKind::Ppt(_) => None,
+            },
+            None => None,
+        };
+        // Сразу после открытия какое-то время виден только фон, даже если страница уже готова.
+        let hold = self.show.as_ref().map_or(Duration::ZERO, |s| SWITCH_BG.saturating_sub(s.opened.elapsed()));
+        if !hold.is_zero() {
+            ctx.request_repaint_after(hold);
+        }
         let view = self.local_state();
+        let windowed = self.cfg.windowed;
+        let top = !windowed && self.show.as_ref().is_none_or(Show::stage_on_top);
+        let level = |top: bool| if top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
+        // «Полный экран» делаем сами: окно без рамки ровно по монитору. Режим fullscreen
+        // у дочернего окна eframe на Windows оставляет окно прежнего размера.
+        let monitor = ctx.input(|i| i.viewport().monitor_size).unwrap_or(egui::vec2(1920.0, 1080.0));
+        // На 1 точку выше монитора: OpenGL-окно ровно по размеру экрана Windows переводит в режим
+        // «полноэкранного приложения», и кадры перестают выводиться на экран.
+        let (pos, size) = if windowed { (egui::pos2(80.0, 80.0), egui::vec2(960.0, 540.0)) } else { (egui::Pos2::ZERO, monitor + egui::vec2(0.0, 1.0)) };
         let builder = egui::ViewportBuilder::default()
-            .with_title("Presentator — показ")
-            .with_inner_size([960.0, 540.0])
-            .with_fullscreen(!self.cfg.windowed);
+            .with_title("Presentator — сцена")
+            .with_position(pos)
+            .with_inner_size(size)
+            .with_decorations(windowed)
+            .with_window_level(level(top));
         let mut cmds: Vec<Cmd> = Vec::new();
         let mut wanted: Vec<PageKey> = Vec::new();
-        let (textures, last_tex, error) = (&self.textures, &mut self.last_tex, &self.render_error);
+        let mut hide = false;
+        // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
+        let sent = self.stage_sent;
+        let (textures, last_tex, error, bg, esc_at) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg, &mut self.esc_at);
 
-        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("show"), builder, |ctx, _| {
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
+            if sent.is_none_or(|(_, fs)| fs == windowed) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(windowed));
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            }
+            if sent.is_none_or(|(t, _)| t != top) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level(top)));
+                // Сцена появилась или снова поднялась после PowerPoint — забирает клавиатуру.
+                if top {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+            }
             if ctx.input(|i| i.viewport().close_requested()) {
-                cmds.push(Cmd::Close);
+                if view.active.is_some() {
+                    cmds.push(Cmd::Close);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                } else {
+                    hide = true;
+                }
             }
             cmds.extend(nav_keys(ctx, &view));
+            // Двойной Esc, когда на сцене только фон, убирает сцену.
+            if view.active.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if esc_at.is_some_and(|t| t.elapsed() <= DOUBLE_ESC) {
+                    hide = true;
+                    *esc_at = None;
+                } else {
+                    *esc_at = Some(Instant::now());
+                }
+            }
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ctx, |ui| {
                 let rect = ui.max_rect();
-                let ppp = ctx.pixels_per_point();
-                let max_side = ctx.input(|i| i.max_texture_side).min(16384) as f32;
-                let w = (rect.width() * ppp).round().clamp(16.0, max_side) as u32;
-                let h = (rect.height() * ppp).round().clamp(16.0, max_side) as u32;
-                let key = PageKey { id, page, w, h };
-                let tex = textures.get(&key).cloned();
-                if tex.is_none() {
-                    // Соседние страницы — заранее, текущая — последней (рендер берёт её первой).
-                    if page > 0 {
-                        wanted.push(PageKey { page: page - 1, ..key });
-                    }
-                    if page + 1 < pages {
-                        wanted.push(PageKey { page: page + 1, ..key });
-                    }
-                    wanted.push(key);
-                } else {
-                    *last_tex = tex.clone();
-                    for p in [page.wrapping_sub(1), page + 1] {
-                        let k = PageKey { page: p, ..key };
-                        if p < pages && !textures.contains_key(&k) {
-                            wanted.push(k);
+                let mut page_tex = None;
+                if let Some((id, page, pages, _)) = &pdf {
+                    let (id, page, pages) = (*id, *page, *pages);
+                    let ppp = ctx.pixels_per_point();
+                    let max_side = ctx.input(|i| i.max_texture_side).min(16384) as f32;
+                    let w = (rect.width() * ppp).round().clamp(16.0, max_side) as u32;
+                    let h = (rect.height() * ppp).round().clamp(16.0, max_side) as u32;
+                    let key = PageKey { id, page, w, h };
+                    let tex = textures.get(&key).cloned();
+                    if tex.is_none() {
+                        // Соседние страницы — заранее, текущая — последней (рендер берёт её первой).
+                        if page > 0 {
+                            wanted.push(PageKey { page: page - 1, ..key });
+                        }
+                        if page + 1 < pages {
+                            wanted.push(PageKey { page: page + 1, ..key });
+                        }
+                        wanted.push(key);
+                    } else {
+                        *last_tex = tex.clone();
+                        for p in [page.wrapping_sub(1), page + 1] {
+                            let k = PageKey { page: p, ..key };
+                            if p < pages && !textures.contains_key(&k) {
+                                wanted.push(k);
+                            }
                         }
                     }
+                    // Пока новая страница рендерится, оставляем на экране предыдущую — без мигания.
+                    // До первой готовой страницы новой презентации виден фон.
+                    page_tex = tex.or(last_tex.clone()).filter(|_| hold.is_zero());
                 }
-                // Пока новая страница рендерится, оставляем на экране предыдущую — без мигания.
-                if let Some(t) = tex.or(last_tex.clone()) {
-                    let ts = t.size_vec2();
-                    let k = (rect.width() / ts.x).min(rect.height() / ts.y);
-                    let r = egui::Rect::from_center_size(rect.center(), ts * k);
-                    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-                    ui.painter().image(t.id(), r, uv, Color32::WHITE);
+                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                match page_tex {
+                    Some(t) => {
+                        let ts = t.size_vec2();
+                        let k = (rect.width() / ts.x).min(rect.height() / ts.y);
+                        let r = egui::Rect::from_center_size(rect.center(), ts * k);
+                        ui.painter().image(t.id(), r, uv, Color32::WHITE);
+                    }
+                    None => match bg {
+                        // Картинка фона заполняет экран целиком (лишнее обрезается по краям).
+                        Some(t) => {
+                            let ts = t.size_vec2();
+                            let k = (rect.width() / ts.x).max(rect.height() / ts.y);
+                            let r = egui::Rect::from_center_size(rect.center(), ts * k);
+                            ui.painter().with_clip_rect(rect).image(t.id(), r, uv, Color32::WHITE);
+                        }
+                        None => {
+                            ui.painter().rect_filled(rect, 0.0, STAGE_BG);
+                        }
+                    },
                 }
-                if let Some(e) = error {
+                if let (Some(e), Some(_)) = (error, &pdf) {
                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(20.0), Color32::LIGHT_RED);
                 }
             });
         });
+        self.stage_sent = Some((top, !windowed));
 
-        for key in wanted {
-            if self.requested.insert(key) {
-                let _ = self.job_tx.send(RenderJob { key, pdf: pdf.clone() });
+        if let Some((_, _, _, pdf)) = pdf {
+            for key in wanted {
+                if self.requested.insert(key) {
+                    let _ = self.job_tx.send(RenderJob { key, pdf: pdf.clone() });
+                }
             }
         }
         for cmd in cmds {
             self.apply(cmd);
         }
+        if hide && self.show.is_none() {
+            self.stage = false;
+        }
     }
+}
+
+/// Картинка фона рядом с exe (background.png / .jpg). Нет файла — None, сцена будет залита цветом.
+fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let path = BG_FILES.iter().map(|n| app_dir().join(n)).find(|p| p.is_file())?;
+    let img = image::open(&path).ok()?;
+    let max = ctx.input(|i| i.max_texture_side).min(8192) as u32;
+    let img = if img.width() > max || img.height() > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(ctx.load_texture("background", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR))
 }
 
 /// Клавиши управления показом — общие для главного окна и окна показа.
@@ -928,8 +1142,9 @@ impl eframe::App for App {
             }
         });
 
+        self.tick_ppt(ctx);
         if !self.connected {
-            self.show_window(ctx);
+            self.stage_window(ctx);
         }
 
         if self.dirty {
@@ -993,6 +1208,16 @@ mod tests {
         wait("prev", &|e| matches!(e, CliEvent::State(s) if s.page == 0));
         c.send(CliReq::Cmd(Cmd::Next));
         wait("next", &|e| matches!(e, CliEvent::State(s) if s.page == 1));
-        std::thread::sleep(Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0)));
+        let hold = Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+        std::thread::sleep(hold);
+        // TEST_SWITCH=id — переключиться на другую презентацию, затем закрыть показ (на сцене останется фон).
+        if let Some(next) = std::env::var("TEST_SWITCH").ok().and_then(|s| s.parse::<u64>().ok()) {
+            c.send(CliReq::Cmd(Cmd::Open { id: next }));
+            wait("switch", &|e| matches!(e, CliEvent::State(s) if s.active == Some(next)));
+            std::thread::sleep(hold);
+            c.send(CliReq::Cmd(Cmd::Close));
+            wait("close", &|e| matches!(e, CliEvent::State(s) if s.active.is_none()));
+            std::thread::sleep(hold);
+        }
     }
 }
