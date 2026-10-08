@@ -43,7 +43,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("Presentator (Rust, тестовая сборка v{})", env!("CARGO_PKG_VERSION")))
             .with_inner_size([750.0, 620.0])
-            .with_min_inner_size([640.0, 420.0]),
+            .with_min_inner_size([640.0, 420.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native("presentator", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
@@ -62,6 +63,16 @@ impl Default for Config {
     fn default() -> Self {
         Self { ip: "127.0.0.1".into(), port: "14999".into(), password: "default_password".into(), windowed: false }
     }
+}
+
+/// Значок окон (тот же, что вшит в exe). Декодируется один раз.
+fn app_icon() -> Arc<egui::IconData> {
+    static ICON: std::sync::OnceLock<Arc<egui::IconData>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        let img = image::load_from_memory(include_bytes!("../assets/icon_256.png")).map(|i| i.to_rgba8());
+        Arc::new(img.map_or_else(|_| egui::IconData::default(), |i| egui::IconData { width: i.width(), height: i.height(), rgba: i.into_raw() }))
+    })
+    .clone()
 }
 
 fn app_dir() -> PathBuf {
@@ -1046,6 +1057,7 @@ impl App {
         let (pos, size) = if windowed { (egui::pos2(80.0, 80.0), egui::vec2(960.0, 540.0)) } else { (egui::Pos2::ZERO, monitor + egui::vec2(0.0, 1.0)) };
         let builder = egui::ViewportBuilder::default()
             .with_title("Presentator — сцена")
+            .with_icon(app_icon())
             .with_position(pos)
             .with_inner_size(size)
             .with_decorations(windowed)
