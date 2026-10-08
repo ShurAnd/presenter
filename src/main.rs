@@ -3,6 +3,7 @@
 mod net;
 mod ppt;
 mod render;
+mod video;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, ServerHandle, SrvEvent, StateMsg};
-use render::{Out, PageKey, RenderJob};
+use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
+use render::{Out, PageKey, RenderJob, VIDEO_EXTS};
 use serde::{Deserialize, Serialize};
 
 const BLUE: Color32 = Color32::from_rgb(0x5b, 0xc0, 0xde);
@@ -93,6 +94,15 @@ enum ShowKind {
     Pdf(PathBuf),
     /// PPTX показывает PowerPoint; мы им управляем.
     Ppt(PptShow),
+    /// Видео — встроенный проигрыватель поверх сцены.
+    Video(VideoShow),
+}
+
+struct VideoShow {
+    player: video::Video,
+    state: VideoState,
+    pos: f64,
+    dur: f64,
 }
 
 /// Показ PowerPoint запускается за сценой и выходит на экран, только когда готов.
@@ -119,7 +129,14 @@ impl Show {
     fn ppt(&self) -> Option<&ppt::Ppt> {
         match &self.kind {
             ShowKind::Ppt(p) => p.ppt.as_ref(),
-            ShowKind::Pdf(_) => None,
+            ShowKind::Pdf(_) | ShowKind::Video(_) => None,
+        }
+    }
+
+    fn video(&self) -> Option<&VideoShow> {
+        match &self.kind {
+            ShowKind::Video(v) => Some(v),
+            _ => None,
         }
     }
 
@@ -140,6 +157,7 @@ struct Show {
 
 struct App {
     cfg: Config,
+    ctx: egui::Context,
     work_dir: PathBuf,
 
     // Локальное состояние (оно же состояние сервера)
@@ -210,6 +228,7 @@ impl App {
 
         let mut app = Self {
             cfg,
+            ctx: cc.egui_ctx.clone(),
             work_dir: app_dir().join("presentator_files"),
             items: Vec::new(),
             next_id: 1,
@@ -284,6 +303,7 @@ impl App {
             page: self.show.as_ref().map_or(0, |s| s.page),
             pages: self.show.as_ref().map_or(0, |s| s.pages),
             message: self.status.clone(),
+            video: self.show.as_ref().and_then(Show::video).map(|v| VideoInfo { state: v.state, pos: v.pos as u32, dur: v.dur as u32 }),
         }
     }
 
@@ -311,14 +331,24 @@ impl App {
                 if !matches!(it.status, Status::Ready) {
                     return;
                 }
-                let (pages, pdf, src, name) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone());
+                let (pages, pdf, src, name, is_video) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone(), it.kind == "ВИДЕО");
                 // Прежний показ закрываем: на экране остаётся сцена с фоном,
                 // новый показ появится на ней, только когда будет готов.
                 self.close_show();
                 self.stage = true;
                 self.show_gen += 1;
+                let gen = self.show_gen;
                 let kind = match pdf {
                     Some(pdf) => ShowKind::Pdf(pdf),
+                    // Видео сразу загружается за фоном и ждёт пробела или «Старт».
+                    None if is_video => {
+                        let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
+                        let player = video::Video::start(&src, self.cfg.windowed, move |ev| {
+                            let _ = tx.send(Out::Video { gen, ev });
+                            ctx.request_repaint();
+                        });
+                        ShowKind::Video(VideoShow { player, state: VideoState::Loading, pos: 0.0, dur: 0.0 })
+                    }
                     None => {
                         self.status = format!("Запуск PowerPoint: «{name}»…");
                         // Сам запуск — в tick_ppt, когда завершится мост прежнего показа.
@@ -327,6 +357,31 @@ impl App {
                 };
                 self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now() });
             }
+            // Видео: стрелки перематывают на 10 с, Home — в начало.
+            Cmd::Next | Cmd::Prev | Cmd::GoTo { .. } if self.show.as_ref().is_some_and(|s| s.video().is_some()) => {
+                let v = &self.show.as_ref().and_then(Show::video).unwrap().player;
+                match cmd {
+                    Cmd::Next => v.seek(10.0),
+                    Cmd::Prev => v.seek(-10.0),
+                    Cmd::GoTo { page: 0 } => v.seek_to(0.0),
+                    _ => {}
+                }
+            }
+            Cmd::Play => match self.show.as_mut().map(|s| &mut s.kind) {
+                Some(ShowKind::Video(v)) => match v.state {
+                    VideoState::Armed => {
+                        v.player.play();
+                        v.state = VideoState::Playing;
+                    }
+                    VideoState::Playing | VideoState::Paused => {
+                        v.player.toggle();
+                        v.state = if v.state == VideoState::Playing { VideoState::Paused } else { VideoState::Playing };
+                    }
+                    VideoState::Loading => {}
+                },
+                // У презентаций пробел — следующий шаг, как в PowerPoint.
+                _ => self.apply(Cmd::Next),
+            },
             Cmd::Next => match self.show.as_ref().map(|s| (matches!(s.kind, ShowKind::Ppt(_)), s.ppt())) {
                 Some((true, p)) => p.into_iter().for_each(|p| p.send("next")),
                 _ => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
@@ -389,6 +444,7 @@ impl App {
                     }
                 }
                 ShowKind::Ppt(_) => {} // PowerPoint ещё запускается
+                ShowKind::Video(_) => {}
             }
         }
     }
@@ -478,8 +534,9 @@ impl App {
         let kind = match ext.as_str() {
             "pdf" => "PDF",
             "pptx" | "ppt" | "ppsx" | "pps" => "PPTX",
+            e if VIDEO_EXTS.contains(&e) => "ВИДЕО",
             _ => {
-                self.status = format!("Формат .{ext} не поддерживается (нужен PDF или PPTX)");
+                self.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX или видео)");
                 return;
             }
         };
@@ -551,6 +608,36 @@ impl App {
                     }
                 }
                 Out::ShowEsc => self.esc_press(),
+                Out::Video { gen, ev } => {
+                    let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) else { continue };
+                    let ShowKind::Video(v) = &mut s.kind else { continue };
+                    match ev {
+                        video::VideoEvent::Ready(dur) => {
+                            v.state = VideoState::Armed;
+                            v.dur = dur;
+                            self.dirty = true;
+                        }
+                        video::VideoEvent::Pos { pos, dur, playing } => {
+                            let state = match v.state {
+                                VideoState::Loading | VideoState::Armed => v.state,
+                                _ if playing => VideoState::Playing,
+                                _ => VideoState::Paused,
+                            };
+                            // Рассылаем клиентам только смену секунды или состояния.
+                            if pos as u32 != v.pos as u32 || state != v.state || dur as u32 != v.dur as u32 {
+                                self.dirty = true;
+                            }
+                            (v.pos, v.dur, v.state) = (pos, dur, state);
+                        }
+                        // Доиграло — возвращаем фон.
+                        video::VideoEvent::Ended => self.close_show(),
+                        video::VideoEvent::Error(e) => {
+                            self.close_show();
+                            self.status = format!("Видео: {e}");
+                        }
+                    }
+                    self.dirty = true;
+                }
                 Out::Page { key, image } => {
                     self.requested.remove(&key);
                     if self.show.as_ref().is_some_and(|s| s.id == key.id) {
@@ -701,7 +788,7 @@ impl App {
             }
             if btn(ui, "➕ Добавить", BLUE).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("Презентации (PDF, PPTX)", &["pdf", "pptx", "ppt", "ppsx", "pps"])
+                    .add_filter("Презентации и видео", &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &VIDEO_EXTS[..]].concat())
                     .pick_files()
                 {
                     let ctx = ui.ctx().clone();
@@ -742,6 +829,17 @@ impl App {
             if ui.add_enabled(sel.is_some(), cbutton("▶ Показать", GREEN)).clicked() {
                 self.act(Cmd::Open { id: sel.unwrap().id });
             }
+            if let Some(v) = &view.video {
+                let (t, c) = match v.state {
+                    VideoState::Loading => ("Подготовка…", GRAY),
+                    VideoState::Armed => ("▶ Старт", GREEN),
+                    VideoState::Playing => ("⏸ Пауза", BLUE),
+                    VideoState::Paused => ("▶ Продолжить", GREEN),
+                };
+                if ui.add_enabled(v.state != VideoState::Loading, cbutton(t, c)).on_hover_text("Пробел").clicked() {
+                    self.act(Cmd::Play);
+                }
+            }
             if ui.add_enabled(active, cbutton("■ Закрыть показ", RED)).clicked() {
                 self.act(Cmd::Close);
             }
@@ -754,7 +852,10 @@ impl App {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if active {
+                if let Some(v) = &view.video {
+                    let (t, c) = video_label(v);
+                    ui.label(RichText::new(t).strong().size(15.0).color(c));
+                } else if active {
                     ui.label(RichText::new(format!("Слайд {} из {}", view.page + 1, view.pages)).strong().size(15.0));
                 } else {
                     ui.label(RichText::new("Показ не запущен").color(GRAY));
@@ -762,9 +863,9 @@ impl App {
             });
         });
         let hint = if self.connected {
-            "Вы управляете сервером. Стрелки влево и вправо листают слайды."
+            "Вы управляете сервером. Пробел — следующий шаг или старт/пауза видео, стрелки — слайды или перемотка видео."
         } else {
-            "Двойной щелчок запускает показ. Стрелки листают слайды. На экране показа двойной Esc закрывает презентацию, а на фоне — убирает фон."
+            "Двойной щелчок открывает файл. Пробел — следующий шаг или старт/пауза видео. Двойной Esc на экране показа закрывает его, на фоне — убирает фон."
         };
         let text = if self.status.is_empty() { hint } else { self.status.as_str() };
         ui.label(RichText::new(text).size(11.5).color(Color32::from_gray(0x66)));
@@ -816,6 +917,9 @@ impl App {
                         );
                         let (info, col) = if !it.status.is_empty() {
                             (it.status.clone(), if it.ready || it.status.starts_with("обработка") { GRAY } else { RED })
+                        } else if let Some(v) = view.video.as_ref().filter(|_| is_active) {
+                            let (t, c) = video_label(v);
+                            (format!("{} · {t}", it.kind), c)
                         } else if is_active {
                             (format!("{} · слайд {}/{}", it.kind, view.page + 1, view.pages), GREEN)
                         } else if it.pages == 0 {
@@ -919,7 +1023,7 @@ impl App {
         let pdf = match &self.show {
             Some(s) => match &s.kind {
                 ShowKind::Pdf(pdf) => Some((s.id, s.page, s.pages, pdf.clone())),
-                ShowKind::Ppt(_) => None,
+                ShowKind::Ppt(_) | ShowKind::Video(_) => None,
             },
             None => None,
         };
@@ -1092,7 +1196,10 @@ fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
     ctx.input(|i| {
         let active = view.active.is_some();
         if active {
-            if [Key::ArrowRight, Key::ArrowDown, Key::PageDown, Key::Space].iter().any(|k| i.key_pressed(*k)) {
+            if i.key_pressed(Key::Space) {
+                out.push(Cmd::Play);
+            }
+            if [Key::ArrowRight, Key::ArrowDown, Key::PageDown].iter().any(|k| i.key_pressed(*k)) {
                 out.push(Cmd::Next);
             }
             if [Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace].iter().any(|k| i.key_pressed(*k)) {
@@ -1121,6 +1228,17 @@ fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
         }
     });
     out
+}
+
+/// Состояние видео для строки списка и нижней панели.
+fn video_label(v: &VideoInfo) -> (String, Color32) {
+    let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
+    match v.state {
+        VideoState::Loading => ("видео загружается…".into(), GRAY),
+        VideoState::Armed => ("готово к запуску — пробел или «Старт»".into(), GREEN),
+        VideoState::Playing => (format!("▶ {} / {}", t(v.pos), t(v.dur)), GREEN),
+        VideoState::Paused => (format!("пауза {} / {}", t(v.pos), t(v.dur)), BLUE),
+    }
 }
 
 fn cbutton(text: &str, color: Color32) -> egui::Button<'static> {
@@ -1238,5 +1356,41 @@ mod tests {
             wait("close", &|e| matches!(e, CliEvent::State(s) if s.active.is_none()));
             std::thread::sleep(hold);
         }
+    }
+
+    /// Видео против запущенного `presentator --server`:
+    /// TEST_VIDEO="a.mp4" cargo test e2e_video -- --ignored --nocapture
+    /// Загрузка → «готово к запуску» → (TEST_HOLD с) → Старт → ждём конца, на сцене снова фон.
+    #[test]
+    #[ignore]
+    fn e2e_video() {
+        let file = PathBuf::from(std::env::var("TEST_VIDEO").unwrap());
+        let hold = Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+        let (tx, rx) = channel();
+        let wait = |what: &str, f: &dyn Fn(&StateMsg) -> bool| {
+            let t = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(60).saturating_sub(t.elapsed())).unwrap_or_else(|_| panic!("timeout: {what}")) {
+                    CliEvent::Closed(r) => panic!("closed: {r}"),
+                    CliEvent::State(s) => {
+                        println!("{:>6} ms {what}: active={:?} video={:?} msg={:?}", t.elapsed().as_millis(), s.active, s.video, s.message);
+                        if f(&s) {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        c.send(CliReq::Upload(file));
+        wait("ready", &|s| s.items.len() == 1 && s.items[0].ready);
+        let id = 1;
+        c.send(CliReq::Cmd(Cmd::Open { id }));
+        wait("armed", &|s| s.video.as_ref().is_some_and(|v| v.state == VideoState::Armed));
+        std::thread::sleep(hold);
+        c.send(CliReq::Cmd(Cmd::Play));
+        wait("playing", &|s| s.video.as_ref().is_some_and(|v| v.state == VideoState::Playing));
+        wait("ended", &|s| s.active.is_none());
     }
 }

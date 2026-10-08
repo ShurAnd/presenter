@@ -30,6 +30,26 @@ pub enum Cmd {
     Clear,
     /// Закрыть показ (если есть) и вывести на сервере сцену с фоном.
     Background,
+    /// Пробел или «Старт»: видео — запуск, затем пауза/продолжить; презентация — следующий шаг.
+    Play,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum VideoState {
+    /// Видео загружается.
+    Loading,
+    /// Загружено и стоит на паузе за фоном — запустится сразу по пробелу или «Старт».
+    Armed,
+    Playing,
+    Paused,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct VideoInfo {
+    pub state: VideoState,
+    /// Позиция и длительность в секундах.
+    pub pos: u32,
+    pub dur: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -52,6 +72,9 @@ pub struct StateMsg {
     /// Сообщение сервера для оператора (например, ошибка PowerPoint).
     #[serde(default)]
     pub message: String,
+    /// Состояние видео, если сейчас открыто видео.
+    #[serde(default)]
+    pub video: Option<VideoInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

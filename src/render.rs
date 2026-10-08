@@ -27,9 +27,13 @@ pub enum Out {
     Ppt { gen: u64, ev: crate::ppt::PptEvent },
     /// Esc, нажатый в слайд-шоу PowerPoint (перехвачен до PowerPoint).
     ShowEsc,
+    Video { gen: u64, ev: crate::video::VideoEvent },
     Page { key: PageKey, image: ColorImage },
     PageErr { key: PageKey, msg: String },
 }
+
+/// Расширения видеофайлов, которые отдаём встроенному проигрывателю.
+pub const VIDEO_EXTS: [&str; 12] = ["mp4", "m4v", "mov", "wmv", "avi", "mkv", "mpg", "mpeg", "ts", "m2ts", "webm", "3gp"];
 
 fn load_pdf(path: &Path) -> Result<Pdf, String> {
     let data = std::fs::read(path).map_err(|e| format!("не удалось прочитать файл: {e}"))?;
@@ -59,6 +63,11 @@ fn prepare_inner(src: &Path) -> Result<(Option<PathBuf>, usize), String> {
         // PPTX показывает сам PowerPoint; здесь только считаем слайды для списка.
         "pptx" | "ppsx" => Ok((None, count_slides(src)?)),
         "ppt" | "pps" => {
+            std::fs::File::open(src).map_err(|e| format!("не удалось прочитать файл: {e}"))?;
+            Ok((None, 0))
+        }
+        // Видео открывает сам проигрыватель; здесь только проверяем, что файл читается.
+        e if VIDEO_EXTS.contains(&e) => {
             std::fs::File::open(src).map_err(|e| format!("не удалось прочитать файл: {e}"))?;
             Ok((None, 0))
         }
