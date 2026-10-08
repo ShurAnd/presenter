@@ -1,7 +1,9 @@
-//! Фоновая подготовка файлов (подсчёт страниц и слайдов) и рендер страниц PDF.
+//! Фоновая подготовка файлов (подсчёт страниц и слайдов) и многопоточный рендер страниц PDF.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::collections::HashSet;
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
 
 use eframe::egui::ColorImage;
 use hayro::hayro_interpret::InterpreterSettings;
@@ -15,11 +17,6 @@ pub struct PageKey {
     pub page: usize,
     pub w: u32,
     pub h: u32,
-}
-
-pub struct RenderJob {
-    pub key: PageKey,
-    pub pdf: PathBuf,
 }
 
 pub enum Out {
@@ -105,35 +102,117 @@ pub fn render_page(pdf: &Pdf, key: PageKey) -> Result<ColorImage, String> {
     Ok(ColorImage::from_rgba_premultiplied(size, pix.data_as_u8_slice()))
 }
 
-/// Поток рендера: держит открытым последний документ, устаревшие запросы пропускает.
-pub fn spawn_renderer(jobs: Receiver<RenderJob>, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
-    std::thread::spawn(move || {
-        let mut doc: Option<(PathBuf, Pdf)> = None;
-        while let Ok(first) = jobs.recv() {
-            let mut batch = vec![first];
-            batch.extend(jobs.try_iter());
-            // Если накопилось много (быстрое листание) — актуальны только последние запросы.
-            let skip = batch.len().saturating_sub(4);
-            for job in batch.into_iter().skip(skip).rev() {
-                if doc.as_ref().map(|d| &d.0) != Some(&job.pdf) {
-                    doc = match load_pdf(&job.pdf) {
-                        Ok(p) => Some((job.pdf.clone(), p)),
-                        Err(msg) => {
-                            let _ = out.send(Out::PageErr { key: job.key, msg });
-                            wake();
-                            continue;
-                        }
-                    };
-                }
-                let pdf = &doc.as_ref().unwrap().1;
-                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_page(pdf, job.key)))
-                    .unwrap_or_else(|_| Err("ошибка рендера страницы".into()));
-                let _ = out.send(match res {
-                    Ok(image) => Out::Page { key: job.key, image },
-                    Err(msg) => Out::PageErr { key: job.key, msg },
-                });
-                wake();
-            }
+/// Рендер страниц PDF в нескольких потоках. GUI каждый кадр сообщает, какие страницы нужны
+/// (самые важные — первыми: текущая, следующие, предыдущая), рабочие потоки берут их по порядку.
+/// Новый список заменяет старый — устаревшие заказы при быстром листании просто отбрасываются,
+/// а страницы, которые уже рендерятся, повторно не заказываются.
+pub struct Renderer {
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    queue: Mutex<Queue>,
+    cv: Condvar,
+    /// Открытый документ — один на все потоки (hayro::Pdf можно читать параллельно).
+    doc: Mutex<Option<(PathBuf, Arc<Pdf>)>>,
+}
+
+#[derive(Default)]
+struct Queue {
+    pdf: Option<PathBuf>,
+    jobs: Vec<PageKey>,
+    busy: HashSet<PageKey>,
+}
+
+impl Renderer {
+    pub fn new(out: Sender<Out>, wake: impl Fn() + Send + Sync + 'static) -> Renderer {
+        let shared = Arc::new(Shared { queue: Mutex::new(Queue::default()), cv: Condvar::new(), doc: Mutex::new(None) });
+        let wake = Arc::new(wake);
+        // Половина ядер, но не больше 4: остальное — интерфейсу, видео и PowerPoint.
+        let workers = std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, 4);
+        for _ in 0..workers {
+            let (shared, out, wake) = (shared.clone(), out.clone(), wake.clone());
+            std::thread::spawn(move || worker(&shared, &out, &*wake));
         }
-    });
+        Renderer { shared }
+    }
+
+    /// Какие страницы нужны сейчас, по убыванию важности. Пустой список — ничего не рендерить.
+    pub fn want(&self, pdf: &Path, keys: Vec<PageKey>) {
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let jobs: Vec<PageKey> = keys.into_iter().filter(|k| !q.busy.contains(k)).collect();
+        if q.jobs == jobs && q.pdf.as_deref() == Some(pdf) {
+            return;
+        }
+        q.pdf = Some(pdf.to_path_buf());
+        q.jobs = jobs;
+        if !q.jobs.is_empty() {
+            self.shared.cv.notify_all();
+        }
+    }
+
+    /// Отменить всё, что ещё не начато (показ закрыт).
+    pub fn cancel(&self) {
+        self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).jobs.clear();
+    }
+}
+
+fn worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync)) {
+    loop {
+        let (key, path) = {
+            let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            while q.jobs.is_empty() {
+                q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+            let key = q.jobs.remove(0);
+            q.busy.insert(key);
+            (key, q.pdf.clone().unwrap_or_default())
+        };
+        let doc = {
+            let mut d = shared.doc.lock().unwrap_or_else(|e| e.into_inner());
+            match d.as_ref().filter(|(p, _)| *p == path) {
+                Some((_, pdf)) => Ok(pdf.clone()),
+                None => load_pdf(&path).map(|pdf| {
+                    let pdf = Arc::new(pdf);
+                    *d = Some((path.clone(), pdf.clone()));
+                    pdf
+                }),
+            }
+        };
+        let res = doc.and_then(|pdf| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_page(&pdf, key)))
+                .unwrap_or_else(|_| Err("ошибка рендера страницы".into()))
+        });
+        shared.queue.lock().unwrap_or_else(|e| e.into_inner()).busy.remove(&key);
+        let _ = out.send(match res {
+            Ok(image) => Out::Page { key, image },
+            Err(msg) => Out::PageErr { key, msg },
+        });
+        wake();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Время рендера каждой страницы под 1920×1080 (или TEST_SIZE):
+    /// TEST_PDF="a.pdf" cargo test --release bench_render -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn bench_render() {
+        let path = PathBuf::from(std::env::var("TEST_PDF").unwrap());
+        let t = Instant::now();
+        let pdf = load_pdf(&path).unwrap();
+        println!("загрузка: {} мс", t.elapsed().as_millis());
+        // TEST_SIZE="3840x2160" — другой размер экрана.
+        let size = std::env::var("TEST_SIZE").unwrap_or_else(|_| "1920x1080".into());
+        let (w, h) = size.split_once('x').map(|(w, h)| (w.parse().unwrap(), h.parse().unwrap())).unwrap();
+        for page in 0..pdf.pages().len() {
+            let t = Instant::now();
+            render_page(&pdf, PageKey { id: 0, page, w, h }).unwrap();
+            println!("страница {}: {} мс", page + 1, t.elapsed().as_millis());
+        }
+    }
 }

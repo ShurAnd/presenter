@@ -63,7 +63,8 @@ if ($win) {
                 # Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
                 try { $win.Activate() } catch {}
             }
-            try { $pres.Saved = -1 } catch {}
+            # Опрос (poll) PowerPoint лишний раз не трогаем — он может как раз менять слайд.
+            if ($line -ne 'poll') { try { $pres.Saved = -1 } catch {} }
             Say ('pos ' + $view.CurrentShowPosition + ' ' + $total)
         } catch {
             # PowerPoint мог быть просто занят; показ окончен, только если его окна больше нет.

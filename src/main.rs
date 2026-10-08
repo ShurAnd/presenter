@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
-use render::{Out, PageKey, RenderJob, VIDEO_EXTS};
+use render::{Out, PageKey, Renderer, VIDEO_EXTS};
 use serde::{Deserialize, Serialize};
 
 const BLUE: Color32 = Color32::from_rgb(0x5b, 0xc0, 0xde);
@@ -35,6 +35,8 @@ const PPT_SETTLE: Duration = Duration::from_millis(500);
 const PPT_LOWER: Duration = Duration::from_millis(120);
 /// Сколько минимум виден фон при открытии презентации (и при переключении между ними).
 const SWITCH_BG: Duration = Duration::from_millis(500);
+/// Сколько страниц PDF вперёд готовить заранее (на очень больших экранах — на одну меньше).
+const PREFETCH_AHEAD: usize = 3;
 /// Два нажатия Esc с интервалом не больше этого скрывают сцену.
 const DOUBLE_ESC: Duration = Duration::from_millis(600);
 
@@ -195,11 +197,12 @@ struct App {
     esc_at: Option<Instant>,
 
     // Рендер
-    job_tx: Sender<RenderJob>,
+    renderer: Renderer,
     out_tx: Sender<Out>,
     out_rx: Receiver<Out>,
     textures: HashMap<PageKey, egui::TextureHandle>,
-    requested: HashSet<PageKey>,
+    /// Страницы, которые не удалось отрендерить, — повторно не заказываем.
+    failed: HashSet<PageKey>,
     last_tex: Option<egui::TextureHandle>,
     render_error: Option<String>,
 
@@ -238,10 +241,10 @@ impl App {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
 
-        let (job_tx, job_rx) = channel();
+
         let (out_tx, out_rx) = channel();
         let ctx = cc.egui_ctx.clone();
-        render::spawn_renderer(job_rx, out_tx.clone(), move || ctx.request_repaint());
+        let renderer = Renderer::new(out_tx.clone(), move || ctx.request_repaint());
         let (srv_tx, srv_rx) = channel();
         let (cli_tx, cli_rx) = channel();
 
@@ -260,11 +263,11 @@ impl App {
             bg: None,
             bg_checked: false,
             esc_at: None,
-            job_tx,
+            renderer,
             out_tx,
             out_rx,
             textures: HashMap::new(),
-            requested: HashSet::new(),
+            failed: HashSet::new(),
             last_tex: None,
             render_error: None,
             server: None,
@@ -463,7 +466,8 @@ impl App {
                 ShowKind::Pdf(_) => {
                     if p != s.page {
                         s.page = p;
-                        self.requested.clear();
+                        let id = s.id;
+                        self.trim_pages(id, p);
                     }
                 }
                 ShowKind::Ppt(_) => {} // PowerPoint ещё запускается
@@ -534,9 +538,15 @@ impl App {
         }
     }
 
+    /// Держим в памяти только страницы рядом с текущей: PREFETCH_AHEAD вперёд и пару назад.
+    fn trim_pages(&mut self, id: u64, cur: usize) {
+        self.textures.retain(|k, _| k.id == id && k.page + 2 >= cur && k.page <= cur + PREFETCH_AHEAD);
+    }
+
     fn reset_pages(&mut self, drop_last: bool) {
+        self.renderer.cancel();
         self.textures.clear();
-        self.requested.clear();
+        self.failed.clear();
         self.render_error = None;
         if drop_last {
             self.last_tex = None;
@@ -662,17 +672,16 @@ impl App {
                     self.dirty = true;
                 }
                 Out::Page { key, image } => {
-                    self.requested.remove(&key);
-                    if self.show.as_ref().is_some_and(|s| s.id == key.id) {
+                    let cur = self.show.as_ref().filter(|s| s.id == key.id).map(|s| s.page);
+                    // Страница, до которой уже не долистать в пределах кеша, не нужна.
+                    if let Some(cur) = cur.filter(|&c| key.page + 2 >= c && key.page <= c + PREFETCH_AHEAD) {
                         let tex = ctx.load_texture(format!("p{}_{}", key.id, key.page), image, egui::TextureOptions::LINEAR);
                         self.textures.insert(key, tex);
-                        let cur = self.show.as_ref().map_or(0, |s| s.page);
-                        if self.textures.len() > 6 {
-                            self.textures.retain(|k, _| k.page.abs_diff(cur) <= 1);
-                        }
+                        self.trim_pages(key.id, cur);
                     }
                 }
                 Out::PageErr { key, msg } => {
+                    self.failed.insert(key);
                     if self.show.as_ref().is_some_and(|s| s.id == key.id && s.page == key.page) {
                         self.render_error = Some(msg);
                     }
@@ -1078,7 +1087,7 @@ impl App {
         let mut esc = false;
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
-        let (textures, last_tex, error, bg) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg);
+        let (textures, last_tex, error, bg, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg, &self.failed);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
             if sent.is_none_or(|(_, fs)| fs == windowed) {
@@ -1116,24 +1125,14 @@ impl App {
                     let h = (rect.height() * ppp).round().clamp(16.0, max_side) as u32;
                     let key = PageKey { id, page, w, h };
                     let tex = textures.get(&key).cloned();
-                    if tex.is_none() {
-                        // Соседние страницы — заранее, текущая — последней (рендер берёт её первой).
-                        if page > 0 {
-                            wanted.push(PageKey { page: page - 1, ..key });
-                        }
-                        if page + 1 < pages {
-                            wanted.push(PageKey { page: page + 1, ..key });
-                        }
-                        wanted.push(key);
-                    } else {
+                    if tex.is_some() {
                         *last_tex = tex.clone();
-                        for p in [page.wrapping_sub(1), page + 1] {
-                            let k = PageKey { page: p, ..key };
-                            if p < pages && !textures.contains_key(&k) {
-                                wanted.push(k);
-                            }
-                        }
                     }
+                    // Очередь рендера по важности: текущая, следующие (по ним листают чаще всего),
+                    // затем предыдущая. Для очень больших экранов вперёд готовим меньше — бережём память.
+                    let ahead = if (w as u64) * (h as u64) > 9_000_000 { PREFETCH_AHEAD - 1 } else { PREFETCH_AHEAD };
+                    let order = std::iter::once(page).chain(page + 1..=page + ahead).chain(page.checked_sub(1));
+                    wanted.extend(order.filter(|&p| p < pages).map(|p| PageKey { page: p, ..key }).filter(|k| !textures.contains_key(k) && !failed.contains(k)));
                     // Пока новая страница рендерится, оставляем на экране предыдущую — без мигания.
                     // До первой готовой страницы новой презентации виден фон.
                     page_tex = tex.or(last_tex.clone()).filter(|_| hold.is_zero());
@@ -1167,11 +1166,7 @@ impl App {
         self.stage_sent = Some((top, !windowed));
 
         if let Some((_, _, _, pdf)) = pdf {
-            for key in wanted {
-                if self.requested.insert(key) {
-                    let _ = self.job_tx.send(RenderJob { key, pdf: pdf.clone() });
-                }
-            }
+            self.renderer.want(&pdf, wanted);
         }
         for cmd in cmds {
             self.apply(cmd);
