@@ -123,6 +123,13 @@ impl SavedServer {
     }
 }
 
+/// Элемент списка в list.json.
+#[derive(Serialize, Deserialize)]
+struct SavedItem {
+    name: String,
+    src: PathBuf,
+}
+
 /// Сколько серверов помнить.
 const MAX_SERVERS: usize = 20;
 
@@ -284,6 +291,8 @@ struct App {
     goto_field: String,
     /// Серверы, удалённые из списка в этом сеансе, — при сохранении не возвращаем их с диска.
     forgotten: HashSet<String>,
+    /// Что последний раз записано в list.json — пишем только при изменениях.
+    saved_list: String,
 
     // Состояние сервера (показатели)
     /// Счётчик кадров интерфейса: по нему сборщик понимает, что программа не зависла.
@@ -385,6 +394,7 @@ impl App {
             goto_at: None,
             goto_field: String::new(),
             forgotten: HashSet::new(),
+            saved_list: String::new(),
             ui_frames: Arc::new(AtomicU64::new(0)),
             collector: None,
             local_health: None,
@@ -422,6 +432,7 @@ impl App {
             net_status: String::new(),
             status: String::new(),
         };
+        app.load_list(&cc.egui_ctx);
         // Автозапуск: `presentator --server` или `presentator --connect`.
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "--server") {
@@ -687,6 +698,56 @@ impl App {
         self.render_error = None;
         if drop_last {
             self.last_tex = None;
+        }
+    }
+
+    fn list_path(&self) -> PathBuf {
+        self.work_dir.join("list.json")
+    }
+
+    /// Сохранить список (порядок, имена, файлы) — он переживает перезапуск программы и сбой.
+    fn save_list(&mut self) {
+        let list: Vec<SavedItem> = self.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone() }).collect();
+        let Ok(text) = serde_json::to_string_pretty(&list) else { return };
+        if text == self.saved_list {
+            return;
+        }
+        let _ = std::fs::create_dir_all(&self.work_dir);
+        // Через временный файл: при сбое посреди записи старый список останется целым.
+        let tmp = self.work_dir.join("list.json.tmp");
+        if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, self.list_path()).is_ok() {
+            self.saved_list = text;
+        }
+    }
+
+    /// Восстановить список при запуске. Файлы, которых больше нет, пропускаются; файлы в рабочей
+    /// папке, на которые список не ссылается (например, недокачанные при сбое), удаляются.
+    fn load_list(&mut self, ctx: &egui::Context) {
+        let list: Vec<SavedItem> = std::fs::read_to_string(self.list_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let keep: HashSet<PathBuf> = list.iter().map(|i| i.src.clone()).collect();
+        if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
+            for e in dir.flatten() {
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().to_string();
+                if p.is_file() && !name.starts_with("list.json") && !keep.contains(&p) {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+        let mut missing = 0;
+        for it in list {
+            if it.src.is_file() {
+                self.add_local(it.src, Some(it.name), ctx);
+            } else {
+                missing += 1;
+            }
+        }
+        if !self.items.is_empty() {
+            self.status = format!("Список восстановлен (файлов: {}", self.items.len());
+            if missing > 0 {
+                self.status += &format!(", не найдено: {missing}");
+            }
+            self.status += ")";
         }
     }
 
@@ -1911,15 +1972,14 @@ impl eframe::App for App {
             if let Some(s) = &self.server {
                 s.publish(&self.local_state());
             }
+            self.save_list();
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_cfg();
-        // Убираем за собой загруженные и сконвертированные файлы.
-        for it in &self.items {
-            self.delete_files(it);
-        }
+        // Список и присланные файлы остаются — при следующем запуске список восстановится.
+        self.save_list();
     }
 }
 
@@ -1955,10 +2015,21 @@ mod tests {
 
         let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
         wait("connect", &|e| matches!(e, CliEvent::Connected));
+        // Список на сервере переживает перезапуск — начинаем с чистого.
+        c.send(CliReq::Cmd(Cmd::Clear));
+        wait("cleared", &|e| matches!(e, CliEvent::State(s) if s.items.is_empty()));
         for f in &files { c.send(CliReq::Upload(f.clone())); }
         let n = files.len();
-        wait("ready", &|e| matches!(e, CliEvent::State(s) if s.items.len() == n && s.items.iter().all(|i| i.ready)));
-        let step: u64 = std::env::var("TEST_OPEN").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        let ids = std::cell::RefCell::new(Vec::new());
+        wait("ready", &|e| {
+            let ok = matches!(e, CliEvent::State(s) if s.items.len() == n && s.items.iter().all(|i| i.ready));
+            if let (true, CliEvent::State(s)) = (ok, e) { *ids.borrow_mut() = s.items.iter().map(|i| i.id).collect(); }
+            ok
+        });
+        let ids = ids.into_inner();
+        // TEST_OPEN / TEST_SWITCH — позиция в списке (1 — первый загруженный файл).
+        let pos = |v: u64| ids[(v as usize).saturating_sub(1).min(ids.len() - 1)];
+        let step: u64 = pos(std::env::var("TEST_OPEN").ok().and_then(|s| s.parse().ok()).unwrap_or(1));
         c.send(CliReq::Cmd(Cmd::Open { id: step }));
         wait("open", &|e| matches!(e, CliEvent::State(s) if s.active == Some(step) && s.page == 0));
         c.send(CliReq::Cmd(Cmd::Next));
@@ -1970,7 +2041,7 @@ mod tests {
         let hold = Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
         std::thread::sleep(hold);
         // TEST_SWITCH=id — переключиться на другую презентацию, затем закрыть показ (на сцене останется фон).
-        if let Some(next) = std::env::var("TEST_SWITCH").ok().and_then(|s| s.parse::<u64>().ok()) {
+        if let Some(next) = std::env::var("TEST_SWITCH").ok().and_then(|s| s.parse::<u64>().ok()).map(pos) {
             c.send(CliReq::Cmd(Cmd::Open { id: next }));
             wait("switch", &|e| matches!(e, CliEvent::State(s) if s.active == Some(next)));
             std::thread::sleep(hold);
@@ -2032,16 +2103,28 @@ mod tests {
             }
         };
         let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        c.send(CliReq::Cmd(Cmd::Clear)); // список на сервере переживает перезапуск — начинаем с чистого
+        wait("cleared", &|s| s.items.is_empty());
         for f in &files {
             c.send(CliReq::Upload(f.clone()));
         }
         let n = files.len();
-        wait("ready", &|s| s.items.len() == n && s.items.iter().all(|i| i.ready));
+        let ids = std::cell::RefCell::new(Vec::new());
+        wait("ready", &|s| {
+            let ok = s.items.len() == n && s.items.iter().all(|i| i.ready);
+            if ok {
+                *ids.borrow_mut() = s.items.iter().map(|i| i.id).collect();
+            }
+            ok
+        });
+        // TEST_SEQ — позиции в списке (1 — первый файл), переводим во внутренние номера.
+        let ids = ids.into_inner();
+        let seq: Vec<(u64, u64)> = seq.iter().map(|&p| (p, ids[(p as usize).saturating_sub(1).min(ids.len() - 1)])).collect();
         // TEST_LAST_HOLD — сколько держать последнюю презентацию (для проверки после быстрых переключений).
         let last_hold = std::env::var("TEST_LAST_HOLD").ok().and_then(|s| s.parse().ok()).map(Duration::from_secs_f64);
         let count = seq.len();
-        for (k, id) in seq.into_iter().enumerate() {
-            println!("OPEN {id} {}", now());
+        for (k, (position, id)) in seq.into_iter().enumerate() {
+            println!("OPEN {position} {}", now());
             c.send(CliReq::Cmd(Cmd::Open { id }));
             wait("open", &|s| s.active == Some(id));
             // Пока держим показ — печатаем смену слайда (для проверки перехода по номеру).
@@ -2061,6 +2144,26 @@ mod tests {
         c.send(CliReq::Cmd(Cmd::Close));
         wait("close", &|s| s.active.is_none());
         std::thread::sleep(Duration::from_secs(2));
+    }
+
+    /// Печатает список на запущенном `presentator --server` (для проверки, что он пережил перезапуск):
+    /// cargo test --release e2e_list -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_list() {
+        let (tx, rx) = channel();
+        let _c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(10) {
+            if let Ok(CliEvent::State(s)) = rx.recv_timeout(Duration::from_secs(10)) {
+                for (n, i) in s.items.iter().enumerate() {
+                    println!("ITEM {} {} | {} | готов: {} | {}", n + 1, i.name, i.kind, i.ready, i.status);
+                }
+                println!("ITEMS {}", s.items.len());
+                return;
+            }
+        }
+        panic!("нет состояния от сервера");
     }
 
     /// Видео против запущенного `presentator --server`:
@@ -2088,9 +2191,18 @@ mod tests {
             }
         };
         let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        c.send(CliReq::Cmd(Cmd::Clear)); // список на сервере переживает перезапуск — начинаем с чистого
+        wait("cleared", &|s| s.items.is_empty());
         c.send(CliReq::Upload(file));
-        wait("ready", &|s| s.items.len() == 1 && s.items[0].ready);
-        let id = 1;
+        let id = std::cell::Cell::new(0);
+        wait("ready", &|s| {
+            let ok = s.items.len() == 1 && s.items[0].ready;
+            if ok {
+                id.set(s.items[0].id);
+            }
+            ok
+        });
+        let id = id.get();
         c.send(CliReq::Cmd(Cmd::Open { id }));
         wait("armed", &|s| s.video.as_ref().is_some_and(|v| v.state == VideoState::Armed));
         std::thread::sleep(hold);
