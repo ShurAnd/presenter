@@ -86,6 +86,8 @@ struct Config {
     servers: Vec<SavedServer>,
     /// Резервный сервер («адрес:порт» из списка) — на него можно переключиться одной кнопкой.
     reserve: String,
+    /// Загружаемые файлы дублировать на резервный сервер.
+    mirror: bool,
 }
 
 /// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
@@ -106,6 +108,7 @@ impl Default for Config {
             monitor: String::new(),
             servers: Vec::new(),
             reserve: String::new(),
+            mirror: true,
         }
     }
 }
@@ -140,6 +143,15 @@ struct SavedItem {
 /// Автопереподключение: попыток и пауза между ними (всего около 30 с).
 const RECONNECT_TRIES: u32 = 15;
 const RECONNECT_EVERY: Duration = Duration::from_secs(2);
+
+/// Что открыть на резервном сервере после переключения.
+struct Resume {
+    name: String,
+    page: usize,
+    /// Уже отправлено «открыть» (номер элемента на резерве).
+    opened: Option<u64>,
+    since: Instant,
+}
 
 /// Сколько серверов помнить.
 const MAX_SERVERS: usize = 20;
@@ -323,6 +335,16 @@ struct App {
     lost: Option<String>,
     /// Автозапуск сервера со сторожем при входе в Windows (состояние читается из реестра при запуске).
     autostart: bool,
+    /// Дублирование загружаемых файлов на резервный сервер: загрузчик (и для какого сервера) и его события.
+    mirror: Option<(String, net::Uploader)>,
+    mirror_tx: Sender<CliEvent>,
+    mirror_rx: Receiver<CliEvent>,
+    /// После переключения на резерв — открыть там ту же презентацию на том же слайде.
+    resume: Option<Resume>,
+    /// Что последним было на экране сервера (имя файла, слайд) — переживает обрыв связи.
+    last_show: Option<(String, usize)>,
+    /// Файлы из ключей `--add` — добавить (загрузить) после запуска / подключения.
+    pending_add: Vec<PathBuf>,
     /// Автопереподключение после обрыва: номер попытки и когда делать следующую.
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
@@ -385,6 +407,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let renderer = Renderer::new(out_tx.clone(), move || ctx.request_repaint());
         let (srv_tx, srv_rx) = channel();
+        let (mirror_tx, mirror_rx) = channel();
         let (cli_tx, cli_rx) = channel();
 
         // Мост к PowerPoint: события приходят с номером показа (он же поколение `gen`).
@@ -420,6 +443,12 @@ impl App {
             health_at: None,
             lost: None,
             reconnect: None,
+            mirror: None,
+            mirror_tx,
+            mirror_rx,
+            resume: None,
+            last_show: None,
+            pending_add: Vec::new(),
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             stage: false,
@@ -451,6 +480,8 @@ impl App {
         };
         // Автозапуск: `presentator --server` или `presentator --connect`.
         let args: Vec<String> = std::env::args().collect();
+        // `--add <файл>` (можно несколько): добавить в список; при `--connect` — загрузить на сервер.
+        app.pending_add = args.windows(2).filter(|w| w[0] == "--add").map(|w| PathBuf::from(&w[1])).collect();
         if args.iter().any(|a| a == "--server") {
             app.toggle_server(&cc.egui_ctx);
         } else if args.iter().any(|a| a == "--connect") {
@@ -825,7 +856,11 @@ impl App {
         for p in paths {
             if self.connected {
                 if let Some(c) = &self.client {
-                    c.send(CliReq::Upload(p));
+                    c.send(CliReq::Upload(p.clone()));
+                }
+                // Тот же файл — и на резервный сервер, чтобы на нём было всё для переключения.
+                if let Some(m) = self.mirror_uploader() {
+                    m.send(p);
                 }
             } else {
                 self.add_local(p, None, ctx);
@@ -934,6 +969,14 @@ impl App {
             }
         }
 
+        while let Ok(ev) = self.mirror_rx.try_recv() {
+            match ev {
+                CliEvent::UploadOk(name) => self.status = format!("Файл «{name}» передан и на резервный сервер"),
+                CliEvent::UploadErr { name, msg } => self.status = format!("Резервный сервер: не удалось передать «{name}»: {msg}"),
+                _ => {}
+            }
+        }
+
         while let Ok(ev) = self.srv_rx.try_recv() {
             match ev {
                 SrvEvent::Started => {
@@ -984,6 +1027,12 @@ impl App {
                 CliEvent::Connected => {
                     (self.remote_health, self.rtt, self.remote_live, self.health_at, self.lost) = (None, None, false, None, None);
                     self.reconnect = None;
+                    // Файлы из `--add` — на сервер (и на резерв).
+                    let add = std::mem::take(&mut self.pending_add);
+                    if !add.is_empty() {
+                        self.connected = true;
+                        self.add_files(add, ctx);
+                    }
                     self.last_seen = Some(Instant::now());
                     self.connected = true;
                     self.close_show();
@@ -1014,6 +1063,8 @@ impl App {
                         self.status = s.message.clone();
                     }
                     self.remote = s;
+                    self.last_show = self.remote.active.and_then(|id| self.remote.items.iter().find(|i| i.id == id)).map(|it| (it.name.clone(), self.remote.page));
+                    self.continue_resume();
                 }
                 CliEvent::Progress { name, sent, total } => {
                     // Пока идёт передача файла, пинги ждут своей очереди — это не молчание сервера.
@@ -1107,6 +1158,18 @@ impl App {
         (health::overall(&rows), rows)
     }
 
+    /// Загрузчик на резервный сервер (создаётся при первой надобности, заново — если резерв сменили).
+    fn mirror_uploader(&mut self) -> Option<&net::Uploader> {
+        let srv = self.reserve_server().filter(|_| self.cfg.mirror)?;
+        if self.mirror.as_ref().is_none_or(|(k, _)| *k != srv.key()) {
+            let port = srv.port.trim().parse().ok()?;
+            let ctx = self.ctx.clone();
+            let up = net::start_uploader(srv.ip.trim().to_string(), port, srv.password.clone(), self.mirror_tx.clone(), move || ctx.request_repaint());
+            self.mirror = Some((srv.key(), up));
+        }
+        self.mirror.as_ref().map(|(_, u)| u)
+    }
+
     /// Резервный сервер из списка, если он выбран и это не тот, к которому мы уже подключены.
     fn reserve_server(&self) -> Option<SavedServer> {
         let current = format!("{}:{}", self.cfg.ip.trim(), self.cfg.port.trim());
@@ -1116,11 +1179,45 @@ impl App {
     /// Отключиться от текущего сервера и подключиться к резервному.
     fn switch_to_reserve(&mut self) {
         let Some(srv) = self.reserve_server() else { return };
+        // Что было на экране основного сервера — откроем то же на резерве (по имени файла).
+        // Список сервера при обрыве уже очищен — берём то, что запомнили.
+        self.resume = self.last_show.clone().map(|(name, page)| Resume { name, page, opened: None, since: Instant::now() });
+        self.mirror = None; // резерв станет основным
         self.disconnect();
         self.status = format!("Переключение на резервный сервер {}…", srv.label());
         (self.cfg.ip, self.cfg.port, self.cfg.password, self.cfg.name) = (srv.ip, srv.port, srv.password, srv.name);
         let ctx = self.ctx.clone();
         self.toggle_client(&ctx);
+    }
+
+    /// Продолжение показа на резерве: найти файл с тем же именем, открыть, перейти на тот же слайд.
+    fn continue_resume(&mut self) {
+        let Some(r) = &mut self.resume else { return };
+        if r.since.elapsed() > Duration::from_secs(20) {
+            self.status = format!("На резервном сервере не удалось открыть «{}»", r.name);
+            self.resume = None;
+            return;
+        }
+        match r.opened {
+            None => {
+                let Some(it) = self.remote.items.iter().find(|i| i.name == r.name) else { return };
+                if !it.ready {
+                    return;
+                }
+                let id = it.id;
+                r.opened = Some(id);
+                self.act(Cmd::Open { id });
+            }
+            Some(id) if self.remote.active == Some(id) => {
+                let (page, name) = (r.page, r.name.clone());
+                self.resume = None;
+                if page > 0 && self.remote.video.is_none() {
+                    self.act(Cmd::GoTo { page });
+                }
+                self.status = format!("На резервном сервере открыт «{name}», слайд {}", page + 1);
+            }
+            Some(_) => {}
+        }
     }
 
     /// Красная полоса под верхней панелью, пока у сервера проблема.
@@ -1639,6 +1736,17 @@ impl App {
             })
             .response
             .on_hover_text("Если с основным сервером беда, на резервный можно переключиться одной кнопкой — в красной полосе или в окне показателей");
+            if !self.cfg.reserve.is_empty() {
+                let mut m = self.cfg.mirror;
+                if ui
+                    .checkbox(&mut m, "Дублировать загружаемые файлы на резервный сервер")
+                    .on_hover_text("Файлы, которые вы добавляете, сразу уходят и на резерв — при переключении там откроется та же презентация на том же слайде")
+                    .changed()
+                {
+                    self.cfg.mirror = m;
+                    self.save_cfg();
+                }
+            }
             ui.add_space(8.0);
             ui.checkbox(&mut self.cfg.windowed, "Сцена и показ в окне, а не на весь экран (только для теста на одном компьютере)");
             let mut auto = self.autostart;
@@ -2227,7 +2335,8 @@ mod tests {
     #[ignore]
     fn e2e_list() {
         let (tx, rx) = channel();
-        let _c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let _c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
         let t = Instant::now();
         while t.elapsed() < Duration::from_secs(10) {
             if let Ok(CliEvent::State(s)) = rx.recv_timeout(Duration::from_secs(10)) {
@@ -2235,10 +2344,40 @@ mod tests {
                     println!("ITEM {} {} | {} | готов: {} | {}", n + 1, i.name, i.kind, i.ready, i.status);
                 }
                 println!("ITEMS {}", s.items.len());
+                let active = s.active.and_then(|id| s.items.iter().find(|i| i.id == id)).map(|i| i.name.clone());
+                println!("ACTIVE {:?} слайд {} из {}", active, s.page + 1, s.pages);
                 return;
             }
         }
         panic!("нет состояния от сервера");
+    }
+
+    /// Открыть элемент TEST_OPEN (позиция в списке) на слайде TEST_PAGE (с 1) на сервере TEST_PORT.
+    /// cargo test --release e2e_cmd -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_cmd() {
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (tx, rx) = channel();
+        let c = net::start_client("127.0.0.1".into(), env("TEST_PORT", 14999) as u16, "default_password".into(), tx, || {});
+        let (pos, page) = (env("TEST_OPEN", 1), env("TEST_PAGE", 1));
+        let t = Instant::now();
+        let mut sent = (false, false);
+        while t.elapsed() < Duration::from_secs(20) {
+            let Ok(CliEvent::State(s)) = rx.recv_timeout(Duration::from_secs(1)) else { continue };
+            let Some(id) = s.items.get(pos - 1).map(|i| i.id) else { continue };
+            if !sent.0 {
+                c.send(CliReq::Cmd(Cmd::Open { id }));
+                sent.0 = true;
+            } else if s.active == Some(id) && !sent.1 {
+                c.send(CliReq::Cmd(Cmd::GoTo { page: page - 1 }));
+                sent.1 = true;
+            } else if s.active == Some(id) && s.page == page - 1 {
+                println!("OPENED {} слайд {}", s.items[pos - 1].name, page);
+                return;
+            }
+        }
+        panic!("не открылось");
     }
 
     /// Команды во время загрузки большого файла: TEST_PDF (≥ 10 стр.), TEST_BIG (большой файл).

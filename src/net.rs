@@ -467,6 +467,28 @@ async fn client_task(
     "Соединение с сервером потеряно".into()
 }
 
+/// Загрузчик файлов на сервер без управляющего соединения — для дублирования на резервный сервер.
+/// Пока жив — живёт; события — те же `CliEvent::Progress / UploadOk / UploadErr`.
+pub struct Uploader {
+    tx: tmpsc::UnboundedSender<PathBuf>,
+}
+
+impl Uploader {
+    pub fn send(&self, path: PathBuf) {
+        let _ = self.tx.send(path);
+    }
+}
+
+pub fn start_uploader(host: String, port: u16, password: String, ev: Sender<CliEvent>, wake: impl Fn() + Send + Sync + 'static) -> Uploader {
+    let (tx, rx) = tmpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return };
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
+        rt.block_on(upload_worker(format!("ws://{host}:{port}"), password, rx, ev, wake));
+    });
+    Uploader { tx }
+}
+
 /// Останавливает задачу, когда клиент отключается.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
