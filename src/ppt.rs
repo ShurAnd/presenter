@@ -335,6 +335,7 @@ impl Host {
         // Чтение ответов. Конец вывода — мост умер: показ (если был) считаем оборвавшимся.
         let (on_event, current, proc) = (self.on_event.clone(), self.current.clone(), Arc::downgrade(&self.proc));
         std::thread::spawn(move || {
+            let mut last_pos: Option<(u64, usize, usize)> = None;
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let mut it = line.split_whitespace();
@@ -347,8 +348,12 @@ impl Host {
                         on_event(sid, PptEvent::Ready(num(0).unwrap_or(0), hwnd));
                     }
                     "pos" => {
+                        // Ответ на опрос раз в 400 мс обычно тот же — без изменений GUI не будим.
                         if let (Some(cur), Some(total)) = (num(0), num(1)) {
-                            on_event(sid, PptEvent::Pos(cur, total));
+                            if last_pos != Some((sid, cur, total)) {
+                                last_pos = Some((sid, cur, total));
+                                on_event(sid, PptEvent::Pos(cur, total));
+                            }
                         }
                     }
                     "ended" => on_event(sid, PptEvent::Ended),

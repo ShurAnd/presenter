@@ -360,6 +360,7 @@ mod win {
     unsafe fn event_loop(engine: &mut dyn Engine, hwnd: HWND, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
         let timer = SetTimer(None, 0, TICK_MS, None);
         let (mut ready, mut started, mut ended) = (false, false, false);
+        let mut last_pos: Option<(u32, u32, bool)> = None;
         let mut ticks = 0u32;
         let mut msg = MSG::default();
         'outer: while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -403,7 +404,12 @@ mod win {
                     // Сцену могли поднять наверх — держим видео поверх неё.
                     let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
-                on_event(VideoEvent::Pos { pos: t.pos, dur: t.dur, playing: t.playing });
+                // Сообщаем только об изменениях: иначе GUI 10 раз в секунду перерисовывал бы окна впустую.
+                let now = (t.pos as u32, t.dur as u32, t.playing);
+                if last_pos != Some(now) {
+                    last_pos = Some(now);
+                    on_event(VideoEvent::Pos { pos: t.pos, dur: t.dur, playing: t.playing });
+                }
                 if started && !ended && t.eof {
                     ended = true;
                     on_event(VideoEvent::Ended);

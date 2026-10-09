@@ -197,6 +197,26 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// Только рендер, без окна и текстур: чередуем два PDF, как при переключении презентаций.
+    /// TEST_PDF="a.pdf;b.pdf" TEST_ROUNDS=60 cargo test --release soak_render -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn soak_render() {
+        let files: Vec<PathBuf> = std::env::var("TEST_PDF").unwrap().split(';').map(PathBuf::from).collect();
+        let rounds: usize = std::env::var("TEST_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let r = Renderer::new(tx, || {});
+        for i in 0..rounds {
+            let pdf = &files[i % files.len()];
+            let keys: Vec<PageKey> = (0..5).map(|page| PageKey { id: i as u64, page, w: 1920, h: 1080 }).collect();
+            r.want(pdf, keys);
+            for _ in 0..5 {
+                rx.recv().unwrap();
+            }
+            println!("ROUND {i}");
+        }
+    }
+
     /// Время рендера каждой страницы под 1920×1080 (или TEST_SIZE):
     /// TEST_PDF="a.pdf" cargo test --release bench_render -- --ignored --nocapture
     #[test]

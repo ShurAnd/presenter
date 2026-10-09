@@ -620,7 +620,8 @@ impl App {
                 }
                 Out::Ppt { gen, ev } => {
                     if self.show.as_ref().is_some_and(|s| s.gen == gen) {
-                        self.dirty = true;
+                        // Позиция без изменений рассылки не требует.
+                        self.dirty |= !matches!(ev, ppt::PptEvent::Pos(..));
                         match ev {
                             ppt::PptEvent::Ready(total, hwnd) => {
                                 self.status.clear();
@@ -634,8 +635,9 @@ impl App {
                             }
                             ppt::PptEvent::Pos(cur, total) => {
                                 if let Some(s) = &mut self.show {
-                                    s.page = cur.saturating_sub(1);
-                                    s.pages = total.max(1);
+                                    let (page, pages) = (cur.saturating_sub(1), total.max(1));
+                                    self.dirty |= (s.page, s.pages) != (page, pages);
+                                    (s.page, s.pages) = (page, pages);
                                 }
                             }
                             ppt::PptEvent::Ended => self.close_show(),
@@ -669,13 +671,16 @@ impl App {
                             (v.pos, v.dur, v.state) = (pos, dur, state);
                         }
                         // Доиграло — возвращаем фон.
-                        video::VideoEvent::Ended => self.close_show(),
+                        video::VideoEvent::Ended => {
+                            self.close_show();
+                            self.dirty = true;
+                        }
                         video::VideoEvent::Error(e) => {
                             self.close_show();
                             self.status = format!("Видео: {e}");
+                            self.dirty = true;
                         }
                     }
-                    self.dirty = true;
                 }
                 Out::Page { key, image } => {
                     let cur = self.show.as_ref().filter(|s| s.id == key.id).map(|s| s.page);
