@@ -2241,6 +2241,67 @@ mod tests {
         panic!("нет состояния от сервера");
     }
 
+    /// Команды во время загрузки большого файла: TEST_PDF (≥ 10 стр.), TEST_BIG (большой файл).
+    /// cargo test --release e2e_upload_cmd -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_upload_cmd() {
+        let pdf = PathBuf::from(std::env::var("TEST_PDF").unwrap());
+        let big = PathBuf::from(std::env::var("TEST_BIG").unwrap());
+        let (tx, rx) = channel();
+        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        let next_state = |timeout: Duration| -> Option<StateMsg> {
+            let t = Instant::now();
+            while let Ok(ev) = rx.recv_timeout(timeout.saturating_sub(t.elapsed())) {
+                match ev {
+                    CliEvent::State(s) => return Some(s),
+                    CliEvent::UploadOk(n) => println!("UPLOADED {n} at {} ms", t.elapsed().as_millis()),
+                    _ => {}
+                }
+            }
+            None
+        };
+        c.send(CliReq::Cmd(Cmd::Clear));
+        while next_state(Duration::from_secs(10)).is_some_and(|s| !s.items.is_empty()) {}
+        c.send(CliReq::Upload(pdf));
+        let id = loop {
+            let s = next_state(Duration::from_secs(30)).expect("нет состояния");
+            if let Some(i) = s.items.first().filter(|i| i.ready) {
+                break i.id;
+            }
+        };
+        c.send(CliReq::Cmd(Cmd::Open { id }));
+        let mut page = 0;
+        while next_state(Duration::from_secs(10)).is_some_and(|s| s.active != Some(id)) {}
+        let started = Instant::now();
+        c.send(CliReq::Upload(big));
+        let mut worst = 0u128;
+        for _ in 0..8 {
+            std::thread::sleep(Duration::from_millis(300));
+            let t = Instant::now();
+            c.send(CliReq::Cmd(Cmd::Next));
+            loop {
+                let s = next_state(Duration::from_secs(60)).expect("нет ответа");
+                if s.page != page {
+                    page = s.page;
+                    break;
+                }
+            }
+            let ms = t.elapsed().as_millis();
+            worst = worst.max(ms);
+            println!("NEXT -> слайд {} за {ms} мс (с начала загрузки {} мс)", page + 1, started.elapsed().as_millis());
+        }
+        println!("WORST {worst} ms");
+        // дождаться конца загрузки (большой файл)
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(120) {
+            if let Ok(CliEvent::UploadOk(n)) = rx.recv_timeout(Duration::from_secs(120)) {
+                println!("UPLOADED {n} through {} ms after start", started.elapsed().as_millis());
+                break;
+            }
+        }
+    }
+
     /// Видео против запущенного `presentator --server`:
     /// TEST_VIDEO="a.mp4" cargo test e2e_video -- --ignored --nocapture
     /// Загрузка → «готово к запуску» → (TEST_HOLD с) → Старт → ждём конца, на сцене снова фон.

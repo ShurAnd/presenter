@@ -82,7 +82,12 @@ pub struct StateMsg {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "t")]
 enum C2S {
-    Hello { password: String },
+    /// `upload` — соединение только для загрузки файлов: не считается клиентом, состояние по нему не шлём.
+    Hello {
+        password: String,
+        #[serde(default)]
+        upload: bool,
+    },
     Cmd { cmd: Cmd },
     UploadBegin { name: String, size: u64 },
     UploadEnd,
@@ -229,11 +234,12 @@ async fn serve_client(
 
     // Авторизация: первое сообщение обязано быть Hello с верным паролем.
     let hello = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
-    let ok = match hello {
-        Ok(Some(Ok(Message::Text(t)))) => {
-            matches!(serde_json::from_str::<C2S>(t.as_str()), Ok(C2S::Hello { password: p }) if p == password)
-        }
-        _ => false,
+    let (ok, upload_only) = match hello {
+        Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str::<C2S>(t.as_str()) {
+            Ok(C2S::Hello { password: p, upload }) => (p == password, upload),
+            _ => (false, false),
+        },
+        _ => (false, false),
     };
     if !ok {
         let _ = ws.send(js(&S2C::Denied { reason: "Неверный пароль".into() })).await;
@@ -243,12 +249,13 @@ async fn serve_client(
     if ws.send(js(&S2C::Welcome)).await.is_err() {
         return;
     }
-    let _ = ev.send(SrvEvent::Clients(clients.fetch_add(1, Ordering::SeqCst) + 1));
-    wake();
-
-    let first = state_rx.borrow_and_update().clone();
-    if !first.is_empty() {
-        let _ = ws.send(Message::text(first)).await;
+    if !upload_only {
+        let _ = ev.send(SrvEvent::Clients(clients.fetch_add(1, Ordering::SeqCst) + 1));
+        wake();
+        let first = state_rx.borrow_and_update().clone();
+        if !first.is_empty() {
+            let _ = ws.send(Message::text(first)).await;
+        }
     }
 
     // Текущая загрузка: (имя, путь, файл, ожидаемый размер, принято)
@@ -256,12 +263,12 @@ async fn serve_client(
 
     loop {
         tokio::select! {
-            changed = state_rx.changed() => {
+            changed = state_rx.changed(), if !upload_only => {
                 if changed.is_err() { break; }
                 let s = state_rx.borrow_and_update().clone();
                 if ws.send(Message::text(s)).await.is_err() { break; }
             }
-            changed = health_rx.changed() => {
+            changed = health_rx.changed(), if !upload_only => {
                 if changed.is_err() { break; }
                 let s = health_rx.borrow_and_update().clone();
                 if !s.is_empty() && ws.send(Message::text(s)).await.is_err() { break; }
@@ -318,8 +325,10 @@ async fn serve_client(
         drop(f);
         let _ = tokio::fs::remove_file(&path).await;
     }
-    let _ = ev.send(SrvEvent::Clients(clients.fetch_sub(1, Ordering::SeqCst) - 1));
-    wake();
+    if !upload_only {
+        let _ = ev.send(SrvEvent::Clients(clients.fetch_sub(1, Ordering::SeqCst) - 1));
+        wake();
+    }
 }
 
 // ---------------------------------------------------------------- клиент
@@ -370,6 +379,7 @@ pub fn start_client(
                 return;
             }
         };
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let reason = rt.block_on(client_task(host, port, password, rx, &ev, &wake));
         let _ = ev.send(CliEvent::Closed(reason));
         wake();
@@ -383,16 +393,20 @@ async fn client_task(
     password: String,
     mut rx: tmpsc::UnboundedReceiver<CliReq>,
     ev: &Sender<CliEvent>,
-    wake: &(impl Fn() + Send + Sync),
+    wake: &Arc<dyn Fn() + Send + Sync>,
 ) -> String {
     let url = format!("ws://{host}:{port}");
+    // Загрузки — отдельной задачей по своему соединению: команды не ждут, пока едет большой файл.
+    let (up_tx, up_rx) = tmpsc::unbounded_channel::<PathBuf>();
+    let uploader = tokio::spawn(upload_worker(url.clone(), password.clone(), up_rx, ev.clone(), wake.clone()));
+    let _stop_uploader = AbortOnDrop(uploader);
     let conn = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(&url)).await;
     let mut ws = match conn {
         Ok(Ok((ws, _))) => ws,
         Ok(Err(e)) => return format!("Не удалось подключиться к {host}:{port} ({e})"),
         Err(_) => return format!("Сервер {host}:{port} не отвечает"),
     };
-    if ws.send(js(&C2S::Hello { password })).await.is_err() {
+    if ws.send(js(&C2S::Hello { password, upload: false })).await.is_err() {
         return "Соединение разорвано".into();
     }
     match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -425,11 +439,7 @@ async fn client_task(
                         if ws.send(js(&C2S::Cmd { cmd })).await.is_err() { break; }
                     }
                     CliReq::Upload(path) => {
-                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                        if let Err(msg) = upload(&mut ws, &path, &name, ev, wake).await {
-                            let _ = ev.send(CliEvent::UploadErr { name, msg });
-                            wake();
-                        }
+                        let _ = up_tx.send(path);
                     }
                 }
             }
@@ -457,12 +467,101 @@ async fn client_task(
     "Соединение с сервером потеряно".into()
 }
 
+/// Останавливает задачу, когда клиент отключается.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Загрузки файлов по отдельному соединению (помечено `upload`): по очереди, соединение
+/// открывается при первой загрузке и переоткрывается, если оборвалось.
+async fn upload_worker(
+    url: String,
+    password: String,
+    mut rx: tmpsc::UnboundedReceiver<PathBuf>,
+    ev: Sender<CliEvent>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) {
+    let mut conn: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>> = None;
+    while let Some(path) = rx.recv().await {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if conn.is_none() {
+            conn = open_upload_conn(&url, &password).await.ok();
+        }
+        let result = match conn.as_mut() {
+            Some(ws) => upload(ws, &path, &name, &ev, &*wake).await,
+            None => Err("не удалось открыть соединение для передачи файла".into()),
+        };
+        let result = match (result, conn.as_mut()) {
+            // Ответ сервера о приёме файла (по этому соединению ничего другого не приходит).
+            (Ok(()), Some(ws)) => match tokio::time::timeout(Duration::from_secs(120), wait_upload_reply(ws)).await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(msg))) => Err(msg),
+                Ok(Err(e)) => Err(e),
+                Err(_) => Err("сервер не подтвердил приём файла".into()),
+            },
+            (r, _) => r,
+        };
+        match result {
+            Ok(()) => {
+                let _ = ev.send(CliEvent::UploadOk(name));
+            }
+            Err(msg) => {
+                conn = None; // при следующей загрузке — новое соединение
+                let _ = ev.send(CliEvent::UploadErr { name, msg });
+            }
+        }
+        wake();
+    }
+}
+
+async fn open_upload_conn(
+    url: &str,
+    password: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>, String> {
+    let (mut ws, _) = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(url))
+        .await
+        .map_err(|_| "сервер не отвечает".to_string())?
+        .map_err(|e| e.to_string())?;
+    ws.send(js(&C2S::Hello { password: password.to_string(), upload: true })).await.map_err(|e| e.to_string())?;
+    match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str::<S2C>(t.as_str()) {
+            Ok(S2C::Welcome) => Ok(ws),
+            Ok(S2C::Denied { reason }) => Err(reason),
+            _ => Err("неожиданный ответ сервера".into()),
+        },
+        _ => Err("сервер не ответил на авторизацию".into()),
+    }
+}
+
+/// Ждём UploadOk / UploadErr; состояние и показатели (если сервер старой версии их шлёт) пропускаем.
+async fn wait_upload_reply<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Result<Result<(), String>, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    while let Some(msg) = ws.next().await {
+        if let Ok(Message::Text(t)) = msg {
+            match serde_json::from_str::<S2C>(t.as_str()) {
+                Ok(S2C::UploadOk { .. }) => return Ok(Ok(())),
+                Ok(S2C::UploadErr { msg, .. }) => return Ok(Err(msg)),
+                _ => {}
+            }
+        } else if msg.is_err() {
+            break;
+        }
+    }
+    Err("соединение для передачи файла оборвалось".into())
+}
+
 async fn upload<S>(
     ws: &mut tokio_tungstenite::WebSocketStream<S>,
     path: &PathBuf,
     name: &str,
     ev: &Sender<CliEvent>,
-    wake: &(impl Fn() + Send + Sync),
+    wake: &(dyn Fn() + Send + Sync),
 ) -> Result<(), String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
