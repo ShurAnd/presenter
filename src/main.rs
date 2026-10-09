@@ -8,6 +8,7 @@ mod render;
 #[cfg(windows)]
 mod mpv;
 mod video;
+mod watchdog;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,12 @@ const GOTO_TIMEOUT: Duration = Duration::from_secs(4);
 const DOUBLE_ESC: Duration = Duration::from_millis(600);
 
 fn main() -> eframe::Result {
+    // `--watchdog`: окна нет — сторож запускает сервер (остальные ключи) и перезапускает его при сбое.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--watchdog") {
+        watchdog::run(args.into_iter().filter(|a| a != "--watchdog").collect());
+        return Ok(());
+    }
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("Presentator v{}", env!("CARGO_PKG_VERSION")))
         .with_inner_size([750.0, 620.0])
@@ -314,6 +321,8 @@ struct App {
     health_at: Option<Instant>,
     /// Связь с сервером оборвалась не по нашей команде — причина (для красной полосы).
     lost: Option<String>,
+    /// Автозапуск сервера со сторожем при входе в Windows (состояние читается из реестра при запуске).
+    autostart: bool,
     /// Автопереподключение после обрыва: номер попытки и когда делать следующую.
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
@@ -411,6 +420,7 @@ impl App {
             health_at: None,
             lost: None,
             reconnect: None,
+            autostart: watchdog::autostart_enabled(),
             health_open: false,
             stage: false,
             stage_sent: None,
@@ -1631,6 +1641,16 @@ impl App {
             .on_hover_text("Если с основным сервером беда, на резервный можно переключиться одной кнопкой — в красной полосе или в окне показателей");
             ui.add_space(8.0);
             ui.checkbox(&mut self.cfg.windowed, "Сцена и показ в окне, а не на весь экран (только для теста на одном компьютере)");
+            let mut auto = self.autostart;
+            let resp = ui.checkbox(&mut auto, "Запускать сервер при входе в Windows (с самовосстановлением после сбоя)").on_hover_text(
+                r"Сервер стартует сам при входе в Windows. Сторож следит за ним: упал или завис — перезапустит, с тем же списком. Закрыли сервер сами — сторож тоже завершится. Журнал: %APPDATA%\presenter\watchdog.log",
+            );
+            if resp.changed() {
+                match watchdog::set_autostart(auto) {
+                    Ok(()) => self.autostart = auto,
+                    Err(e) => self.net_status = format!("Не удалось изменить автозапуск: {e}"),
+                }
+            }
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
