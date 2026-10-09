@@ -9,7 +9,6 @@ mod video;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,13 +29,17 @@ const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
 /// Файлы фона рядом с exe — если есть, заменяют вшитую картинку. Берётся первый найденный.
 const BG_FILES: [&str; 3] = ["background.png", "background.jpg", "background.jpeg"];
 /// Сколько ждать после «ready» от PowerPoint, прежде чем убрать сцену: слайд-шоу должно успеть отрисоваться.
-const PPT_SETTLE: Duration = Duration::from_millis(500);
+const PPT_SETTLE: Duration = Duration::from_millis(300);
+/// PowerPoint не открыл показ за это время — считаем, что он завис, и перезапускаем мост.
+const PPT_TIMEOUT: Duration = Duration::from_secs(25);
 /// Пауза между опусканием сцены и выводом слайд-шоу на передний план.
 const PPT_LOWER: Duration = Duration::from_millis(120);
 /// Сколько минимум виден фон при открытии презентации (и при переключении между ними).
 const SWITCH_BG: Duration = Duration::from_millis(500);
 /// Сколько страниц PDF вперёд готовить заранее (на очень больших экранах — на одну меньше).
 const PREFETCH_AHEAD: usize = 3;
+/// Набранный с клавиатуры номер слайда забывается, если Enter не нажали за это время.
+const GOTO_TIMEOUT: Duration = Duration::from_secs(4);
 /// Два нажатия Esc с интервалом не больше этого скрывают сцену.
 const DOUBLE_ESC: Duration = Duration::from_millis(600);
 
@@ -126,10 +129,9 @@ struct VideoShow {
 
 /// Показ PowerPoint запускается за сценой и выходит на экран, только когда готов.
 struct PptShow {
-    src: PathBuf,
-    /// None — ждём, пока завершится мост прежнего показа.
-    ppt: Option<ppt::Ppt>,
     phase: PptPhase,
+    /// Окно слайд-шоу (из ответа `ready`).
+    hwnd: isize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -145,11 +147,8 @@ enum PptPhase {
 }
 
 impl Show {
-    fn ppt(&self) -> Option<&ppt::Ppt> {
-        match &self.kind {
-            ShowKind::Ppt(p) => p.ppt.as_ref(),
-            ShowKind::Pdf(_) | ShowKind::Video(_) => None,
-        }
+    fn is_ppt(&self) -> bool {
+        matches!(self.kind, ShowKind::Ppt(_))
     }
 
     fn video(&self) -> Option<&VideoShow> {
@@ -185,8 +184,13 @@ struct App {
     show: Option<Show>,
     show_gen: u64,
     dirty: bool,
-    /// Мосты закрытых показов PowerPoint, которые ещё не завершились.
-    retiring: Vec<(Arc<AtomicBool>, Instant)>,
+    /// Постоянный мост к PowerPoint (один на всё время работы).
+    ppt_host: ppt::Host,
+    /// Набираемый с клавиатуры номер слайда (цифры, затем Enter) и время последней цифры.
+    goto_buf: String,
+    goto_at: Option<Instant>,
+    /// Поле «перейти к слайду» в главном окне.
+    goto_field: String,
 
     // Сцена — полноэкранное окно с фоном, на котором идут показы
     stage: bool,
@@ -248,6 +252,14 @@ impl App {
         let (srv_tx, srv_rx) = channel();
         let (cli_tx, cli_rx) = channel();
 
+        // Мост к PowerPoint: события приходят с номером показа (он же поколение `gen`).
+        let ppt_host = {
+            let (tx, ctx) = (out_tx.clone(), cc.egui_ctx.clone());
+            ppt::Host::new(move |gen, ev| {
+                let _ = tx.send(Out::Ppt { gen, ev });
+                ctx.request_repaint();
+            })
+        };
         let mut app = Self {
             cfg,
             ctx: cc.egui_ctx.clone(),
@@ -257,7 +269,10 @@ impl App {
             show: None,
             show_gen: 0,
             dirty: false,
-            retiring: Vec::new(),
+            ppt_host,
+            goto_buf: String::new(),
+            goto_at: None,
+            goto_field: String::new(),
             stage: false,
             stage_sent: None,
             bg: None,
@@ -376,9 +391,18 @@ impl App {
                         ShowKind::Video(VideoShow { player, state: VideoState::Loading, pos: 0.0, dur: 0.0 })
                     }
                     None => {
-                        self.status = format!("Запуск PowerPoint: «{name}»…");
-                        // Сам запуск — в tick_ppt, когда завершится мост прежнего показа.
-                        ShowKind::Ppt(PptShow { src, ppt: None, phase: PptPhase::Loading })
+                        let (tx, c) = (self.out_tx.clone(), self.ctx.clone());
+                        ppt::install_esc_hook(move || {
+                            let _ = tx.send(Out::ShowEsc);
+                            c.request_repaint();
+                        });
+                        // Прежний показ мост закрывает сам, перед открытием нового — в том же PowerPoint.
+                        if let Err(e) = self.ppt_host.open(gen, &src, self.cfg.windowed) {
+                            self.status = format!("PowerPoint: {e}");
+                            return;
+                        }
+                        self.status = format!("Открытие в PowerPoint: «{name}»…");
+                        ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0 })
                     }
                 };
                 self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now() });
@@ -408,14 +432,10 @@ impl App {
                 // У презентаций пробел — следующий шаг, как в PowerPoint.
                 _ => self.apply(Cmd::Next),
             },
-            Cmd::Next => match self.show.as_ref().map(|s| (matches!(s.kind, ShowKind::Ppt(_)), s.ppt())) {
-                Some((true, p)) => p.into_iter().for_each(|p| p.send("next")),
-                _ => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
-            },
-            Cmd::Prev => match self.show.as_ref().map(|s| (matches!(s.kind, ShowKind::Ppt(_)), s.ppt())) {
-                Some((true, p)) => p.into_iter().for_each(|p| p.send("prev")),
-                _ => self.go(|s| s.page.saturating_sub(1)),
-            },
+            Cmd::Next if self.show.as_ref().is_some_and(Show::is_ppt) => self.ppt_host.send("next"),
+            Cmd::Prev if self.show.as_ref().is_some_and(Show::is_ppt) => self.ppt_host.send("prev"),
+            Cmd::Next => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
+            Cmd::Prev => self.go(|s| s.page.saturating_sub(1)),
             Cmd::Background => {
                 self.close_show();
                 self.stage = true;
@@ -454,13 +474,13 @@ impl App {
             let p = f(s);
             match &s.kind {
                 // Позицию PowerPoint сообщит сам — в нём шаг может быть анимацией, а не слайдом.
-                ShowKind::Ppt(PptShow { ppt: Some(ppt), .. }) => {
+                ShowKind::Ppt(_) => {
                     if p == s.page + 1 {
-                        ppt.send("next");
+                        self.ppt_host.send("next");
                     } else if p + 1 == s.page {
-                        ppt.send("prev");
+                        self.ppt_host.send("prev");
                     } else if p != s.page {
-                        ppt.send(&format!("goto {}", p + 1));
+                        self.ppt_host.send(&format!("goto {}", p + 1));
                     }
                 }
                 ShowKind::Pdf(_) => {
@@ -470,7 +490,6 @@ impl App {
                         self.trim_pages(id, p);
                     }
                 }
-                ShowKind::Ppt(_) => {} // PowerPoint ещё запускается
                 ShowKind::Video(_) => {}
             }
         }
@@ -478,63 +497,45 @@ impl App {
 
     /// Закрывает показ; сцена (если она есть) остаётся и показывает фон.
     fn close_show(&mut self) {
-        if let Some(Show { kind: ShowKind::Ppt(PptShow { ppt: Some(p), .. }), .. }) = self.show.take() {
-            self.retiring.push((p.done_flag(), Instant::now()));
+        if self.show.take().is_some_and(|s| s.is_ppt()) {
             // Сцена лежит прямо под слайд-шоу, поэтому при его закрытии сразу виден фон.
+            self.ppt_host.close();
         }
+        self.goto_buf.clear();
         self.reset_pages(true);
     }
 
-    /// Запуск PowerPoint и вывод слайд-шоу на экран — по шагам, чтобы запуск не был виден.
+    /// Вывод слайд-шоу на экран — по шагам, чтобы запуск не был виден, плюс сторож зависаний.
     fn tick_ppt(&mut self, ctx: &egui::Context) {
-        // Мост, не завершившийся за 8 с, больше не ждём.
-        self.retiring.retain(|(done, t)| !done.load(Ordering::SeqCst) && t.elapsed() < Duration::from_secs(8));
-        let waiting = !self.retiring.is_empty();
-        let (windowed, out_tx) = (self.cfg.windowed, self.out_tx.clone());
-        let Some(show) = &mut self.show else {
-            if waiting {
-                ctx.request_repaint_after(Duration::from_millis(100));
-            }
-            return;
-        };
-        let gen = show.gen;
+        let Some(show) = &mut self.show else { return };
         let ShowKind::Ppt(ps) = &mut show.kind else { return };
-        match (&ps.ppt, ps.phase) {
-            (None, _) if waiting => ctx.request_repaint_after(Duration::from_millis(100)),
-            (None, _) => {
-                let (tx, c) = (out_tx.clone(), ctx.clone());
-                ppt::install_esc_hook(move || {
-                    let _ = tx.send(Out::ShowEsc);
-                    c.request_repaint();
-                });
-                let c = ctx.clone();
-                match ppt::Ppt::start(&ps.src, windowed, move |ev| {
-                    let _ = out_tx.send(Out::Ppt { gen, ev });
-                    c.request_repaint();
-                }) {
-                    Ok(p) => ps.ppt = Some(p),
-                    Err(e) => {
-                        self.status = format!("PowerPoint: {e}");
-                        self.close_show();
-                        self.dirty = true;
-                    }
+        match ps.phase {
+            PptPhase::Loading => {
+                if show.opened.elapsed() >= PPT_TIMEOUT {
+                    // PowerPoint не отвечает (завис, висит его диалог) — перезапускаем мост.
+                    self.ppt_host.restart();
+                    self.status = "PowerPoint не отвечает — мост перезапущен, откройте презентацию ещё раз".into();
+                    self.close_show();
+                    self.dirty = true;
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(500));
                 }
             }
-            (Some(_), PptPhase::Ready(t)) => {
+            PptPhase::Ready(t) => {
                 if t.elapsed() >= PPT_SETTLE && show.opened.elapsed() >= SWITCH_BG {
                     ps.phase = PptPhase::Lowered(Instant::now()); // сцена опустится в stage_window
                 }
                 ctx.request_repaint_after(Duration::from_millis(30));
             }
-            (Some(p), PptPhase::Lowered(t)) => {
+            PptPhase::Lowered(t) => {
                 if t.elapsed() >= PPT_LOWER {
-                    p.reveal();
+                    self.ppt_host.reveal(ps.hwnd);
                     ps.phase = PptPhase::Shown;
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(30));
                 }
             }
-            _ => {}
+            PptPhase::Shown => {}
         }
     }
 
@@ -577,6 +578,10 @@ impl App {
         self.next_id += 1;
         let name = name.unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
         self.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing });
+        if kind == "PPTX" {
+            // PowerPoint запускаем заранее (скрыто) — к показу он уже будет готов.
+            self.ppt_host.prewarm();
+        }
         let ctx = ctx.clone();
         render::prepare(id, path, self.out_tx.clone(), move || ctx.request_repaint());
         self.dirty = true;
@@ -617,12 +622,13 @@ impl App {
                     if self.show.as_ref().is_some_and(|s| s.gen == gen) {
                         self.dirty = true;
                         match ev {
-                            ppt::PptEvent::Ready(total) => {
+                            ppt::PptEvent::Ready(total, hwnd) => {
                                 self.status.clear();
                                 if let Some(s) = &mut self.show {
                                     s.pages = total.max(1);
                                     if let ShowKind::Ppt(p) = &mut s.kind {
                                         p.phase = PptPhase::Ready(Instant::now());
+                                        p.hwnd = hwnd;
                                     }
                                 }
                             }
@@ -888,7 +894,12 @@ impl App {
                     let (t, c) = video_label(v);
                     ui.label(RichText::new(t).strong().size(15.0).color(c));
                 } else if active {
-                    ui.label(RichText::new(format!("Слайд {} из {}", view.page + 1, view.pages)).strong().size(15.0));
+                    if !self.goto_buf.is_empty() {
+                        // Номер, набранный с клавиатуры, — подсказка оператору (на стене его не видно).
+                        ui.label(RichText::new(format!("К слайду {} — Enter", self.goto_buf)).strong().size(15.0).color(GREEN));
+                    } else {
+                        ui.label(RichText::new(format!("Слайд {} из {}", view.page + 1, view.pages)).strong().size(15.0));
+                    }
                 } else {
                     ui.label(RichText::new("Показ не запущен").color(GRAY));
                 }
@@ -899,8 +910,30 @@ impl App {
         } else {
             "Двойной щелчок открывает файл. Пробел — следующий шаг или старт/пауза видео. Двойной Esc на экране показа закрывает его, на фоне — убирает фон."
         };
-        let text = if self.status.is_empty() { hint } else { self.status.as_str() };
-        ui.label(RichText::new(text).size(11.5).color(Color32::from_gray(0x66)));
+        let text = if self.status.is_empty() { hint } else { self.status.as_str() }.to_owned();
+        let status = |ui: &mut egui::Ui| {
+            ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(Color32::from_gray(0x66))).truncate());
+        };
+        if !(active && view.video.is_none()) {
+            status(ui);
+            return;
+        }
+        // Слева строка состояния, справа переход к слайду по номеру (Enter в поле тоже работает).
+        egui::Sides::new().show(
+            ui,
+            status,
+            |ui| {
+                let go = btn(ui, "Перейти", BLUE).on_hover_text("Перейти к слайду с этим номером");
+                let field = ui.add(egui::TextEdit::singleline(&mut self.goto_field).hint_text("№").desired_width(44.0));
+                ui.label("Слайд №");
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                self.goto_field.retain(|c| c.is_ascii_digit());
+                if go.clicked() || enter {
+                    let n = std::mem::take(&mut self.goto_field);
+                    self.goto_number(&n, view);
+                }
+            },
+        );
     }
 
     fn list(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
@@ -1033,10 +1066,40 @@ impl App {
         for cmd in nav_keys(ctx, view) {
             self.act(cmd);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+        let (digits, enter) = typed_digits(ctx);
+        if !self.goto_typed(&digits, enter, view) && enter {
             if let Some(id) = self.selected {
                 self.act(Cmd::Open { id });
             }
+        }
+    }
+
+    /// Номер слайда с клавиатуры, как в PowerPoint: цифры, затем Enter. Работает в главном окне
+    /// и на экране показа. Возвращает true, если Enter ушёл на переход к слайду.
+    fn goto_typed(&mut self, digits: &str, enter: bool, view: &StateMsg) -> bool {
+        if view.active.is_none() || view.video.is_some() || self.goto_at.is_some_and(|t| t.elapsed() > GOTO_TIMEOUT) {
+            self.goto_buf.clear();
+            self.goto_at = None;
+        }
+        if view.active.is_some() && view.video.is_none() && !digits.is_empty() {
+            self.goto_buf.push_str(digits);
+            self.goto_buf.truncate(4);
+            self.goto_at = Some(Instant::now());
+        }
+        if !enter || self.goto_buf.is_empty() {
+            return false;
+        }
+        let n = std::mem::take(&mut self.goto_buf);
+        self.goto_number(&n, view);
+        true
+    }
+
+    /// Перейти к слайду с номером `n` (с единицы).
+    fn goto_number(&mut self, n: &str, view: &StateMsg) {
+        match n.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= view.pages => self.act(Cmd::GoTo { page: n - 1 }),
+            _ if n.is_empty() => {}
+            _ => self.status = format!("Нет слайда {n}: в презентации {} слайдов", view.pages),
         }
     }
 
@@ -1075,7 +1138,7 @@ impl App {
         // «полноэкранного приложения», и кадры перестают выводиться на экран.
         let (pos, size) = if windowed { (egui::pos2(80.0, 80.0), egui::vec2(960.0, 540.0)) } else { (egui::Pos2::ZERO, monitor + egui::vec2(0.0, 1.0)) };
         let builder = egui::ViewportBuilder::default()
-            .with_title("Presentator — сцена")
+            .with_title(ppt::STAGE_TITLE)
             .with_icon(app_icon())
             .with_position(pos)
             .with_inner_size(size)
@@ -1085,6 +1148,7 @@ impl App {
         let mut wanted: Vec<PageKey> = Vec::new();
         let mut hide = false;
         let mut esc = false;
+        let mut typed = (String::new(), false);
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
         let (textures, last_tex, error, bg, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg, &self.failed);
@@ -1112,6 +1176,7 @@ impl App {
             }
             cmds.extend(nav_keys(ctx, &view));
             esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+            typed = typed_digits(ctx);
             // Пока на экране сцена (фон или презентация), курсора не видно.
             ctx.set_cursor_icon(egui::CursorIcon::None);
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ctx, |ui| {
@@ -1163,6 +1228,15 @@ impl App {
                 }
             });
         });
+        // Уровень окна сцены дублируем напрямую через Windows: при смене, а пока PowerPoint
+        // готовит показ за сценой — каждый кадр (его окно не должно вылезти поверх фона).
+        let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
+        if !windowed && (sent.is_none_or(|(t, _)| t != top) || ppt_loading) {
+            ppt::stage_topmost(top);
+        }
+        if ppt_loading {
+            ctx.request_repaint_after(Duration::from_millis(15));
+        }
         self.stage_sent = Some((top, !windowed));
 
         if let Some((_, _, _, pdf)) = pdf {
@@ -1174,6 +1248,7 @@ impl App {
         if esc {
             self.esc_press();
         }
+        self.goto_typed(&typed.0, typed.1, &self.local_state());
         if hide && self.show.is_none() {
             self.stage = false;
         }
@@ -1205,6 +1280,18 @@ fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(ctx.load_texture("background", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR))
+}
+
+/// Цифры, набранные без Shift (Shift+цифра открывает презентацию по номеру), и нажат ли Enter.
+fn typed_digits(ctx: &egui::Context) -> (String, bool) {
+    ctx.input(|i| {
+        let digits = if i.modifiers.shift || i.modifiers.ctrl || i.modifiers.alt {
+            String::new()
+        } else {
+            i.events.iter().filter_map(|e| if let egui::Event::Text(t) = e { Some(t.as_str()) } else { None }).flat_map(str::chars).filter(char::is_ascii_digit).collect()
+        };
+        (digits, i.key_pressed(egui::Key::Enter))
+    })
 }
 
 /// Клавиши управления показом — общие для главного окна и сцены. Esc обрабатывает только сцена (`esc_press`).
@@ -1374,6 +1461,62 @@ mod tests {
             wait("close", &|e| matches!(e, CliEvent::State(s) if s.active.is_none()));
             std::thread::sleep(hold);
         }
+    }
+
+    /// Переключение презентаций против запущенного `presentator --server`:
+    /// TEST_FILES="a.pptx;b.pptx;c.pdf" TEST_SEQ="1,2,1,3,2" TEST_HOLD=4 cargo test --release e2e_switch -- --ignored --nocapture
+    /// Печатает момент каждой команды (unix-мс), чтобы сопоставить со снимками экрана.
+    #[test]
+    #[ignore]
+    fn e2e_switch() {
+        let files: Vec<PathBuf> = std::env::var("TEST_FILES").unwrap().split(';').map(PathBuf::from).collect();
+        let seq: Vec<u64> = std::env::var("TEST_SEQ").unwrap().split(',').map(|x| x.trim().parse().unwrap()).collect();
+        let hold = Duration::from_secs_f64(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(4.0));
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+        let (tx, rx) = channel();
+        let wait = |what: &str, f: &dyn Fn(&StateMsg) -> bool| {
+            let t = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(60).saturating_sub(t.elapsed())).unwrap_or_else(|_| panic!("timeout: {what}")) {
+                    CliEvent::Closed(r) => panic!("closed: {r}"),
+                    CliEvent::State(s) => {
+                        if !s.message.is_empty() {
+                            println!("MSG {} {}", now(), s.message);
+                        }
+                        if f(&s) {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        for f in &files {
+            c.send(CliReq::Upload(f.clone()));
+        }
+        let n = files.len();
+        wait("ready", &|s| s.items.len() == n && s.items.iter().all(|i| i.ready));
+        for id in seq {
+            println!("OPEN {id} {}", now());
+            c.send(CliReq::Cmd(Cmd::Open { id }));
+            wait("open", &|s| s.active == Some(id));
+            // Пока держим показ — печатаем смену слайда (для проверки перехода по номеру).
+            let end = Instant::now() + hold;
+            let mut last = None;
+            while let Ok(ev) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
+                if let CliEvent::State(s) = ev {
+                    if last != Some(s.page) {
+                        println!("PAGE {} {}/{}", now(), s.page + 1, s.pages);
+                        last = Some(s.page);
+                    }
+                }
+            }
+        }
+        println!("CLOSE {}", now());
+        c.send(CliReq::Cmd(Cmd::Close));
+        wait("close", &|s| s.active.is_none());
+        std::thread::sleep(Duration::from_secs(2));
     }
 
     /// Видео против запущенного `presentator --server`:

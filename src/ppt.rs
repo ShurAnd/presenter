@@ -1,17 +1,17 @@
 //! Показ PPTX через установленный PowerPoint: запускается настоящее слайд-шоу,
 //! которым мы управляем (вперёд, назад, переход к слайду) и за которым следим.
-//! Мост к PowerPoint — скрытый процесс PowerShell, работающий с ним по COM.
+//! Мост к PowerPoint — скрытый постоянный процесс PowerShell, работающий с ним по COM.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub enum PptEvent {
-    /// Показ запущен; число слайдов.
-    Ready(usize),
+    /// Показ запущен; число слайдов и дескриптор окна слайд-шоу (0 — неизвестен).
+    Ready(usize, isize),
     /// Текущий слайд (с единицы) и всего слайдов.
     Pos(usize, usize),
     /// Показ завершён (в том числе закрыт на самом сервере).
@@ -19,70 +19,135 @@ pub enum PptEvent {
     Error(String),
 }
 
+/// Постоянный мост: один процесс PowerShell и один PowerPoint на всё время работы программы.
+/// Открыть показ = открыть файл в уже запущенном PowerPoint (~0,2 с вместо ~1,5 с).
+/// Переключение — закрыть файл и открыть другой в том же PowerPoint: без перезапуска,
+/// поэтому нет гонки, когда новый показ подключался к ещё закрывающемуся PowerPoint.
+///
+/// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8>`, `next`, `prev`, `goto N`,
+/// `poll`, `show`, `close`, `quit`. Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`,
+/// `ended <sid>`, `error <sid> текст`.
 const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 function Say($s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
-$app = $null; $pres = $null; $win = $null; $total = 0
-try {
-    $app = New-Object -ComObject PowerPoint.Application
-    $pres = $app.Presentations.Open($env:PRES_SRC, -1, 0, 0)
-    $total = $pres.Slides.Count
-    $ss = $pres.SlideShowSettings
-    if ($env:PRES_WINDOWED -eq '1') { $ss.ShowType = 2 } else { $ss.ShowType = 1 }
-    try { $ss.ShowPresenterView = 0 } catch {}
-    $win = $ss.Run()
-    # Настройки показа выше меняют презентацию. Помечаем её сохранённой: иначе при закрытии
-    # (в том числе Esc в самом PowerPoint) он спросит о сохранении файла, открытого только для чтения.
-    $pres.Saved = -1
-    # Указатель мыши в показе всегда скрыт.
-    try { $win.View.PointerType = 3 } catch {}
-    Say ('ready ' + $total)
-} catch {
-    Say ('error ' + ($_.Exception.Message -replace '\s+', ' '))
+function Msg($e) { $e.Exception.Message -replace '\s+', ' ' }
+$script:app = $null; $script:pres = $null; $script:win = $null; $script:total = 0; $script:sid = '0'
+
+# Живой PowerPoint; если его закрыли или он упал — запускаем заново.
+function App {
+    if ($script:app) { try { $null = $script:app.Version; return $script:app } catch { $script:app = $null } }
+    $script:app = New-Object -ComObject PowerPoint.Application
+    return $script:app
 }
-if ($win) {
-    while ($true) {
-        $line = [Console]::In.ReadLine()
-        if ($line -eq $null -or $line -eq 'close') { break }
+
+function CloseShow {
+    # Exit у показа файла, открытого без окна, закрывает и сам файл; Close — на всякий случай.
+    if ($script:win) { try { $script:win.View.Exit() } catch {} }
+    if ($script:pres) { try { $script:pres.Saved = -1; $script:pres.Close() } catch {} }
+    $script:win = $null; $script:pres = $null
+}
+
+function OpenShow($path, $windowed) {
+    $a = App
+    $script:pres = $a.Presentations.Open($path, -1, 0, 0)
+    $script:total = $script:pres.Slides.Count
+    $ss = $script:pres.SlideShowSettings
+    if ($windowed -eq '1') { $ss.ShowType = 2 } else { $ss.ShowType = 1 }
+    try { $ss.ShowPresenterView = 0 } catch {}
+    $script:win = $ss.Run()
+    # Настройки показа выше меняют презентацию. Помечаем её сохранённой: иначе при закрытии
+    # PowerPoint спросит о сохранении файла, открытого только для чтения.
+    $script:pres.Saved = -1
+    # Указатель мыши в показе всегда скрыт.
+    try { $script:win.View.PointerType = 3 } catch {}
+}
+
+# PowerPoint запускаем сразу (скрыто) — к первому показу он уже готов.
+try { $null = App } catch {}
+Say 'host'
+
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($line -eq $null -or $line -eq 'quit') { break }
+    $parts = $line.Split(' ')
+    $cmd = $parts[0]
+    if ($cmd -eq 'open') {
+        CloseShow
+        $script:sid = $parts[1]
         try {
-            $view = $win.View
-            $cur = $view.CurrentShowPosition
-            if ($line -eq 'next') {
-                # На последнем шаге последнего слайда не идём дальше, иначе показ закроется.
-                $last = $false
-                if ($cur -ge $total) {
-                    try { $last = ($view.GetClickIndex() -ge $view.GetClickCount()) } catch { $last = $true }
-                }
-                if (-not $last) { $view.Next() }
-            } elseif ($line -eq 'prev') {
-                $view.Previous()
-            } elseif ($line -like 'goto *') {
-                $view.GotoSlide([int]$line.Substring(5))
-            } elseif ($line -eq 'show') {
-                # Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
-                try { $win.Activate() } catch {}
+            $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
+            try { OpenShow $path $parts[2] } catch {
+                # Одна повторная попытка с заново запущенным PowerPoint.
+                CloseShow; $script:app = $null; OpenShow $path $parts[2]
             }
-            # Опрос (poll) PowerPoint лишний раз не трогаем — он может как раз менять слайд.
-            if ($line -ne 'poll') { try { $pres.Saved = -1 } catch {} }
-            Say ('pos ' + $view.CurrentShowPosition + ' ' + $total)
+            $hwnd = 0; try { $hwnd = $script:win.HWND } catch {}
+            Say ('ready ' + $script:sid + ' ' + $script:total + ' ' + $hwnd)
         } catch {
-            # PowerPoint мог быть просто занят; показ окончен, только если его окна больше нет.
-            $alive = $false
-            try { $alive = ($app.SlideShowWindows.Count -gt 0) } catch {}
-            if (-not $alive) { Say 'ended'; $win = $null; break }
+            Say ('error ' + $script:sid + ' ' + (Msg $_)); CloseShow
         }
+        continue
+    }
+    if ($cmd -eq 'close') { CloseShow; continue }
+    if (-not $script:win) { continue }
+    try {
+        $view = $script:win.View
+        $cur = $view.CurrentShowPosition
+        if ($cmd -eq 'next') {
+            # На последнем шаге последнего слайда не идём дальше, иначе показ закроется.
+            $last = $false
+            if ($cur -ge $script:total) {
+                try { $last = ($view.GetClickIndex() -ge $view.GetClickCount()) } catch { $last = $true }
+            }
+            if (-not $last) { $view.Next() }
+        } elseif ($cmd -eq 'prev') {
+            $view.Previous()
+        } elseif ($cmd -eq 'goto') {
+            $view.GotoSlide([int]$parts[1])
+        } elseif ($cmd -eq 'show') {
+            # Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
+            try { $script:win.Activate() } catch {}
+        }
+        # Опрос (poll) PowerPoint лишний раз не трогаем — он может как раз менять слайд.
+        if ($cmd -ne 'poll') { try { $script:pres.Saved = -1 } catch {} }
+        Say ('pos ' + $script:sid + ' ' + $view.CurrentShowPosition + ' ' + $script:total)
+    } catch {
+        # PowerPoint мог быть просто занят; показ окончен, только если его окна больше нет.
+        $alive = $false
+        try { $alive = ($script:app.SlideShowWindows.Count -gt 0) } catch {}
+        if (-not $alive) { Say ('ended ' + $script:sid); $script:win = $null; CloseShow }
     }
 }
-try { if ($win) { $win.View.Exit() } } catch {}
-try { if ($pres) { $pres.Saved = -1; $pres.Close() } } catch {}
-try { if ($app -and $app.Presentations.Count -eq 0) { $app.Quit() } } catch {}
+CloseShow
+try { if ($script:app -and $script:app.Presentations.Count -eq 0) { $script:app.Quit() } } catch {}
 "#;
 
 #[cfg(windows)]
 #[link(name = "user32")]
 extern "system" {
     fn AllowSetForegroundWindow(pid: u32) -> i32;
+    fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+}
+
+/// Заголовок окна сцены — по нему мост находит её, чтобы положить прямо под слайд-шоу.
+pub const STAGE_TITLE: &str = "Presentator — сцена";
+
+/// Сцена «поверх всех окон» или обычное окно — напрямую через Windows. Команда уровня окна
+/// через egui/winit после первого показа PowerPoint повторно не срабатывала, и следующее
+/// слайд-шоу появлялось поверх фона ещё во время загрузки.
+pub fn stage_topmost(on: bool) {
+    #[cfg(windows)]
+    unsafe {
+        let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
+        let stage = FindWindowW(std::ptr::null(), title.as_ptr());
+        if stage != 0 {
+            // HWND_TOPMOST = -1, HWND_NOTOPMOST = -2; NOSIZE | NOMOVE | NOACTIVATE.
+            SetWindowPos(stage, if on { -1 } else { -2 }, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = on;
 }
 
 /// Перехват Esc в слайд-шоу PowerPoint. Сам PowerPoint закрывает показ по одиночному Esc,
@@ -197,15 +262,51 @@ pub fn grab_esc(on: bool) {
     let _ = on;
 }
 
-/// Пока жив этот объект — идёт показ. При уничтожении показ закрывается.
-pub struct Ppt {
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-    done: Arc<AtomicBool>,
+type Callback = Arc<dyn Fn(u64, PptEvent) + Send + Sync>;
+
+struct Proc {
+    stdin: ChildStdin,
+    child: Arc<Mutex<Child>>,
+    /// Номер запуска процесса — чтобы события умершего моста не путать с новым.
+    epoch: u64,
 }
 
-impl Ppt {
-    pub fn start(src: &Path, windowed: bool, on_event: impl Fn(PptEvent) + Send + 'static) -> Result<Ppt, String> {
-        // PRESENTATOR_PPT_CMD — подмена моста для отладки без PowerPoint.
+/// Мост к PowerPoint. Процесс запускается при первой надобности и живёт до выхода из программы;
+/// если он упал или его пришлось убить — запускается заново.
+pub struct Host {
+    proc: Arc<Mutex<Option<Proc>>>,
+    /// Номер текущего показа (0 — показа нет). События чужих показов отбрасываются в `App`.
+    current: Arc<AtomicU64>,
+    epoch: AtomicU64,
+    on_event: Callback,
+}
+
+impl Host {
+    pub fn new(on_event: impl Fn(u64, PptEvent) + Send + Sync + 'static) -> Host {
+        let host = Host { proc: Arc::new(Mutex::new(None)), current: Arc::new(AtomicU64::new(0)), epoch: AtomicU64::new(0), on_event: Arc::new(on_event) };
+        // Регулярный опрос позиции, пока идёт показ: слайды могут листать и на самом сервере.
+        let (proc, current) = (Arc::downgrade(&host.proc), host.current.clone());
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let Some(proc) = proc.upgrade() else { break };
+            if current.load(Ordering::SeqCst) != 0 {
+                write_line(&proc, "poll");
+            }
+        });
+        host
+    }
+
+    /// Запустить мост (и с ним PowerPoint) заранее, чтобы первый показ открылся быстро.
+    pub fn prewarm(&self) {
+        let _ = self.ensure();
+    }
+
+    fn ensure(&self) -> Result<(), String> {
+        let mut g = self.proc.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some() {
+            return Ok(());
+        }
+        // PRESENTATOR_PPT_CMD — подмена моста для отладки без PowerPoint (тот же протокол).
         let mut cmd = match std::env::var_os("PRESENTATOR_PPT_CMD") {
             Some(c) => Command::new(c),
             None => {
@@ -220,97 +321,148 @@ impl Ppt {
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
         let mut child = cmd
-            .env("PRES_SRC", src)
-            .env("PRES_WINDOWED", if windowed { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("не удалось запустить PowerShell: {e}"))?;
-        let stdin = Arc::new(Mutex::new(child.stdin.take()));
+        let stdin = child.stdin.take().ok_or("нет ввода процесса")?;
         let stdout = child.stdout.take().ok_or("нет вывода процесса")?;
-        let done = Arc::new(AtomicBool::new(false));
+        let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let child = Arc::new(Mutex::new(child));
+        *g = Some(Proc { stdin, child: child.clone(), epoch });
 
-        // Чтение событий.
-        let done_r = done.clone();
+        // Чтение ответов. Конец вывода — мост умер: показ (если был) считаем оборвавшимся.
+        let (on_event, current, proc) = (self.on_event.clone(), self.current.clone(), Arc::downgrade(&self.proc));
         std::thread::spawn(move || {
-            let mut finished = false;
-            let mut started = false;
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
-                let mut it = line.trim().splitn(2, ' ');
-                let (head, rest) = (it.next().unwrap_or(""), it.next().unwrap_or(""));
+                let mut it = line.split_whitespace();
+                let (head, sid) = (it.next().unwrap_or(""), it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0));
+                let rest: Vec<&str> = it.collect();
+                let num = |i: usize| rest.get(i).and_then(|x| x.parse::<usize>().ok());
                 match head {
                     "ready" => {
-                        started = true;
-                        on_event(PptEvent::Ready(rest.trim().parse().unwrap_or(0)));
+                        let hwnd = rest.get(1).and_then(|x| x.parse::<isize>().ok()).unwrap_or(0);
+                        on_event(sid, PptEvent::Ready(num(0).unwrap_or(0), hwnd));
                     }
                     "pos" => {
-                        let mut n = rest.split_whitespace().filter_map(|x| x.parse::<usize>().ok());
-                        if let (Some(cur), Some(total)) = (n.next(), n.next()) {
-                            on_event(PptEvent::Pos(cur, total));
+                        if let (Some(cur), Some(total)) = (num(0), num(1)) {
+                            on_event(sid, PptEvent::Pos(cur, total));
                         }
                     }
-                    "ended" => {
-                        finished = true;
-                        on_event(PptEvent::Ended);
-                    }
-                    "error" => {
-                        finished = true;
-                        on_event(PptEvent::Error(rest.to_string()));
-                    }
+                    "ended" => on_event(sid, PptEvent::Ended),
+                    "error" => on_event(sid, PptEvent::Error(rest.join(" "))),
                     _ => {}
                 }
             }
-            let _ = child.wait();
-            done_r.store(true, Ordering::SeqCst);
-            if !finished {
-                on_event(if started { PptEvent::Ended } else { PptEvent::Error("PowerPoint не запустился".into()) });
+            let _ = child.lock().unwrap_or_else(|e| e.into_inner()).wait();
+            if let Some(proc) = proc.upgrade() {
+                let mut g = proc.lock().unwrap_or_else(|e| e.into_inner());
+                if g.as_ref().is_some_and(|p| p.epoch == epoch) {
+                    *g = None;
+                }
+            }
+            let sid = current.load(Ordering::SeqCst);
+            if sid != 0 {
+                on_event(sid, PptEvent::Error("мост к PowerPoint завершился".into()));
             }
         });
-
-        // Регулярный опрос позиции: слайды могут листать и на самом сервере.
-        let poll = stdin.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(400));
-            let mut g = poll.lock().unwrap_or_else(|e| e.into_inner());
-            let ok = g.as_mut().is_some_and(|s| s.write_all(b"poll\n").and_then(|_| s.flush()).is_ok());
-            if !ok {
-                break;
-            }
-        });
-
-        Ok(Ppt { stdin, done })
+        Ok(())
     }
 
-    /// Флаг «процесс моста завершился». Нужен, чтобы не запускать новый показ,
-    /// пока прежний ещё закрывает PowerPoint (иначе его Quit() убьёт новый).
-    pub fn done_flag(&self) -> Arc<AtomicBool> {
-        self.done.clone()
+    /// Открыть презентацию и запустить показ. Прежний показ (если был) мост закроет сам.
+    pub fn open(&self, sid: u64, src: &Path, windowed: bool) -> Result<(), String> {
+        self.ensure()?;
+        self.current.store(sid, Ordering::SeqCst);
+        let path = base64(src.to_string_lossy().as_bytes());
+        self.send(&format!("open {sid} {} {path}", if windowed { 1 } else { 0 }));
+        Ok(())
     }
 
-    /// Вывести слайд-шоу на передний план (после того как сцена опустилась под него).
-    pub fn reveal(&self) {
-        // Разрешаем процессу PowerShell забрать фокус: сами мы сейчас активное окно.
+    /// Закрыть текущий показ; PowerPoint остаётся запущенным для следующего.
+    pub fn close(&self) {
+        if self.current.swap(0, Ordering::SeqCst) != 0 {
+            self.send("close");
+        }
+    }
+
+    /// PowerPoint завис: убиваем мост, следующий показ запустит его заново.
+    pub fn restart(&self) {
+        self.current.store(0, Ordering::SeqCst);
+        if let Some(p) = self.proc.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = p.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+        }
+    }
+
+    /// Вывести слайд-шоу на экран (сцена уже не «поверх всех»). Порядок окон ставим явно:
+    /// слайд-шоу наверх, сцену — прямо под него. Иначе со второго показа слайд-шоу, уже получившее
+    /// фокус, оставалось под сценой: опущенная сцена встаёт выше всех обычных окон,
+    /// а «вывести вперёд» окно, которое и так в фокусе, ничего не меняет.
+    pub fn reveal(&self, slideshow: isize) {
         #[cfg(windows)]
         unsafe {
+            const SWP: u32 = 0x0001 | 0x0002 | 0x0010; // NOSIZE | NOMOVE | NOACTIVATE
+            // Разрешаем PowerPoint забрать фокус (если сейчас он у нас) — для кликера.
             AllowSetForegroundWindow(u32::MAX); // ASFW_ANY
+            // PowerPoint не всегда отдаёт дескриптор окна показа — тогда ищем его по классу.
+            let class: Vec<u16> = "screenClass".encode_utf16().chain(Some(0)).collect();
+            let slideshow = if slideshow != 0 { slideshow } else { FindWindowW(class.as_ptr(), std::ptr::null()) };
+            if slideshow != 0 {
+                SetWindowPos(slideshow, 0, 0, 0, 0, 0, SWP); // HWND_TOP
+                let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
+                let stage = FindWindowW(std::ptr::null(), title.as_ptr());
+                if stage != 0 {
+                    SetWindowPos(stage, slideshow, 0, 0, 0, 0, SWP);
+                }
+            }
         }
+        #[cfg(not(windows))]
+        let _ = slideshow;
         self.send("show");
     }
 
     pub fn send(&self, line: &str) {
-        let mut g = self.stdin.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(s) = g.as_mut() {
-            let _ = s.write_all(format!("{line}\n").as_bytes()).and_then(|_| s.flush());
-        }
+        write_line(&self.proc, line);
     }
 }
 
-impl Drop for Ppt {
+impl Drop for Host {
     fn drop(&mut self) {
-        self.send("close");
-        // Закрываем канал: скрипт завершит показ и закроет презентацию.
-        *self.stdin.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Мост закроет показ и PowerPoint (если в нём нет чужих файлов) уже после нашего выхода.
+        self.send("quit");
+        self.proc.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
+fn write_line(proc: &Mutex<Option<Proc>>, line: &str) {
+    let mut g = proc.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(p) = g.as_mut() {
+        let _ = p.stdin.write_all(format!("{line}\n").as_bytes()).and_then(|_| p.stdin.flush());
+    }
+}
+
+/// Путь передаём в base64: так в одной строке протокола не мешают пробелы, кириллица и кавычки.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn base64() {
+        assert_eq!(super::base64(b""), "");
+        assert_eq!(super::base64(b"f"), "Zg==");
+        assert_eq!(super::base64(b"fo"), "Zm8=");
+        assert_eq!(super::base64(b"foo"), "Zm9v");
+        assert_eq!(super::base64("тест".as_bytes()), "0YLQtdGB0YI=");
     }
 }
