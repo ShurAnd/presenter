@@ -61,13 +61,66 @@ struct Config {
     ip: String,
     port: String,
     password: String,
+    /// Название сервера для списка (необязательно), например «Зал 1».
+    name: String,
     windowed: bool,
+    /// Серверы, к которым подключались, — последний использованный первым.
+    #[serde(deserialize_with = "null_as_empty")]
+    servers: Vec<SavedServer>,
+}
+
+/// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
+/// иначе из-за одного поля пропали бы все настройки.
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<SavedServer>, D::Error> {
+    Ok(Option::<Vec<SavedServer>>::deserialize(d)?.unwrap_or_default())
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { ip: "127.0.0.1".into(), port: "14999".into(), password: "default_password".into(), windowed: false }
+        Self {
+            ip: "127.0.0.1".into(),
+            port: "14999".into(),
+            password: "default_password".into(),
+            name: String::new(),
+            windowed: false,
+            servers: Vec::new(),
+        }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+#[serde(default)]
+struct SavedServer {
+    name: String,
+    ip: String,
+    port: String,
+    password: String,
+}
+
+impl SavedServer {
+    /// Сервер узнаём по адресу и порту.
+    fn key(&self) -> String {
+        format!("{}:{}", self.ip.trim(), self.port.trim())
+    }
+
+    fn label(&self) -> String {
+        if self.name.trim().is_empty() { self.key() } else { format!("{} — {}", self.name.trim(), self.key()) }
+    }
+}
+
+/// Сколько серверов помнить.
+const MAX_SERVERS: usize = 20;
+
+/// Добавить в `ours` серверы из `other`, которых там нет (кроме забытых в этом сеансе).
+/// Наш порядок сохраняется: свои — первыми.
+fn merge_servers(ours: &mut Vec<SavedServer>, other: Vec<SavedServer>, forgotten: &HashSet<String>) {
+    for srv in other {
+        let key = srv.key();
+        if !forgotten.contains(&key) && !ours.iter().any(|s| s.key() == key) {
+            ours.push(srv);
+        }
+    }
+    ours.truncate(MAX_SERVERS);
 }
 
 /// Значок окон (тот же, что вшит в exe). Декодируется один раз.
@@ -191,6 +244,8 @@ struct App {
     goto_at: Option<Instant>,
     /// Поле «перейти к слайду» в главном окне.
     goto_field: String,
+    /// Серверы, удалённые из списка в этом сеансе, — при сохранении не возвращаем их с диска.
+    forgotten: HashSet<String>,
 
     // Сцена — полноэкранное окно с фоном, на котором идут показы
     stage: bool,
@@ -273,6 +328,7 @@ impl App {
             goto_buf: String::new(),
             goto_at: None,
             goto_field: String::new(),
+            forgotten: HashSet::new(),
             stage: false,
             stage_sent: None,
             bg: None,
@@ -311,7 +367,12 @@ impl App {
     }
 
     fn save_cfg(&self) {
-        if let Ok(s) = serde_json::to_string_pretty(&self.cfg) {
+        // Список серверов объединяем с тем, что сейчас на диске: две копии программы на одном
+        // компьютере пишут один файл, и одна не должна стирать серверы, запомненные другой.
+        let mut cfg = self.cfg.clone();
+        let disk: Option<Config> = std::fs::read_to_string(config_path()).ok().and_then(|s| serde_json::from_str(&s).ok());
+        merge_servers(&mut cfg.servers, disk.map(|c| c.servers).unwrap_or_default(), &self.forgotten);
+        if let Ok(s) = serde_json::to_string_pretty(&cfg) {
             let path = config_path();
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -735,6 +796,7 @@ impl App {
                     self.close_show();
                     self.net_status = format!("Подключено к {}:{}", self.cfg.ip, self.cfg.port);
                     self.status.clear();
+                    self.remember_server();
                 }
                 CliEvent::Closed(reason) => {
                     self.connected = false;
@@ -798,6 +860,28 @@ impl App {
         }
     }
 
+    /// Подтянуть в список серверы, которые запомнила другая копия программы после нашего запуска.
+    fn merge_servers_from_disk(&mut self) {
+        let disk: Option<Config> = std::fs::read_to_string(config_path()).ok().and_then(|s| serde_json::from_str(&s).ok());
+        merge_servers(&mut self.cfg.servers, disk.map(|c| c.servers).unwrap_or_default(), &self.forgotten);
+    }
+
+    /// Запомнить текущий сервер (адрес, порт, пароль, название) первым в списке.
+    fn remember_server(&mut self) {
+        let srv = SavedServer {
+            name: self.cfg.name.trim().to_string(),
+            ip: self.cfg.ip.trim().to_string(),
+            port: self.cfg.port.trim().to_string(),
+            password: self.cfg.password.clone(),
+        };
+        let key = srv.key();
+        self.forgotten.remove(&key);
+        self.cfg.servers.retain(|s| s.key() != key);
+        self.cfg.servers.insert(0, srv);
+        self.cfg.servers.truncate(MAX_SERVERS);
+        self.save_cfg();
+    }
+
     fn toggle_client(&mut self, ctx: &egui::Context) {
         if self.client.is_some() {
             self.disconnect();
@@ -828,6 +912,9 @@ impl App {
             let label = if self.net_panel { "📄 Список" } else { "🌐 Сеть" };
             if btn(ui, label, BLUE).clicked() {
                 self.net_panel = !self.net_panel;
+                if self.net_panel {
+                    self.merge_servers_from_disk();
+                }
             }
             if btn(ui, "➕ Добавить", BLUE).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
@@ -1037,6 +1124,40 @@ impl App {
             egui::Frame::new().fill(Color32::WHITE).corner_radius(5.0).inner_margin(12.0).show(ui, |ui| {
                 ui.add_enabled_ui(!locked, |ui| {
                     egui::Grid::new("net").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                        // Сохранённые серверы: выбор подставляет адрес, порт, пароль и название.
+                        let current = format!("{}:{}", self.cfg.ip.trim(), self.cfg.port.trim());
+                        let known = self.cfg.servers.iter().position(|s| s.key() == current);
+                        ui.label("Сохранённые серверы:");
+                        ui.horizontal(|ui| {
+                            let shown = match known {
+                                Some(i) => self.cfg.servers[i].label(),
+                                None if self.cfg.servers.is_empty() => "пока пусто — сервер запомнится после подключения".into(),
+                                None => "выберите сервер…".into(),
+                            };
+                            let mut pick = None;
+                            egui::ComboBox::from_id_salt("servers").selected_text(shown).width(300.0).show_ui(ui, |ui| {
+                                for (i, srv) in self.cfg.servers.iter().enumerate() {
+                                    if ui.selectable_label(known == Some(i), srv.label()).clicked() {
+                                        pick = Some(i);
+                                    }
+                                }
+                            });
+                            if let Some(i) = pick {
+                                let srv = self.cfg.servers[i].clone();
+                                (self.cfg.ip, self.cfg.port, self.cfg.password, self.cfg.name) = (srv.ip, srv.port, srv.password, srv.name);
+                            }
+                            if ui.add_enabled(known.is_some(), egui::Button::new("Забыть")).on_hover_text("Убрать этот сервер из списка").clicked() {
+                                if let Some(i) = known {
+                                    let srv = self.cfg.servers.remove(i);
+                                    self.forgotten.insert(srv.key());
+                                    self.save_cfg();
+                                }
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("🏷 Название (необязательно):");
+                        ui.add(egui::TextEdit::singleline(&mut self.cfg.name).hint_text("Например: Зал 1").desired_width(220.0));
+                        ui.end_row();
                         ui.label("📡 IP адрес сервера:");
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.ip).hint_text("Например: 192.168.1.100").desired_width(220.0));
                         ui.end_row();
@@ -1055,7 +1176,8 @@ impl App {
             ui.label(
                 RichText::new(
                     "💡 На компьютере с видеостеной нажмите «Запустить сервер».\n\
-                     На управляющем компьютере введите IP сервера и нажмите «Подключиться».\n\
+                     На управляющем компьютере выберите сервер из списка или введите его IP и нажмите «Подключиться».\n\
+                     Серверы, к которым удалось подключиться, запоминаются в списке.\n\
                      Для теста на одном компьютере оставьте IP 127.0.0.1.",
                 )
                 .size(12.0)
@@ -1466,6 +1588,29 @@ mod tests {
             wait("close", &|e| matches!(e, CliEvent::State(s) if s.active.is_none()));
             std::thread::sleep(hold);
         }
+    }
+
+    fn srv(name: &str, port: &str) -> SavedServer {
+        SavedServer { name: name.into(), ip: "10.0.0.1".into(), port: port.into(), password: "p".into() }
+    }
+
+    #[test]
+    fn merge_servers_keeps_ours_first_and_skips_forgotten() {
+        let mut ours = vec![srv("Зал 2", "2"), srv("Зал 1", "1")];
+        let disk = vec![srv("Зал 1 (старое имя)", "1"), srv("Зал 3", "3"), srv("Зал 4", "4")];
+        let forgotten: HashSet<String> = ["10.0.0.1:4".to_string()].into();
+        merge_servers(&mut ours, disk, &forgotten);
+        let names: Vec<&str> = ours.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Зал 2", "Зал 1", "Зал 3"]);
+    }
+
+    #[test]
+    fn config_reads_null_servers_without_losing_other_settings() {
+        let c: Config = serde_json::from_str(r#"{"ip":"10.1.2.3","port":"15000","servers":null}"#).unwrap();
+        assert_eq!((c.ip.as_str(), c.port.as_str(), c.servers.len()), ("10.1.2.3", "15000", 0));
+        // Старый файл без новых полей тоже читается.
+        let c: Config = serde_json::from_str(r#"{"ip":"10.1.2.3","port":"14999","password":"x","windowed":false}"#).unwrap();
+        assert!(c.servers.is_empty() && c.name.is_empty());
     }
 
     /// Переключение презентаций против запущенного `presentator --server`:
