@@ -130,6 +130,10 @@ struct SavedItem {
     src: PathBuf,
 }
 
+/// Автопереподключение: попыток и пауза между ними (всего около 30 с).
+const RECONNECT_TRIES: u32 = 15;
+const RECONNECT_EVERY: Duration = Duration::from_secs(2);
+
 /// Сколько серверов помнить.
 const MAX_SERVERS: usize = 20;
 
@@ -310,6 +314,8 @@ struct App {
     health_at: Option<Instant>,
     /// Связь с сервером оборвалась не по нашей команде — причина (для красной полосы).
     lost: Option<String>,
+    /// Автопереподключение после обрыва: номер попытки и когда делать следующую.
+    reconnect: Option<(u32, Instant)>,
     health_open: bool,
 
     // Сцена — полноэкранное окно с фоном, на котором идут показы
@@ -404,6 +410,7 @@ impl App {
             remote_live: false,
             health_at: None,
             lost: None,
+            reconnect: None,
             health_open: false,
             stage: false,
             stage_sent: None,
@@ -432,7 +439,6 @@ impl App {
             net_status: String::new(),
             status: String::new(),
         };
-        app.load_list(&cc.egui_ctx);
         // Автозапуск: `presentator --server` или `presentator --connect`.
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "--server") {
@@ -701,12 +707,17 @@ impl App {
         }
     }
 
+    /// Список хранит только сервер, и у каждого порта свой файл: копии программы на одном
+    /// компьютере (клиенты, второй сервер) работают из той же папки и не должны мешать друг другу.
     fn list_path(&self) -> PathBuf {
-        self.work_dir.join("list.json")
+        self.work_dir.join(format!("list_{}.json", self.cfg.port.trim()))
     }
 
     /// Сохранить список (порядок, имена, файлы) — он переживает перезапуск программы и сбой.
     fn save_list(&mut self) {
+        if !self.server_online {
+            return;
+        }
         let list: Vec<SavedItem> = self.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone() }).collect();
         let Ok(text) = serde_json::to_string_pretty(&list) else { return };
         if text == self.saved_list {
@@ -714,22 +725,37 @@ impl App {
         }
         let _ = std::fs::create_dir_all(&self.work_dir);
         // Через временный файл: при сбое посреди записи старый список останется целым.
-        let tmp = self.work_dir.join("list.json.tmp");
+        let tmp = self.list_path().with_extension("json.tmp");
         if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, self.list_path()).is_ok() {
             self.saved_list = text;
         }
     }
 
-    /// Восстановить список при запуске. Файлы, которых больше нет, пропускаются; файлы в рабочей
-    /// папке, на которые список не ссылается (например, недокачанные при сбое), удаляются.
+    /// Восстановить список при запуске сервера. Файлы, которых больше нет, пропускаются; файлы
+    /// в рабочей папке, на которые не ссылается ни один список (недокачанные при сбое), удаляются.
     fn load_list(&mut self, ctx: &egui::Context) {
-        let list: Vec<SavedItem> = std::fs::read_to_string(self.list_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-        let keep: HashSet<PathBuf> = list.iter().map(|i| i.src.clone()).collect();
+        // list.json — файл первой сборки с сохранением списка (до раздельных файлов по портам).
+        let list: Vec<SavedItem> = std::fs::read_to_string(self.list_path())
+            .or_else(|_| std::fs::read_to_string(self.work_dir.join("list.json")))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let is_list = |name: &str| name.starts_with("list_") || name.starts_with("list.json");
+        let mut keep: HashSet<PathBuf> = HashSet::new();
+        if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
+            for e in dir.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if is_list(&name) && name.ends_with(".json") {
+                    let other: Vec<SavedItem> = std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+                    keep.extend(other.into_iter().map(|i| i.src));
+                }
+            }
+        }
         if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
             for e in dir.flatten() {
                 let p = e.path();
                 let name = e.file_name().to_string_lossy().to_string();
-                if p.is_file() && !name.starts_with("list.json") && !keep.contains(&p) {
+                if p.is_file() && !is_list(&name) && !keep.contains(&p) {
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -902,6 +928,11 @@ impl App {
             match ev {
                 SrvEvent::Started => {
                     self.server_online = true;
+                    // Сервер восстанавливает свой список (если в окне ещё ничего нет).
+                    if self.items.is_empty() {
+                        self.load_list(ctx);
+                    }
+                    self.dirty = true;
                     self.start_collector();
                     self.stage = true; // сервер стоит у видеостены — сразу выводим фон
                     self.net_status = format!("Сервер запущен на порту {}", self.cfg.port);
@@ -942,6 +973,7 @@ impl App {
                 }
                 CliEvent::Connected => {
                     (self.remote_health, self.rtt, self.remote_live, self.health_at, self.lost) = (None, None, false, None, None);
+                    self.reconnect = None;
                     self.last_seen = Some(Instant::now());
                     self.connected = true;
                     self.close_show();
@@ -950,9 +982,15 @@ impl App {
                     self.remember_server();
                 }
                 CliEvent::Closed(reason) => {
-                    // Обрыв не по нашей команде (пустая причина — мы отключились сами) — тревога.
-                    if self.connected && !reason.is_empty() {
-                        self.lost = Some(reason.clone());
+                    // Обрыв не по нашей команде (пустая причина — мы отключились сами) — тревога
+                    // и автопереподключение. Неудачная попытка — следующая через RECONNECT_EVERY.
+                    let retrying = self.reconnect.is_some();
+                    if (self.connected || retrying) && !reason.is_empty() {
+                        if self.connected {
+                            self.lost = Some(reason.clone());
+                        }
+                        let attempt = self.reconnect.map_or(0, |(n, _)| n);
+                        self.reconnect = (attempt < RECONNECT_TRIES && reason != "Неверный пароль").then(|| (attempt, Instant::now() + RECONNECT_EVERY));
                     }
                     (self.remote_health, self.rtt, self.remote_live, self.last_seen, self.health_at) = (None, None, false, None, None);
                     self.connected = false;
@@ -1016,6 +1054,7 @@ impl App {
 
     fn disconnect(&mut self) {
         self.lost = None;
+        self.reconnect = None;
         if self.client.take().is_some() {
             self.connected = false;
             self.remote = StateMsg::default();
@@ -1078,7 +1117,12 @@ impl App {
     fn alarm_bar(&mut self, ctx: &egui::Context) {
         let problems: Vec<String> = if let (false, Some(reason)) = (self.connected, &self.lost) {
             // Общую причину «соединение потеряно» не повторяем, конкретную (например, «не отвечает») — показываем.
-            vec![if reason.contains("потеряно") { "связь с сервером потеряна".into() } else { format!("связь с сервером потеряна: {reason}") }]
+            let mut text = if reason.contains("потеряно") { "связь с сервером потеряна".to_string() } else { format!("связь с сервером потеряна: {reason}") };
+            match self.reconnect {
+                Some((n, _)) => text += &format!(" — переподключаюсь (попытка {} из {RECONNECT_TRIES})", n.max(1)),
+                None => text += " — автоматически переподключиться не удалось",
+            }
+            vec![text]
         } else if self.connected {
             let (level, rows) = self.health_rows();
             if level != health::Level::Bad {
@@ -1103,13 +1147,14 @@ impl App {
                     }
                 }
                 if lost {
-                    if btn(ui, "Переподключиться", BLUE).clicked() {
+                    if self.reconnect.is_none() && btn(ui, "Переподключиться", BLUE).clicked() {
                         self.lost = None;
                         let ctx = self.ctx.clone();
                         self.toggle_client(&ctx);
                     }
                     if btn(ui, "Скрыть", GRAY).clicked() {
                         self.lost = None;
+                        self.reconnect = None;
                     }
                 } else if btn(ui, "Показатели", GRAY).clicked() {
                     self.health_open = true;
@@ -1935,6 +1980,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui_frames.fetch_add(1, Ordering::SeqCst);
         self.poll(ctx);
+        if let Some((n, at)) = self.reconnect {
+            if self.client.is_none() && Instant::now() >= at {
+                self.reconnect = Some((n + 1, Instant::now() + Duration::from_secs(3600)));
+                let ctx = ctx.clone();
+                self.toggle_client(&ctx);
+                self.net_status = format!("Переподключение… попытка {} из {RECONNECT_TRIES}", n + 1);
+            } else if self.client.is_none() {
+                ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
+            }
+        }
         if self.connected {
             // Раз в секунду пересчитываем, давно ли сервер отвечал.
             ctx.request_repaint_after(Duration::from_secs(1));
