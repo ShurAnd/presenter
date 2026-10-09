@@ -1497,11 +1497,15 @@ mod tests {
         }
         let n = files.len();
         wait("ready", &|s| s.items.len() == n && s.items.iter().all(|i| i.ready));
-        for id in seq {
+        // TEST_LAST_HOLD — сколько держать последнюю презентацию (для проверки после быстрых переключений).
+        let last_hold = std::env::var("TEST_LAST_HOLD").ok().and_then(|s| s.parse().ok()).map(Duration::from_secs_f64);
+        let count = seq.len();
+        for (k, id) in seq.into_iter().enumerate() {
             println!("OPEN {id} {}", now());
             c.send(CliReq::Cmd(Cmd::Open { id }));
             wait("open", &|s| s.active == Some(id));
             // Пока держим показ — печатаем смену слайда (для проверки перехода по номеру).
+            let hold = if k + 1 == count { last_hold.unwrap_or(hold) } else { hold };
             let end = Instant::now() + hold;
             let mut last = None;
             while let Ok(ev) = rx.recv_timeout(end.saturating_duration_since(Instant::now())) {

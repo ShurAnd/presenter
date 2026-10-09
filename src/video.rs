@@ -201,7 +201,10 @@ mod win {
     struct MfEngine {
         player: IMFPMediaPlayer,
         ready: bool,
-        started: bool,
+        /// Когда нажали «старт».
+        started: Option<std::time::Instant>,
+        /// Видео действительно пошло (MFPlay был в состоянии «играет»).
+        played: bool,
     }
 
     fn secs(p: windows::core::Result<PROPVARIANT>) -> f64 {
@@ -216,7 +219,7 @@ mod win {
             let mut item: Option<IMFPMediaItem> = None;
             player.CreateMediaItemFromURL(&HSTRING::from(src.as_os_str()), BOOL::from(true), 0, Some(&mut item))?;
             player.SetMediaItem(&item.ok_or_else(windows::core::Error::empty)?)?;
-            Ok(MfEngine { player, ready: false, started: false })
+            Ok(MfEngine { player, ready: false, started: None, played: false })
         }
     }
 
@@ -246,14 +249,19 @@ mod win {
                 t.pos = secs(self.player.GetPosition(&MFP_POSITIONTYPE_100NS));
                 t.dur = dur;
                 t.playing = state == MFP_MEDIAPLAYER_STATE_PLAYING;
-                // В конце файла MFPlay сам переходит в «остановлено».
-                t.eof = self.started && state == MFP_MEDIAPLAYER_STATE_STOPPED;
+                self.played |= t.playing;
+                // В конце файла MFPlay сам переходит в «остановлено». Сразу после Play() он тоже ещё
+                // «остановлен» — поэтому конец засчитываем, только если видео уже успело поиграть.
+                t.eof = self.played && state == MFP_MEDIAPLAYER_STATE_STOPPED;
+                if self.started.is_some_and(|s| !self.played && s.elapsed() > std::time::Duration::from_secs(8)) {
+                    t.error = Some("Windows не смог воспроизвести это видео".into());
+                }
             }
             t
         }
 
         fn play(&mut self) {
-            self.started = true;
+            self.started = Some(std::time::Instant::now());
             unsafe {
                 let _ = self.player.Play();
             }
