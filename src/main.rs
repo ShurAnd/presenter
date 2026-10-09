@@ -46,7 +46,7 @@ const DOUBLE_ESC: Duration = Duration::from_millis(600);
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(format!("Presentator (Rust, тестовая сборка v{})", env!("CARGO_PKG_VERSION")))
+            .with_title(format!("Presentator v{}", env!("CARGO_PKG_VERSION")))
             .with_inner_size([750.0, 620.0])
             .with_min_inner_size([640.0, 420.0])
             .with_icon(app_icon()),
