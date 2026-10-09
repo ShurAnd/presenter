@@ -275,6 +275,8 @@ struct Proc {
 /// если он упал или его пришлось убить — запускается заново.
 pub struct Host {
     proc: Arc<Mutex<Option<Proc>>>,
+    /// С какого момента (мс от старта программы) ждём ответа PowerPoint; 0 — не ждём.
+    waiting: Arc<AtomicU64>,
     /// Номер текущего показа (0 — показа нет). События чужих показов отбрасываются в `App`.
     current: Arc<AtomicU64>,
     epoch: AtomicU64,
@@ -283,13 +285,20 @@ pub struct Host {
 
 impl Host {
     pub fn new(on_event: impl Fn(u64, PptEvent) + Send + Sync + 'static) -> Host {
-        let host = Host { proc: Arc::new(Mutex::new(None)), current: Arc::new(AtomicU64::new(0)), epoch: AtomicU64::new(0), on_event: Arc::new(on_event) };
+        let host = Host {
+            proc: Arc::new(Mutex::new(None)),
+            waiting: Arc::new(AtomicU64::new(0)),
+            current: Arc::new(AtomicU64::new(0)),
+            epoch: AtomicU64::new(0),
+            on_event: Arc::new(on_event),
+        };
         // Регулярный опрос позиции, пока идёт показ: слайды могут листать и на самом сервере.
-        let (proc, current) = (Arc::downgrade(&host.proc), host.current.clone());
+        let (proc, current, waiting) = (Arc::downgrade(&host.proc), host.current.clone(), host.waiting.clone());
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(400));
             let Some(proc) = proc.upgrade() else { break };
             if current.load(Ordering::SeqCst) != 0 {
+                let _ = waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
                 write_line(&proc, "poll");
             }
         });
@@ -333,11 +342,12 @@ impl Host {
         *g = Some(Proc { stdin, child: child.clone(), epoch });
 
         // Чтение ответов. Конец вывода — мост умер: показ (если был) считаем оборвавшимся.
-        let (on_event, current, proc) = (self.on_event.clone(), self.current.clone(), Arc::downgrade(&self.proc));
+        let (on_event, current, proc, waiting) = (self.on_event.clone(), self.current.clone(), Arc::downgrade(&self.proc), self.waiting.clone());
         std::thread::spawn(move || {
             let mut last_pos: Option<(u64, usize, usize)> = None;
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
+                waiting.store(0, Ordering::SeqCst); // PowerPoint ответил
                 let mut it = line.split_whitespace();
                 let (head, sid) = (it.next().unwrap_or(""), it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0));
                 let rest: Vec<&str> = it.collect();
@@ -381,12 +391,27 @@ impl Host {
         self.ensure()?;
         self.current.store(sid, Ordering::SeqCst);
         let path = base64(src.to_string_lossy().as_bytes());
+        let _ = self.waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
         self.send(&format!("open {sid} {} {path}", if windowed { 1 } else { 0 }));
         Ok(())
     }
 
+    /// Для показателей сервера: сколько мс PowerPoint не отвечает на запросы моста
+    /// (None — показа PPTX сейчас нет). Функцию можно вызывать из другого потока.
+    pub fn lag_probe(&self) -> impl Fn() -> Option<u64> + Send + 'static {
+        let (current, waiting) = (self.current.clone(), self.waiting.clone());
+        move || {
+            if current.load(Ordering::SeqCst) == 0 {
+                return None;
+            }
+            let w = waiting.load(Ordering::SeqCst);
+            Some(if w == 0 { 0 } else { now_ms().saturating_sub(w) })
+        }
+    }
+
     /// Закрыть текущий показ; PowerPoint остаётся запущенным для следующего.
     pub fn close(&self) {
+        self.waiting.store(0, Ordering::SeqCst);
         if self.current.swap(0, Ordering::SeqCst) != 0 {
             self.send("close");
         }
@@ -438,6 +463,12 @@ impl Drop for Host {
         self.send("quit");
         self.proc.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
+}
+
+/// Миллисекунды от первого вызова (монотонно; 0 зарезервирован под «не ждём»).
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
 fn write_line(proc: &Mutex<Option<Proc>>, line: &str) {

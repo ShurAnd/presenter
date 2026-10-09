@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod health;
 mod net;
 mod ppt;
 mod render;
@@ -10,6 +11,7 @@ mod video;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -23,7 +25,6 @@ const GREEN: Color32 = Color32::from_rgb(0x28, 0xa7, 0x45);
 const RED: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
 const GRAY: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
 const OFF: Color32 = Color32::from_rgb(0x6c, 0x75, 0x7d);
-const TEAL: Color32 = Color32::from_rgb(0x17, 0xa2, 0xb8);
 /// Фон сцены, если картинки фона нет.
 const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
 /// Файлы фона рядом с exe — если есть, заменяют вшитую картинку. Берётся первый найденный.
@@ -73,6 +74,8 @@ struct Config {
     /// Серверы, к которым подключались, — последний использованный первым.
     #[serde(deserialize_with = "null_as_empty")]
     servers: Vec<SavedServer>,
+    /// Резервный сервер («адрес:порт» из списка) — на него можно переключиться одной кнопкой.
+    reserve: String,
 }
 
 /// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
@@ -91,6 +94,7 @@ impl Default for Config {
             windowed: false,
             keyboard: true,
             servers: Vec::new(),
+            reserve: String::new(),
         }
     }
 }
@@ -277,6 +281,24 @@ struct App {
     /// Серверы, удалённые из списка в этом сеансе, — при сохранении не возвращаем их с диска.
     forgotten: HashSet<String>,
 
+    // Состояние сервера (показатели)
+    /// Счётчик кадров интерфейса: по нему сборщик понимает, что программа не зависла.
+    ui_frames: Arc<AtomicU64>,
+    /// Сборщик показателей этого компьютера — работает, пока запущен сервер.
+    collector: Option<health::Collector>,
+    local_health: Option<health::HealthInfo>,
+    /// Показатели сервера, к которому подключены, задержка связи и когда сервер последний раз отвечал.
+    remote_health: Option<health::HealthInfo>,
+    rtt: Option<u32>,
+    last_seen: Option<Instant>,
+    /// Сервер отвечает на пинг (новая версия) — только тогда тревожим из-за молчания.
+    remote_live: bool,
+    /// Когда пришли последние показатели сервера.
+    health_at: Option<Instant>,
+    /// Связь с сервером оборвалась не по нашей команде — причина (для красной полосы).
+    lost: Option<String>,
+    health_open: bool,
+
     // Сцена — полноэкранное окно с фоном, на котором идут показы
     stage: bool,
     /// Что уже отправлено окну сцены: (поверх всех окон, на весь экран).
@@ -359,6 +381,16 @@ impl App {
             goto_at: None,
             goto_field: String::new(),
             forgotten: HashSet::new(),
+            ui_frames: Arc::new(AtomicU64::new(0)),
+            collector: None,
+            local_health: None,
+            remote_health: None,
+            rtt: None,
+            last_seen: None,
+            remote_live: false,
+            health_at: None,
+            lost: None,
+            health_open: false,
             stage: false,
             stage_sent: None,
             bg: None,
@@ -740,6 +772,7 @@ impl App {
                     }
                 }
                 Out::ShowEsc => self.esc_press(),
+                Out::Health(h) => self.local_health = Some(h),
                 Out::Video { gen, ev } => {
                     let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) else { continue };
                     let ShowKind::Video(v) = &mut s.kind else { continue };
@@ -795,6 +828,7 @@ impl App {
             match ev {
                 SrvEvent::Started => {
                     self.server_online = true;
+                    self.start_collector();
                     self.stage = true; // сервер стоит у видеостены — сразу выводим фон
                     self.net_status = format!("Сервер запущен на порту {}", self.cfg.port);
                     self.dirty = true;
@@ -821,7 +855,20 @@ impl App {
 
         while let Ok(ev) = self.cli_rx.try_recv() {
             match ev {
+                CliEvent::Rtt(ms) => {
+                    self.rtt = Some(ms);
+                    self.remote_live = true;
+                    self.last_seen = Some(Instant::now());
+                }
+                CliEvent::Health(h) => {
+                    self.remote_health = Some(h);
+                    self.remote_live = true;
+                    self.last_seen = Some(Instant::now());
+                    self.health_at = self.last_seen;
+                }
                 CliEvent::Connected => {
+                    (self.remote_health, self.rtt, self.remote_live, self.health_at, self.lost) = (None, None, false, None, None);
+                    self.last_seen = Some(Instant::now());
                     self.connected = true;
                     self.close_show();
                     self.net_status = format!("Подключено к {}:{}", self.cfg.ip, self.cfg.port);
@@ -829,18 +876,26 @@ impl App {
                     self.remember_server();
                 }
                 CliEvent::Closed(reason) => {
+                    // Обрыв не по нашей команде (пустая причина — мы отключились сами) — тревога.
+                    if self.connected && !reason.is_empty() {
+                        self.lost = Some(reason.clone());
+                    }
+                    (self.remote_health, self.rtt, self.remote_live, self.last_seen, self.health_at) = (None, None, false, None, None);
                     self.connected = false;
                     self.client = None;
                     self.remote = StateMsg::default();
                     self.net_status = if reason.is_empty() { "Отключено".into() } else { reason };
                 }
                 CliEvent::State(s) => {
+                    self.last_seen = Some(Instant::now());
                     if s.message != self.remote.message {
                         self.status = s.message.clone();
                     }
                     self.remote = s;
                 }
                 CliEvent::Progress { name, sent, total } => {
+                    // Пока идёт передача файла, пинги ждут своей очереди — это не молчание сервера.
+                    self.last_seen = Some(Instant::now());
                     let pct = if total > 0 { sent * 100 / total } else { 100 };
                     self.status = format!("Отправка «{name}»: {pct}%");
                 }
@@ -864,6 +919,8 @@ impl App {
 
     fn toggle_server(&mut self, ctx: &egui::Context) {
         if self.server.take().is_some() {
+            self.collector = None;
+            self.local_health = None;
             self.server_online = false;
             self.clients = 0;
             self.net_status = "Сервер остановлен".into();
@@ -884,9 +941,169 @@ impl App {
     }
 
     fn disconnect(&mut self) {
+        self.lost = None;
         if self.client.take().is_some() {
             self.connected = false;
             self.remote = StateMsg::default();
+        }
+    }
+
+    /// Запустить сборщик показателей этого компьютера (на сервере).
+    fn start_collector(&mut self) {
+        let Some(server) = &self.server else { return };
+        let publish = server.health_publisher();
+        let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
+        self.collector = Some(health::start(
+            self.work_dir.clone(),
+            self.ui_frames.clone(),
+            self.ppt_host.lag_probe(),
+            move |h| {
+                publish(&h); // клиентам — напрямую из потока сбора, без перерисовки окон
+                let _ = tx.send(Out::Health(h));
+            },
+            move || ctx.request_repaint(),
+        ));
+    }
+
+    /// Оценка состояния сервера: у клиента — показатели сервера и связь, на сервере — свои.
+    fn health_rows(&self) -> (health::Level, Vec<health::Row>) {
+        let rows = if self.connected {
+            // Старый сервер (без пинга) молчит между изменениями — молчание тогда не тревога.
+            let silent = self.last_seen.filter(|_| self.remote_live).map(|t| t.elapsed());
+            // Пинг отвечает, а показатели не приходят дольше 7 с — программа на сервере зависла целиком.
+            let mut h = self.remote_health.clone();
+            if let (Some(h), Some(at)) = (h.as_mut(), self.health_at) {
+                if at.elapsed() > Duration::from_secs(7) {
+                    h.ui_ok = false;
+                }
+            }
+            if self.remote_live { health::assess(h.as_ref(), self.rtt, silent) } else { Vec::new() }
+        } else {
+            health::assess(self.local_health.as_ref(), None, None)
+        };
+        (health::overall(&rows), rows)
+    }
+
+    /// Резервный сервер из списка, если он выбран и это не тот, к которому мы уже подключены.
+    fn reserve_server(&self) -> Option<SavedServer> {
+        let current = format!("{}:{}", self.cfg.ip.trim(), self.cfg.port.trim());
+        self.cfg.servers.iter().find(|s| s.key() == self.cfg.reserve && s.key() != current).cloned()
+    }
+
+    /// Отключиться от текущего сервера и подключиться к резервному.
+    fn switch_to_reserve(&mut self) {
+        let Some(srv) = self.reserve_server() else { return };
+        self.disconnect();
+        self.status = format!("Переключение на резервный сервер {}…", srv.label());
+        (self.cfg.ip, self.cfg.port, self.cfg.password, self.cfg.name) = (srv.ip, srv.port, srv.password, srv.name);
+        let ctx = self.ctx.clone();
+        self.toggle_client(&ctx);
+    }
+
+    /// Красная полоса под верхней панелью, пока у сервера проблема.
+    fn alarm_bar(&mut self, ctx: &egui::Context) {
+        let problems: Vec<String> = if let (false, Some(reason)) = (self.connected, &self.lost) {
+            // Общую причину «соединение потеряно» не повторяем, конкретную (например, «не отвечает») — показываем.
+            vec![if reason.contains("потеряно") { "связь с сервером потеряна".into() } else { format!("связь с сервером потеряна: {reason}") }]
+        } else if self.connected {
+            let (level, rows) = self.health_rows();
+            if level != health::Level::Bad {
+                return;
+            }
+            rows.iter().filter(|r| r.level == health::Level::Bad).map(|r| format!("{}: {}", r.name, r.value)).collect()
+        } else {
+            return;
+        };
+        let lost = !self.connected;
+        let reserve = self.reserve_server();
+        let frame = egui::Frame::new().fill(RED).inner_margin(egui::Margin::symmetric(10, 6));
+        egui::TopBottomPanel::top("alarm").frame(frame).show(ctx, |ui| {
+            // Две строки: полный текст проблемы, под ним кнопки — ничего не перекрывается.
+            let text = format!("⚠ Проблема на сервере — {}", problems.join("; "));
+            ui.label(RichText::new(&text).color(Color32::WHITE).strong());
+            ui.horizontal(|ui| {
+                if let Some(r) = &reserve {
+                    let name = if r.name.trim().is_empty() { r.key() } else { r.name.trim().to_string() };
+                    if btn(ui, &format!("Переключиться на резерв «{name}»"), GREEN).on_hover_text(r.label()).clicked() {
+                        self.switch_to_reserve();
+                    }
+                }
+                if lost {
+                    if btn(ui, "Переподключиться", BLUE).clicked() {
+                        self.lost = None;
+                        let ctx = self.ctx.clone();
+                        self.toggle_client(&ctx);
+                    }
+                    if btn(ui, "Скрыть", GRAY).clicked() {
+                        self.lost = None;
+                    }
+                } else if btn(ui, "Показатели", GRAY).clicked() {
+                    self.health_open = true;
+                }
+            });
+        });
+    }
+
+    /// Окно с показателями сервера.
+    fn health_window(&mut self, ctx: &egui::Context) {
+        if !self.health_open {
+            return;
+        }
+        if !(self.connected || self.server_online) {
+            self.health_open = false;
+            return;
+        }
+        if !self.connected {
+            // Своё окно показателей на сервере обновляем вслед за замерами.
+            ctx.request_repaint_after(Duration::from_secs(2));
+        }
+        let (level, rows) = self.health_rows();
+        let reserve = self.reserve_server();
+        let mut open = true;
+        let mut switch = false;
+        let title = if self.connected { "Состояние сервера" } else { "Состояние этого сервера" };
+        egui::Window::new(title).open(&mut open).collapsible(false).resizable(false).default_width(520.0).show(ctx, |ui| {
+            if rows.is_empty() {
+                ui.label(if self.connected {
+                    "Сервер не присылает показатели — вероятно, на нём старая версия Presentator (до 1.0.4)."
+                } else {
+                    "Показатели появятся через пару секунд."
+                });
+                return;
+            }
+            let summary = match level {
+                health::Level::Ok => "Всё в норме",
+                health::Level::Warn => "Есть показатели на грани — присмотритесь",
+                health::Level::Bad => "Проблема — возможно, пора переключиться на резерв",
+            };
+            ui.label(RichText::new(summary).strong().size(15.0).color(level_color(level)));
+            ui.add_space(6.0);
+            egui::Grid::new("health").num_columns(2).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
+                for r in &rows {
+                    ui.label(r.name);
+                    ui.label(RichText::new(&r.value).color(if r.level == health::Level::Ok { Color32::from_gray(0x33) } else { level_color(r.level) }).strong());
+                    ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Обновляется каждые 2 с. Жёлтый — на грани, красный — проблема.").size(11.5).color(GRAY));
+            if self.connected {
+                ui.add_space(4.0);
+                match &reserve {
+                    Some(r) => {
+                        if btn(ui, &format!("Переключиться на резерв «{}»", r.label()), GREEN).clicked() {
+                            switch = true;
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new("Резервный сервер не выбран — его можно указать на панели «Сеть».").size(11.5).color(GRAY));
+                    }
+                }
+            }
+        });
+        self.health_open = open;
+        if switch {
+            self.switch_to_reserve();
         }
     }
 
@@ -968,10 +1185,33 @@ impl App {
                 self.save_cfg();
             }
             ui.add_space(4.0);
-            let srv = if self.server_online { format!("Сервер: онлайн ({})", self.clients) } else { "Сервер: офлайн".into() };
-            indicator(ui, if self.server_online { GREEN } else { OFF }, &srv);
-            let cli = if self.connected { "Клиент: подключен" } else { "Клиент: не подключен" };
-            indicator(ui, if self.connected { TEAL } else { OFF }, cli);
+            if self.connected || self.server_online {
+                // Состояние сервера: зелёный — норма, жёлтый — внимание, красный — проблема.
+                let (level, rows) = self.health_rows();
+                let who = if self.connected {
+                    let name = self.cfg.name.trim();
+                    if name.is_empty() { format!("Сервер {}", self.cfg.ip.trim()) } else { format!("Сервер «{name}»") }
+                } else {
+                    format!("Этот сервер ({} кл.)", self.clients)
+                };
+                let state = match (level, rows.is_empty()) {
+                    (_, true) => "нет данных",
+                    (health::Level::Ok, _) => "норма",
+                    (health::Level::Warn, _) => "внимание",
+                    (health::Level::Bad, _) => "проблема",
+                };
+                let color = if rows.is_empty() { OFF } else { level_color(level) };
+                // Кружок рисуем сами: в шрифте egui нет символа «●».
+                let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot.center(), 6.0, color);
+                let resp = ui.add(egui::Button::new(RichText::new(format!("{who}: {state}")).color(color).strong()).frame(false));
+                if resp.on_hover_text("Показатели сервера: процессор, память, видеокарта, мониторы, связь").clicked() {
+                    self.health_open = !self.health_open;
+                }
+            } else {
+                indicator(ui, OFF, "Сервер: офлайн");
+                indicator(ui, OFF, "Клиент: не подключен");
+            }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if btn(ui, "🗑 Очистить", RED).clicked() {
@@ -1214,6 +1454,32 @@ impl App {
                     });
                 });
             });
+            // Резервный сервер — просто настройка, менять можно и во время подключения.
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Резервный сервер:");
+                let reserve = self.cfg.servers.iter().find(|s| s.key() == self.cfg.reserve).map(SavedServer::label);
+                let mut pick: Option<String> = None;
+                egui::ComboBox::from_id_salt("reserve")
+                    .selected_text(reserve.unwrap_or_else(|| "не выбран".into()))
+                    .width(300.0)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(self.cfg.reserve.is_empty(), "не выбран").clicked() {
+                            pick = Some(String::new());
+                        }
+                        for srv in &self.cfg.servers {
+                            if ui.selectable_label(self.cfg.reserve == srv.key(), srv.label()).clicked() {
+                                pick = Some(srv.key());
+                            }
+                        }
+                    });
+                if let Some(k) = pick {
+                    self.cfg.reserve = k;
+                    self.save_cfg();
+                }
+            })
+            .response
+            .on_hover_text("Если с основным сервером беда, на резервный можно переключиться одной кнопкой — в красной полосе или в окне показателей");
             ui.add_space(8.0);
             ui.checkbox(&mut self.cfg.windowed, "Сцена и показ в окне, а не на весь экран (только для теста на одном компьютере)");
             ui.add_space(8.0);
@@ -1527,6 +1793,14 @@ fn video_label(v: &VideoInfo) -> (String, Color32) {
     }
 }
 
+fn level_color(level: health::Level) -> Color32 {
+    match level {
+        health::Level::Ok => GREEN,
+        health::Level::Warn => Color32::from_rgb(0xe0, 0x9a, 0x00),
+        health::Level::Bad => RED,
+    }
+}
+
 fn cbutton(text: &str, color: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(Color32::WHITE).strong()).fill(color).corner_radius(5.0)
 }
@@ -1543,7 +1817,12 @@ fn indicator(ui: &mut egui::Ui, color: Color32, text: &str) {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_frames.fetch_add(1, Ordering::SeqCst);
         self.poll(ctx);
+        if self.connected {
+            // Раз в секунду пересчитываем, давно ли сервер отвечал.
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
 
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if !dropped.is_empty() {
@@ -1555,6 +1834,8 @@ impl eframe::App for App {
 
         let margin = egui::Frame::new().fill(Color32::from_gray(0xfa)).inner_margin(6.0);
         egui::TopBottomPanel::top("top").frame(margin).show(ctx, |ui| self.top_bar(ui, &view));
+        self.alarm_bar(ctx);
+        self.health_window(ctx);
         egui::TopBottomPanel::bottom("bottom").frame(margin).show(ctx, |ui| self.bottom_bar(ui, &view));
         egui::CentralPanel::default().frame(margin).show(ctx, |ui| {
             if self.net_panel {

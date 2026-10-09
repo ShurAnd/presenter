@@ -24,6 +24,8 @@ pub enum Out {
     Ppt { gen: u64, ev: crate::ppt::PptEvent },
     /// Esc, нажатый в слайд-шоу PowerPoint (перехвачен до PowerPoint).
     ShowEsc,
+    /// Свежие показатели этого компьютера (сборщик работает, пока запущен сервер).
+    Health(crate::health::HealthInfo),
     Video { gen: u64, ev: crate::video::VideoEvent },
     Page { key: PageKey, image: ColorImage },
     PageErr { key: PageKey, msg: String },

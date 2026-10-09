@@ -14,6 +14,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc as tmpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::health::HealthInfo;
+
 pub const CHUNK: usize = 256 * 1024;
 
 /// Команды управления. Одинаковы для локального управления и для сети.
@@ -84,6 +86,8 @@ enum C2S {
     Cmd { cmd: Cmd },
     UploadBegin { name: String, size: u64 },
     UploadEnd,
+    /// Замер задержки: сервер сразу отвечает `Pong` с тем же `ts`.
+    Ping { ts: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -94,6 +98,9 @@ enum S2C {
     State { state: StateMsg },
     UploadOk { name: String },
     UploadErr { name: String, msg: String },
+    Pong { ts: u64 },
+    /// Показатели компьютера-сервера (раз в 2 с).
+    Health { health: HealthInfo },
 }
 
 fn js<T: Serialize>(v: &T) -> Message {
@@ -112,6 +119,7 @@ pub enum SrvEvent {
 
 pub struct ServerHandle {
     state_tx: watch::Sender<String>,
+    health_tx: Arc<watch::Sender<String>>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -127,6 +135,16 @@ impl ServerHandle {
             changed
         });
     }
+
+    /// Функция рассылки показателей клиентам. Её вызывает поток сбора напрямую, а не интерфейс:
+    /// если интерфейс сервера зависнет, клиенты всё равно увидят показатели и «программа не отвечает».
+    pub fn health_publisher(&self) -> impl Fn(&HealthInfo) + Send + 'static {
+        let tx = self.health_tx.clone();
+        move |health: &HealthInfo| {
+            let s = serde_json::to_string(&S2C::Health { health: health.clone() }).unwrap_or_default();
+            tx.send_replace(s);
+        }
+    }
 }
 
 pub fn start_server(
@@ -137,6 +155,7 @@ pub fn start_server(
     wake: impl Fn() + Send + Sync + 'static,
 ) -> ServerHandle {
     let (state_tx, state_rx) = watch::channel(String::new());
+    let (health_tx, health_rx) = watch::channel(String::new());
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
     std::thread::spawn(move || {
@@ -164,9 +183,9 @@ pub fn start_server(
                 loop {
                     let Ok((stream, _)) = listener.accept().await else { continue };
                     let (ev, wake, clients) = (ev.clone(), wake.clone(), clients.clone());
-                    let (password, dir, state_rx) = (password.clone(), dir.clone(), state_rx.clone());
+                    let (password, dir, state_rx, health_rx) = (password.clone(), dir.clone(), state_rx.clone(), health_rx.clone());
                     tokio::spawn(async move {
-                        serve_client(stream, password, dir, state_rx, &ev, &wake, &clients).await;
+                        serve_client(stream, password, dir, state_rx, health_rx, &ev, &wake, &clients).await;
                     });
                 }
             };
@@ -174,7 +193,7 @@ pub fn start_server(
         });
         // Runtime уничтожается здесь — все соединения закрываются.
     });
-    ServerHandle { state_tx, _stop: stop_tx }
+    ServerHandle { state_tx, health_tx: Arc::new(health_tx), _stop: stop_tx }
 }
 
 fn safe_name(name: &str) -> String {
@@ -200,6 +219,7 @@ async fn serve_client(
     password: String,
     dir: PathBuf,
     mut state_rx: watch::Receiver<String>,
+    mut health_rx: watch::Receiver<String>,
     ev: &Sender<SrvEvent>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     clients: &AtomicUsize,
@@ -241,11 +261,19 @@ async fn serve_client(
                 let s = state_rx.borrow_and_update().clone();
                 if ws.send(Message::text(s)).await.is_err() { break; }
             }
+            changed = health_rx.changed() => {
+                if changed.is_err() { break; }
+                let s = health_rx.borrow_and_update().clone();
+                if !s.is_empty() && ws.send(Message::text(s)).await.is_err() { break; }
+            }
             msg = ws.next() => {
                 let Some(Ok(msg)) = msg else { break };
                 match msg {
                     Message::Text(t) => match serde_json::from_str::<C2S>(t.as_str()) {
                         Ok(C2S::Cmd { cmd }) => { let _ = ev.send(SrvEvent::Cmd(cmd)); wake(); }
+                        Ok(C2S::Ping { ts }) => {
+                            if ws.send(js(&S2C::Pong { ts })).await.is_err() { break; }
+                        }
                         Ok(C2S::UploadBegin { name, size }) => {
                             let name = safe_name(&name);
                             let path = dir.join(format!("{}_{}", unique_prefix(), name));
@@ -304,6 +332,9 @@ pub enum CliEvent {
     Progress { name: String, sent: u64, total: u64 },
     UploadOk(String),
     UploadErr { name: String, msg: String },
+    /// Задержка связи (пинг туда и обратно), мс.
+    Rtt(u32),
+    Health(HealthInfo),
 }
 
 pub enum CliReq {
@@ -375,8 +406,15 @@ async fn client_task(
     let _ = ev.send(CliEvent::Connected);
     wake();
 
+    // Пинг раз в 2 с: задержка связи и признак того, что сервер жив.
+    let started = std::time::Instant::now();
+    let mut ping = tokio::time::interval(Duration::from_secs(2));
     loop {
         tokio::select! {
+            _ = ping.tick() => {
+                let t = started.elapsed().as_millis() as u64;
+                if ws.send(js(&C2S::Ping { ts: t })).await.is_err() { break; }
+            }
             req = rx.recv() => {
                 let Some(req) = req else {
                     let _ = ws.close(None).await;
@@ -402,6 +440,12 @@ async fn client_task(
                         Ok(S2C::State { state }) => { let _ = ev.send(CliEvent::State(state)); wake(); }
                         Ok(S2C::UploadOk { name }) => { let _ = ev.send(CliEvent::UploadOk(name)); wake(); }
                         Ok(S2C::UploadErr { name, msg }) => { let _ = ev.send(CliEvent::UploadErr { name, msg }); wake(); }
+                        Ok(S2C::Pong { ts }) => {
+                            let ms = (started.elapsed().as_millis() as u64).saturating_sub(ts);
+                            let _ = ev.send(CliEvent::Rtt(ms.min(u32::MAX as u64) as u32));
+                            wake();
+                        }
+                        Ok(S2C::Health { health }) => { let _ = ev.send(CliEvent::Health(health)); wake(); }
                         _ => {}
                     },
                     Message::Close(_) => break,
