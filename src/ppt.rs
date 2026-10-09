@@ -24,7 +24,7 @@ pub enum PptEvent {
 /// Переключение — закрыть файл и открыть другой в том же PowerPoint: без перезапуска,
 /// поэтому нет гонки, когда новый показ подключался к ещё закрывающемуся PowerPoint.
 ///
-/// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8>`, `next`, `prev`, `goto N`,
+/// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или ->`, `next`, `prev`, `goto N`,
 /// `poll`, `show`, `close`, `quit`. Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`,
 /// `ended <sid>`, `error <sid> текст`.
 const SCRIPT: &str = r#"
@@ -48,8 +48,19 @@ function CloseShow {
     $script:win = $null; $script:pres = $null
 }
 
-function OpenShow($path, $windowed) {
+# Монитор для показа (\\.\DISPLAY2) — в собственную настройку PowerPoint «Показ на мониторе».
+function SetMonitor($dev) {
+    if (-not $dev) { return }
+    try {
+        $k = 'HKCU:\Software\Microsoft\Office\' + $script:app.Version + '\PowerPoint\Options'
+        if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }
+        Set-ItemProperty -Path $k -Name DisplayMonitor -Value $dev
+    } catch {}
+}
+
+function OpenShow($path, $windowed, $monitor) {
     $a = App
+    SetMonitor $monitor
     $script:pres = $a.Presentations.Open($path, -1, 0, 0)
     $script:total = $script:pres.Slides.Count
     $ss = $script:pres.SlideShowSettings
@@ -77,9 +88,11 @@ while ($true) {
         $script:sid = $parts[1]
         try {
             $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
-            try { OpenShow $path $parts[2] } catch {
+            $mon = ''
+            if ($parts.Count -gt 4 -and $parts[4] -ne '-') { $mon = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[4])) }
+            try { OpenShow $path $parts[2] $mon } catch {
                 # Одна повторная попытка с заново запущенным PowerPoint.
-                CloseShow; $script:app = $null; OpenShow $path $parts[2]
+                CloseShow; $script:app = $null; OpenShow $path $parts[2] $mon
             }
             $hwnd = 0; try { $hwnd = $script:win.HWND } catch {}
             Say ('ready ' + $script:sid + ' ' + $script:total + ' ' + $hwnd)
@@ -127,6 +140,7 @@ try { if ($script:app -and $script:app.Presentations.Count -eq 0) { $script:app.
 extern "system" {
     fn AllowSetForegroundWindow(pid: u32) -> i32;
     fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+    fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
     fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
 }
 
@@ -141,7 +155,9 @@ pub fn stage_topmost(on: bool) {
     unsafe {
         let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
         let stage = FindWindowW(std::ptr::null(), title.as_ptr());
-        if stage != 0 {
+        // Уже в нужном состоянии — ничего не делаем (вызывается на каждой перерисовке сцены).
+        let topmost = stage != 0 && GetWindowLongW(stage, -20) & 0x8 != 0; // GWL_EXSTYLE, WS_EX_TOPMOST
+        if stage != 0 && topmost != on {
             // HWND_TOPMOST = -1, HWND_NOTOPMOST = -2; NOSIZE | NOMOVE | NOACTIVATE.
             SetWindowPos(stage, if on { -1 } else { -2 }, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
         }
@@ -387,12 +403,14 @@ impl Host {
     }
 
     /// Открыть презентацию и запустить показ. Прежний показ (если был) мост закроет сам.
-    pub fn open(&self, sid: u64, src: &Path, windowed: bool) -> Result<(), String> {
+    /// `monitor` — системное имя монитора для показа (пусто — как настроено в PowerPoint).
+    pub fn open(&self, sid: u64, src: &Path, windowed: bool, monitor: &str) -> Result<(), String> {
         self.ensure()?;
         self.current.store(sid, Ordering::SeqCst);
         let path = base64(src.to_string_lossy().as_bytes());
+        let mon = if monitor.is_empty() { "-".to_string() } else { base64(monitor.as_bytes()) };
         let _ = self.waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
-        self.send(&format!("open {sid} {} {path}", if windowed { 1 } else { 0 }));
+        self.send(&format!("open {sid} {} {path} {mon}", if windowed { 1 } else { 0 }));
         Ok(())
     }
 
@@ -429,7 +447,8 @@ impl Host {
     /// слайд-шоу наверх, сцену — прямо под него. Иначе со второго показа слайд-шоу, уже получившее
     /// фокус, оставалось под сценой: опущенная сцена встаёт выше всех обычных окон,
     /// а «вывести вперёд» окно, которое и так в фокусе, ничего не меняет.
-    pub fn reveal(&self, slideshow: isize) {
+    /// `target` — монитор для показа: если PowerPoint открыл слайд-шоу не там, переставляем окно.
+    pub fn reveal(&self, slideshow: isize, target: Option<(i32, i32, i32, i32)>) {
         #[cfg(windows)]
         unsafe {
             const SWP: u32 = 0x0001 | 0x0002 | 0x0010; // NOSIZE | NOMOVE | NOACTIVATE
@@ -439,6 +458,9 @@ impl Host {
             let class: Vec<u16> = "screenClass".encode_utf16().chain(Some(0)).collect();
             let slideshow = if slideshow != 0 { slideshow } else { FindWindowW(class.as_ptr(), std::ptr::null()) };
             if slideshow != 0 {
+                if let Some(r) = target {
+                    crate::display::fit_hwnd(slideshow, r);
+                }
                 SetWindowPos(slideshow, 0, 0, 0, 0, 0, SWP); // HWND_TOP
                 let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
                 let stage = FindWindowW(std::ptr::null(), title.as_ptr());
@@ -448,7 +470,7 @@ impl Host {
             }
         }
         #[cfg(not(windows))]
-        let _ = slideshow;
+        let _ = (slideshow, target);
         self.send("show");
     }
 

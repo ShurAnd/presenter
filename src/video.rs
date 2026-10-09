@@ -36,19 +36,20 @@ pub struct Video {
 }
 
 impl Video {
-    pub fn start(src: &Path, windowed: bool, on_event: impl Fn(VideoEvent) + Send + 'static) -> Video {
+    /// `rect` — монитор для показа (физические пиксели); None — основной монитор.
+    pub fn start(src: &Path, windowed: bool, rect: Option<(i32, i32, i32, i32)>, on_event: impl Fn(VideoEvent) + Send + 'static) -> Video {
         let (tx, rx) = channel();
         #[cfg(windows)]
         {
             let (id_tx, id_rx) = channel();
             let src = src.to_path_buf();
-            std::thread::spawn(move || win::run(&src, windowed, rx, id_tx, on_event));
+            std::thread::spawn(move || win::run(&src, windowed, rect, rx, id_tx, on_event));
             let thread = id_rx.recv().unwrap_or(0);
             Video { tx, thread }
         }
         #[cfg(not(windows))]
         {
-            let _ = (src, windowed, rx);
+            let _ = (src, windowed, rect, rx);
             on_event(VideoEvent::Error("видео поддерживается только в Windows".into()));
             Video { tx }
         }
@@ -308,7 +309,7 @@ mod win {
         }
     }
 
-    unsafe fn create_window(windowed: bool) -> windows::core::Result<HWND> {
+    unsafe fn create_window(windowed: bool, rect: Option<(i32, i32, i32, i32)>) -> windows::core::Result<HWND> {
         let hinst: HINSTANCE = GetModuleHandleW(None)?.into();
         let class = w!("PresentatorVideo");
         let wc = WNDCLASSW {
@@ -319,25 +320,28 @@ mod win {
             ..Default::default()
         };
         RegisterClassW(&wc); // повторная регистрация вернёт ошибку — это нормально
-        let (x, y, cx, cy) = if windowed {
-            (120, 120, 960, 540)
-        } else {
-            (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+        let (x, y, cx, cy) = match (windowed, rect) {
+            (true, _) => (120, 120, 960, 540),
+            (false, Some(r)) => r,
+            (false, None) => (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)),
         };
         CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class, w!("Presentator — видео"), WS_POPUP, x, y, cx, cy, None, None, hinst, None)
     }
 
-    pub fn run(src: &Path, windowed: bool, rx: Receiver<VCmd>, id_tx: Sender<u32>, on_event: impl Fn(VideoEvent)) {
+    pub fn run(src: &Path, windowed: bool, rect: Option<(i32, i32, i32, i32)>, rx: Receiver<VCmd>, id_tx: Sender<u32>, on_event: impl Fn(VideoEvent)) {
         unsafe {
             // Очередь сообщений потока должна существовать до того, как в неё начнут писать.
             let mut msg = MSG::default();
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
             let _ = id_tx.send(GetCurrentThreadId());
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            match create_window(windowed) {
+            match create_window(windowed, rect) {
                 Ok(hwnd) => {
                     // Окно видно, но лежит под сценой (она поверх всех окон): в него уже выводится первый кадр.
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                    // Явно в самый низ: новое окно иначе встаёт выше обычных окон, и если сцена вдруг
+                    // не «поверх всех», зритель увидел бы первый кадр до «Старт».
+                    let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     let engine: Result<Box<dyn Engine>, String> = match MpvEngine::new(hwnd, src) {
                         Ok(e) => Ok(Box::new(e)),
                         // libmpv недоступен — играем движком Windows.

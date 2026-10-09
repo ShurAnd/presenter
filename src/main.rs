@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod display;
 mod health;
 mod net;
 mod ppt;
@@ -71,6 +72,8 @@ struct Config {
     windowed: bool,
     /// Клавиши в окне программы (стрелки, PageUp/PageDown, пробел, цифры + Enter) управляют показом.
     keyboard: bool,
+    /// Монитор для показа (видеостена): системное имя `\\.\DISPLAY2`; пусто — основной.
+    monitor: String,
     /// Серверы, к которым подключались, — последний использованный первым.
     #[serde(deserialize_with = "null_as_empty")]
     servers: Vec<SavedServer>,
@@ -93,6 +96,7 @@ impl Default for Config {
             name: String::new(),
             windowed: false,
             keyboard: true,
+            monitor: String::new(),
             servers: Vec::new(),
             reserve: String::new(),
         }
@@ -507,7 +511,8 @@ impl App {
                     // Видео сразу загружается за фоном и ждёт пробела или «Старт».
                     None if is_video => {
                         let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
-                        let player = video::Video::start(&src, self.cfg.windowed, move |ev| {
+                        let rect = if self.cfg.windowed { None } else { display::target(&self.cfg.monitor).map(|m| m.rect) };
+                        let player = video::Video::start(&src, self.cfg.windowed, rect, move |ev| {
                             let _ = tx.send(Out::Video { gen, ev });
                             ctx.request_repaint();
                         });
@@ -520,7 +525,14 @@ impl App {
                             c.request_repaint();
                         });
                         // Прежний показ мост закрывает сам, перед открытием нового — в том же PowerPoint.
-                        if let Err(e) = self.ppt_host.open(gen, &src, self.cfg.windowed) {
+                        // PowerPoint получает монитор, на который реально пойдёт показ: выбранный, а если его
+                        // отключили — основной. Монитор не выбран — его собственную настройку не трогаем.
+                        let monitor = if self.cfg.monitor.is_empty() || self.cfg.windowed {
+                            String::new()
+                        } else {
+                            display::target(&self.cfg.monitor).map(|m| m.device).unwrap_or_default()
+                        };
+                        if let Err(e) = self.ppt_host.open(gen, &src, self.cfg.windowed, &monitor) {
                             self.status = format!("PowerPoint: {e}");
                             return;
                         }
@@ -652,7 +664,8 @@ impl App {
             }
             PptPhase::Lowered(t) => {
                 if t.elapsed() >= PPT_LOWER {
-                    self.ppt_host.reveal(ps.hwnd);
+                    let target = if self.cfg.windowed { None } else { display::target(&self.cfg.monitor).map(|m| m.rect) };
+                    self.ppt_host.reveal(ps.hwnd, target);
                     ps.phase = PptPhase::Shown;
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(30));
@@ -1454,6 +1467,36 @@ impl App {
                     });
                 });
             });
+            // Монитор для показа — для сервера (видеостены).
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Монитор для показа:");
+                let monitors = display::list();
+                let current = monitors.iter().position(|m| m.device == self.cfg.monitor);
+                let shown = match current {
+                    Some(i) => monitors[i].label(i + 1),
+                    None if self.cfg.monitor.is_empty() => "основной".into(),
+                    None => format!("{} — не подключён, показ на основном", self.cfg.monitor),
+                };
+                let mut pick: Option<String> = None;
+                egui::ComboBox::from_id_salt("monitor").selected_text(shown).width(330.0).show_ui(ui, |ui| {
+                    if ui.selectable_label(self.cfg.monitor.is_empty(), "основной").clicked() {
+                        pick = Some(String::new());
+                    }
+                    for (i, m) in monitors.iter().enumerate() {
+                        if ui.selectable_label(current == Some(i), m.label(i + 1)).clicked() {
+                            pick = Some(m.device.clone());
+                        }
+                    }
+                });
+                if let Some(d) = pick {
+                    self.cfg.monitor = d;
+                    self.save_cfg();
+                }
+            })
+            .response
+            .on_hover_text("Куда выводить фон, PDF, видео и PowerPoint на сервере — обычно монитор видеостены");
+
             // Резервный сервер — просто настройка, менять можно и во время подключения.
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1603,8 +1646,11 @@ impl App {
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
             if sent.is_none_or(|(_, fs)| fs == windowed) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(windowed));
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                // В оконном режиме размер задаёт egui; на весь экран — подгоняем ниже под монитор показа.
+                if windowed {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+                }
             }
             if sent.is_none_or(|(t, _)| t != top) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level(top)));
@@ -1678,13 +1724,22 @@ impl App {
         // Уровень окна сцены дублируем напрямую через Windows: при смене, а пока PowerPoint
         // готовит показ за сценой — каждый кадр (его окно не должно вылезти поверх фона).
         let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
-        if !windowed && (sent.is_none_or(|(t, _)| t != top) || ppt_loading) {
+        // Проверяем на каждой перерисовке: после показа PowerPoint сцена теряла «поверх всех»
+        // и не получала его обратно — тогда подготовленное видео оказывалось над фоном.
+        if !windowed {
             ppt::stage_topmost(top);
         }
         if ppt_loading {
             ctx.request_repaint_after(Duration::from_millis(15));
         }
         self.stage_sent = Some((top, !windowed));
+        // На весь экран: окно сцены ровно на монитор показа (+1 точка по высоте, см. выше), в физических
+        // пикселях — так верно и при разном масштабе мониторов. Окно на месте — ничего не делается.
+        if !windowed {
+            if let Some(m) = display::target(&self.cfg.monitor) {
+                display::fit_window(ppt::STAGE_TITLE, m.rect, 1);
+            }
+        }
 
         if let Some((_, _, _, pdf)) = pdf {
             self.renderer.want(&pdf, wanted);
