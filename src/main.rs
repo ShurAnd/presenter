@@ -44,14 +44,18 @@ const GOTO_TIMEOUT: Duration = Duration::from_secs(4);
 const DOUBLE_ESC: Duration = Duration::from_millis(600);
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(format!("Presentator v{}", env!("CARGO_PKG_VERSION")))
-            .with_inner_size([750.0, 620.0])
-            .with_min_inner_size([640.0, 420.0])
-            .with_icon(app_icon()),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(format!("Presentator v{}", env!("CARGO_PKG_VERSION")))
+        .with_inner_size([750.0, 620.0])
+        .with_min_inner_size([640.0, 420.0])
+        .with_icon(app_icon());
+    // По центру рабочей области: иначе Windows при каскадной раскладке мог открыть окно так низко,
+    // что нижняя панель с кнопками уходила за край экрана (1080p при масштабе 150 %).
+    let geometry = initial_geometry();
+    if let Some((pos, size)) = geometry {
+        viewport = viewport.with_position(pos).with_inner_size(size);
+    }
+    let options = eframe::NativeOptions { viewport, centered: geometry.is_none(), ..Default::default() };
     eframe::run_native("presentator", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
@@ -64,6 +68,8 @@ struct Config {
     /// Название сервера для списка (необязательно), например «Зал 1».
     name: String,
     windowed: bool,
+    /// Клавиши в окне программы (стрелки, PageUp/PageDown, пробел, цифры + Enter) управляют показом.
+    keyboard: bool,
     /// Серверы, к которым подключались, — последний использованный первым.
     #[serde(deserialize_with = "null_as_empty")]
     servers: Vec<SavedServer>,
@@ -83,6 +89,7 @@ impl Default for Config {
             password: "default_password".into(),
             name: String::new(),
             windowed: false,
+            keyboard: true,
             servers: Vec::new(),
         }
     }
@@ -121,6 +128,29 @@ fn merge_servers(ours: &mut Vec<SavedServer>, other: Vec<SavedServer>, forgotten
         }
     }
     ours.truncate(MAX_SERVERS);
+}
+
+/// Положение и размер главного окна: по центру рабочей области (экран без панели задач)
+/// и не выше неё. В логических точках — как их ждёт egui.
+fn initial_geometry() -> Option<(egui::Pos2, egui::Vec2)> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS};
+        let mut r = RECT::default();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut r as *mut RECT as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)).ok()?;
+        // До создания окна процесс может ещё не учитывать масштаб — тогда Windows уже отдаёт
+        // логические единицы и системный DPI = 96; в обоих случаях деление даёт точки egui.
+        let k = windows::Win32::UI::HiDpi::GetDpiForSystem().max(96) as f32 / 96.0;
+        let (x, y) = (r.left as f32 / k, r.top as f32 / k);
+        let (w, h) = ((r.right - r.left) as f32 / k, (r.bottom - r.top) as f32 / k);
+        const FRAME: f32 = 45.0; // заголовок и рамки окна
+        let size = egui::vec2(750f32.min(w - 20.0), 620f32.min(h - FRAME - 10.0)).max(egui::vec2(640.0, 420.0));
+        let pos = egui::pos2(x + (w - size.x) / 2.0, y + (h - size.y - FRAME) / 2.0).max(egui::pos2(x, y));
+        Some((pos, size))
+    }
+    #[cfg(not(windows))]
+    None
 }
 
 /// Значок окон (тот же, что вшит в exe). Декодируется один раз.
@@ -925,6 +955,18 @@ impl App {
                     self.add_files(files, &ctx);
                 }
             }
+            // Переключатель «управление с клавиатуры»: зелёный — клавиши в этом окне управляют показом.
+            let (fill, tip) = if self.cfg.keyboard {
+                (GREEN, "Клавиатура включена: стрелки и PageUp/PageDown листают слайды, пробел — следующий шаг или старт/пауза видео, цифры + Enter — переход к слайду. Нажмите, чтобы выключить.")
+            } else {
+                (GRAY, "Клавиатура выключена: клавиши в этом окне показом не управляют. Нажмите, чтобы включить.")
+            };
+            let key_btn = egui::Button::new(RichText::new("⌨").size(14.0).color(Color32::WHITE)).fill(fill).corner_radius(5.0).min_size(egui::vec2(44.0, 0.0));
+            if ui.add(key_btn).on_hover_text(tip).clicked() {
+                self.cfg.keyboard = !self.cfg.keyboard;
+                self.goto_buf.clear();
+                self.save_cfg();
+            }
             ui.add_space(4.0);
             let srv = if self.server_online { format!("Сервер: онлайн ({})", self.clients) } else { "Сервер: офлайн".into() };
             indicator(ui, if self.server_online { GREEN } else { OFF }, &srv);
@@ -997,8 +1039,10 @@ impl App {
                 }
             });
         });
-        let hint = if self.connected {
-            "Вы управляете сервером. Пробел — следующий шаг или старт/пауза видео, стрелки — слайды или перемотка видео."
+        let hint = if !self.cfg.keyboard {
+            "Клавиатура выключена (кнопка ⌨ вверху) — управляйте кнопками."
+        } else if self.connected {
+            "Вы управляете сервером. Стрелки и PageUp/PageDown — слайды, пробел — следующий шаг или старт/пауза видео, цифры + Enter — переход к слайду."
         } else {
             "Двойной щелчок открывает файл. Пробел — следующий шаг или старт/пауза видео. Двойной Esc на экране показа закрывает его, на фоне — убирает фон."
         };
@@ -1190,10 +1234,20 @@ impl App {
         if ctx.wants_keyboard_input() {
             return;
         }
-        for cmd in nav_keys(ctx, view) {
-            self.act(cmd);
-        }
         let (digits, enter) = typed_digits(ctx);
+        if self.cfg.keyboard {
+            // Кнопка, нажатая мышью, остаётся в фокусе, и пробел или Enter «нажали» бы её снова, —
+            // в режиме управления с клавиатуры они должны уходить в показ.
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            for cmd in nav_keys(ctx, view) {
+                self.act(cmd);
+            }
+        }
+        let digits = if self.cfg.keyboard { digits } else { String::new() };
         if !self.goto_typed(&digits, enter, view) && enter {
             if let Some(id) = self.selected {
                 self.act(Cmd::Open { id });
