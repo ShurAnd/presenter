@@ -1,8 +1,10 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod audio;
 mod display;
 mod health;
 mod net;
+mod player;
 mod ppt;
 mod render;
 mod screen;
@@ -19,8 +21,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
-use render::{Out, PageKey, Renderer, THUMB_H, THUMB_W, VIDEO_EXTS};
+use net::{AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
+use render::{Out, PageKey, Renderer, AUDIO_EXTS, THUMB_H, THUMB_W, VIDEO_EXTS};
 use serde::{Deserialize, Serialize};
 
 const BLUE: Color32 = Color32::from_rgb(0x5b, 0xc0, 0xde);
@@ -28,6 +30,8 @@ const GREEN: Color32 = Color32::from_rgb(0x28, 0xa7, 0x45);
 const RED: Color32 = Color32::from_rgb(0xd9, 0x53, 0x4f);
 const GRAY: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
 const OFF: Color32 = Color32::from_rgb(0x6c, 0x75, 0x7d);
+/// Вставка (фанфары) в плеере.
+const INSERT: Color32 = Color32::from_rgb(0xe0, 0x8a, 0x00);
 /// Фон сцены, если картинки фона нет.
 const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
 /// Файлы фона рядом с exe — если есть, заменяют вшитую картинку. Берётся первый найденный.
@@ -89,6 +93,10 @@ struct Config {
     reserve: String,
     /// Загружаемые файлы дублировать на резервный сервер.
     mirror: bool,
+    /// Плеер (на сервере): играть по списку, по кругу, громкость 0–100.
+    audio_list: bool,
+    audio_repeat: bool,
+    audio_volume: u8,
 }
 
 /// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
@@ -110,6 +118,9 @@ impl Default for Config {
             servers: Vec::new(),
             reserve: String::new(),
             mirror: true,
+            audio_list: true,
+            audio_repeat: false,
+            audio_volume: 100,
         }
     }
 }
@@ -132,6 +143,14 @@ impl SavedServer {
     fn label(&self) -> String {
         if self.name.trim().is_empty() { self.key() } else { format!("{} — {}", self.name.trim(), self.key()) }
     }
+}
+
+/// Вкладки главного окна.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    List,
+    Player,
+    Net,
 }
 
 /// Папка в рабочей папке для слайдов PPTX в картинках (превью).
@@ -405,8 +424,16 @@ struct App {
     cli_rx: Receiver<CliEvent>,
     remote: StateMsg,
 
+    // Плеер (на сервере и в автономном режиме; у клиента — состояние сервера в `remote.audio`)
+    player: player::Player,
+    /// Что последний раз записано в audio_<порт>.json.
+    saved_audio: String,
+    /// Выбранный трек в списке плеера и позиция, которую сейчас тянут мышью.
+    audio_selected: Option<u64>,
+    audio_seek: Option<f32>,
+
     // Интерфейс
-    net_panel: bool,
+    tab: Tab,
     selected: Option<u64>,
     net_status: String,
     status: String,
@@ -442,7 +469,18 @@ impl App {
                 ctx.request_repaint();
             })
         };
+        let player = {
+            let (tx, ctx) = (out_tx.clone(), cc.egui_ctx.clone());
+            player::Player::new(cfg.audio_list, cfg.audio_repeat, cfg.audio_volume, move |ev| {
+                let _ = tx.send(Out::Audio(ev));
+                ctx.request_repaint();
+            })
+        };
         let mut app = Self {
+            player,
+            saved_audio: String::new(),
+            audio_selected: None,
+            audio_seek: None,
             cfg,
             ctx: cc.egui_ctx.clone(),
             work_dir: app_dir().join("presentator_files"),
@@ -507,7 +545,7 @@ impl App {
             cli_tx,
             cli_rx,
             remote: StateMsg::default(),
-            net_panel: std::env::args().any(|a| a == "--net"),
+            tab: if std::env::args().any(|a| a == "--net") { Tab::Net } else { Tab::List },
             selected: None,
             net_status: String::new(),
             status: String::new(),
@@ -566,6 +604,7 @@ impl App {
             video: self.show.as_ref().and_then(Show::video).map(|v| VideoInfo { state: v.state, pos: v.pos as u32, dur: v.dur as u32 }),
             screen: self.screen,
             timer: self.timer.info(),
+            audio: self.player.info(),
         }
     }
 
@@ -674,6 +713,33 @@ impl App {
                     Cmd::Timer => Screen::Timer,
                     _ => Screen::Background,
                 };
+            }
+            c @ (Cmd::AudioPlay { .. }
+            | Cmd::AudioInsert { .. }
+            | Cmd::AudioToggle
+            | Cmd::AudioStop
+            | Cmd::AudioNext
+            | Cmd::AudioPrev
+            | Cmd::AudioSeek { .. }
+            | Cmd::AudioMode { .. }
+            | Cmd::AudioVolume { .. }
+            | Cmd::AudioRemove { .. }
+            | Cmd::AudioMove { .. }
+            | Cmd::AudioClear) => {
+                let mode = matches!(c, Cmd::AudioMode { .. } | Cmd::AudioVolume { .. });
+                for f in self.player.apply(c) {
+                    if f.starts_with(&self.work_dir) {
+                        let _ = std::fs::remove_file(f);
+                    }
+                }
+                // Режим и громкость плеера запоминаются (записываются при смене режима и при выходе).
+                if mode {
+                    let changed = (self.cfg.audio_list, self.cfg.audio_repeat) != (self.player.list, self.player.repeat);
+                    (self.cfg.audio_list, self.cfg.audio_repeat, self.cfg.audio_volume) = (self.player.list, self.player.repeat, self.player.volume);
+                    if changed {
+                        self.save_cfg();
+                    }
+                }
             }
             Cmd::TimerSet { countdown, secs } => self.timer.set(countdown, secs),
             Cmd::TimerRun { run } => self.timer.run(run),
@@ -837,21 +903,30 @@ impl App {
         self.work_dir.join(format!("list_{}.json", self.cfg.port.trim()))
     }
 
+    /// Список плеера — рядом, в своём файле.
+    fn audio_path(&self) -> PathBuf {
+        self.work_dir.join(format!("audio_{}.json", self.cfg.port.trim()))
+    }
+
     /// Сохранить список (порядок, имена, файлы) — он переживает перезапуск программы и сбой.
     fn save_list(&mut self) {
         if !self.server_online {
             return;
         }
         let list: Vec<SavedItem> = self.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone() }).collect();
-        let Ok(text) = serde_json::to_string_pretty(&list) else { return };
-        if text == self.saved_list {
-            return;
-        }
-        let _ = std::fs::create_dir_all(&self.work_dir);
-        // Через временный файл: при сбое посреди записи старый список останется целым.
-        let tmp = self.list_path().with_extension("json.tmp");
-        if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, self.list_path()).is_ok() {
-            self.saved_list = text;
+        let audio: Vec<SavedItem> = self.player.tracks.iter().map(|t| SavedItem { name: t.name.clone(), src: t.src.clone() }).collect();
+        let (list_path, audio_path) = (self.list_path(), self.audio_path());
+        for (list, path, saved) in [(list, list_path, &mut self.saved_list), (audio, audio_path, &mut self.saved_audio)] {
+            let Ok(text) = serde_json::to_string_pretty(&list) else { continue };
+            if text == *saved {
+                continue;
+            }
+            let _ = std::fs::create_dir_all(&self.work_dir);
+            // Через временный файл: при сбое посреди записи старый список останется целым.
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+                *saved = text;
+            }
         }
     }
 
@@ -864,7 +939,8 @@ impl App {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        let is_list = |name: &str| name.starts_with("list_") || name.starts_with("list.json");
+        let audio: Vec<SavedItem> = std::fs::read_to_string(self.audio_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        let is_list = |name: &str| name.starts_with("list_") || name.starts_with("list.json") || name.starts_with("audio_");
         let mut keep: HashSet<PathBuf> = HashSet::new();
         if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
             for e in dir.flatten() {
@@ -894,15 +970,15 @@ impl App {
             }
         }
         let mut missing = 0;
-        for it in list {
+        for it in list.into_iter().chain(audio) {
             if it.src.is_file() {
                 self.add_local(it.src, Some(it.name), ctx);
             } else {
                 missing += 1;
             }
         }
-        if !self.items.is_empty() {
-            self.status = format!("Список восстановлен (файлов: {}", self.items.len());
+        if !self.items.is_empty() || !self.player.tracks.is_empty() {
+            self.status = format!("Список восстановлен (файлов: {}", self.items.len() + self.player.tracks.len());
             if missing > 0 {
                 self.status += &format!(", не найдено: {missing}");
             }
@@ -940,12 +1016,19 @@ impl App {
 
     fn add_local(&mut self, path: PathBuf, name: Option<String>, ctx: &egui::Context) {
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        // Звук — в плеер, а не в список презентаций.
+        if AUDIO_EXTS.contains(&ext.as_str()) {
+            let name = name.unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            self.player.add(path, name);
+            self.dirty = true;
+            return;
+        }
         let kind = match ext.as_str() {
             "pdf" => "PDF",
             "pptx" | "ppt" | "ppsx" | "pps" => "PPTX",
             e if VIDEO_EXTS.contains(&e) => "ВИДЕО",
             _ => {
-                self.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX или видео)");
+                self.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX, видео или музыка)");
                 return;
             }
         };
@@ -1035,6 +1118,13 @@ impl App {
                     }
                 }
                 Out::ShowEsc => self.esc_press(),
+                Out::Audio(ev) => {
+                    self.dirty |= self.player.on_event(ev);
+                    if let Some(m) = self.player.message.take() {
+                        self.status = m;
+                        self.dirty = true;
+                    }
+                }
                 Out::Health(h) => self.local_health = Some(h),
                 Out::Video { gen, ev } => {
                     let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) else { continue };
@@ -1113,7 +1203,7 @@ impl App {
                 SrvEvent::Started => {
                     self.server_online = true;
                     // Сервер восстанавливает свой список (если в окне ещё ничего нет).
-                    if self.items.is_empty() {
+                    if self.items.is_empty() && self.player.tracks.is_empty() {
                         self.load_list(ctx);
                     }
                     self.dirty = true;
@@ -1523,16 +1613,10 @@ impl App {
 
     fn top_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         ui.horizontal(|ui| {
-            let label = if self.net_panel { "📄 Список" } else { "🌐 Сеть" };
-            if btn(ui, label, BLUE).clicked() {
-                self.net_panel = !self.net_panel;
-                if self.net_panel {
-                    self.merge_servers_from_disk();
-                }
-            }
             if btn(ui, "➕ Добавить", BLUE).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("Презентации и видео", &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &VIDEO_EXTS[..]].concat())
+                    .add_filter("Презентации, видео и музыка", &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &VIDEO_EXTS[..], &AUDIO_EXTS[..]].concat())
+                    .add_filter("Музыка", &AUDIO_EXTS)
                     .pick_files()
                 {
                     let ctx = ui.ctx().clone();
@@ -1581,15 +1665,23 @@ impl App {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if btn(ui, "🗑 Очистить", RED).clicked() {
-                    self.act(Cmd::Clear);
+                // На вкладке «Плеер» кнопки работают со списком плеера.
+                let player = self.tab == Tab::Player;
+                let tip = if player { "Очистить список плеера" } else { "Очистить список презентаций" };
+                if btn(ui, "🗑 Очистить", RED).on_hover_text(tip).clicked() {
+                    self.act(if player { Cmd::AudioClear } else { Cmd::Clear });
                 }
-                let sel = self.selected.filter(|id| view.items.iter().any(|i| i.id == *id));
+                let sel = if player {
+                    self.audio_selected.filter(|id| view.audio.tracks.iter().any(|t| t.id == *id))
+                } else {
+                    self.selected.filter(|id| view.items.iter().any(|i| i.id == *id))
+                };
+                let mv = |id, up| if player { Cmd::AudioMove { id, up } } else { Cmd::Move { id, up } };
                 if ui.add_enabled(sel.is_some(), cbutton("⬇ Вниз", GRAY)).clicked() {
-                    self.act(Cmd::Move { id: sel.unwrap(), up: false });
+                    self.act(mv(sel.unwrap(), false));
                 }
                 if ui.add_enabled(sel.is_some(), cbutton("⬆ Вверх", GRAY)).clicked() {
-                    self.act(Cmd::Move { id: sel.unwrap(), up: true });
+                    self.act(mv(sel.unwrap(), true));
                 }
             });
         });
@@ -1821,6 +1913,197 @@ impl App {
             });
         });
         self.help_open = open;
+    }
+
+    /// Вкладки «Презентации / Плеер / Сеть»; справа — что играет плеер (видно с любой вкладки).
+    fn tab_row(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+        ui.horizontal(|ui| {
+            for (tab, label) in [(Tab::List, "Презентации"), (Tab::Player, "Плеер"), (Tab::Net, "Сеть")] {
+                let on = self.tab == tab;
+                let text = RichText::new(label).size(14.0).strong().color(if on { Color32::WHITE } else { Color32::from_gray(0x44) });
+                let b = egui::Button::new(text).fill(if on { BLUE } else { Color32::from_gray(0xe4) }).corner_radius(5.0).min_size(egui::vec2(96.0, 0.0));
+                if ui.add(b).clicked() && !on {
+                    if tab == Tab::Net {
+                        self.merge_servers_from_disk();
+                    }
+                    self.tab = tab;
+                }
+            }
+            if let Some((text, color)) = now_playing(&view.audio) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(cbutton("■", RED)).on_hover_text("Остановить музыку (плавно)").clicked() {
+                        self.act(Cmd::AudioStop);
+                    }
+                    ui.add(egui::Label::new(RichText::new(text).color(color).strong()).truncate());
+                });
+            }
+        });
+    }
+
+    /// Вкладка «Плеер»: режим и громкость, список треков, позиция и кнопки.
+    fn player_panel(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+        let a = view.audio.clone();
+        // Режим и громкость.
+        ui.horizontal(|ui| {
+            if ui.selectable_label(!a.list, "Один трек").on_hover_text("Сыграть трек и остановиться (с «Повтором» — крутить его по кругу)").clicked() && a.list {
+                self.act(Cmd::AudioMode { list: false, repeat: a.repeat });
+            }
+            if ui.selectable_label(a.list, "По списку").on_hover_text("После трека — следующий (с «Повтором» — весь список по кругу)").clicked() && !a.list {
+                self.act(Cmd::AudioMode { list: true, repeat: a.repeat });
+            }
+            ui.add_space(6.0);
+            if ui.selectable_label(a.repeat, "Повтор").on_hover_text("По кругу: один трек или весь список").clicked() {
+                self.act(Cmd::AudioMode { list: a.list, repeat: !a.repeat });
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut v = a.volume as f32;
+                ui.spacing_mut().slider_width = 130.0;
+                if ui.add(egui::Slider::new(&mut v, 0.0..=100.0).show_value(false)).on_hover_text(format!("{} %", a.volume)).changed() {
+                    self.act(Cmd::AudioVolume { volume: v.round() as u8 });
+                }
+                ui.label(format!("Громкость {} %", a.volume));
+            });
+        });
+        ui.add_space(4.0);
+        // Позиция и кнопки — внизу, список занимает остальное.
+        egui::TopBottomPanel::bottom("player_controls").frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 6))).show_inside(ui, |ui| self.player_controls(ui, &a));
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0_f32, Color32::from_gray(0xcc)))
+            .corner_radius(5.0)
+            .inner_margin(6.0)
+            .fill(Color32::WHITE)
+            .show(ui, |ui| {
+                ui.set_min_size(ui.available_size());
+                if a.tracks.is_empty() {
+                    ui.centered_and_justified(|ui| {
+                        let t = "Список плеера пуст.\nНажмите «Добавить» или перетащите сюда музыку (mp3, wav, flac, ogg, m4a, wma…) — например, фоновую музыку и фанфары.";
+                        ui.label(RichText::new(t).color(GRAY).size(14.0));
+                    });
+                    return;
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for (n, t) in a.tracks.iter().enumerate() {
+                        let is_cur = a.current == Some(t.id) && a.state != AudioState::Stopped;
+                        let is_ins = a.insert == Some(t.id);
+                        let is_sel = self.audio_selected == Some(t.id);
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+                        let bg = if is_cur || is_ins {
+                            Color32::from_rgb(0xd4, 0xed, 0xda)
+                        } else if is_sel {
+                            Color32::from_rgb(0xd9, 0xee, 0xf7)
+                        } else if resp.hovered() {
+                            Color32::from_gray(0xf3)
+                        } else {
+                            Color32::WHITE
+                        };
+                        let p = ui.painter();
+                        p.rect_filled(rect, 3.0, bg);
+                        p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0_f32, Color32::from_gray(0xee)));
+                        let mark = if is_cur || is_ins { "▶ " } else { "" };
+                        p.text(rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, format!("{mark}{}. {}", n + 1, t.name), egui::FontId::proportional(14.0), Color32::from_gray(0x22));
+                        let info = if is_ins {
+                            Some((format!("вставка {}", audio_time(a.insert_pos, a.insert_dur)), INSERT))
+                        } else if is_cur {
+                            Some(match a.state {
+                                AudioState::Playing if a.insert.is_some() => (format!("ждёт вставку · {}", audio_time(a.pos, a.dur)), BLUE),
+                                AudioState::Playing => (format!("играет {}", audio_time(a.pos, a.dur)), GREEN),
+                                AudioState::Paused if a.insert.is_some() => (format!("ждёт вставку · {}", audio_time(a.pos, a.dur)), BLUE),
+                                AudioState::Paused => (format!("пауза {}", audio_time(a.pos, a.dur)), BLUE),
+                                _ => ("затихает…".to_string(), GRAY),
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some((text, color)) = info {
+                            p.text(rect.right_center() - egui::vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, text, egui::FontId::proportional(12.0), color);
+                        }
+                        if resp.clicked() {
+                            self.audio_selected = Some(t.id);
+                        }
+                        if resp.double_clicked() {
+                            self.audio_selected = Some(t.id);
+                            self.act(Cmd::AudioPlay { id: t.id });
+                        }
+                    }
+                });
+            });
+    }
+
+    /// Позиция (с перемоткой) и кнопки плеера.
+    fn player_controls(&mut self, ui: &mut egui::Ui, a: &AudioInfo) {
+        let sel = self.audio_selected.filter(|id| a.tracks.iter().any(|t| t.id == *id));
+        let ins = a.insert.is_some();
+        // Позиция того, что звучит: вставки, если она идёт, иначе музыки.
+        let (pos, dur, name) = if ins { (a.insert_pos, a.insert_dur, a.insert) } else { (a.pos, a.dur, a.current) };
+        let active = if ins { a.insert_state != AudioState::Stopped } else { a.state != AudioState::Stopped };
+        let name = name.and_then(|id| a.tracks.iter().find(|t| t.id == id)).map(|t| t.name.as_str()).filter(|_| active);
+        ui.horizontal(|ui| {
+            let title = match name {
+                Some(n) if ins => format!("Вставка: {n}"),
+                Some(n) => n.to_string(),
+                None => "Ничего не играет".into(),
+            };
+            ui.add(egui::Label::new(RichText::new(title).strong().color(if ins { INSERT } else { Color32::from_gray(0x33) })).truncate());
+        });
+        ui.horizontal(|ui| {
+            let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
+            ui.label(t(self.audio_seek.map_or(pos, |v| v as u32)));
+            ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(60.0);
+            let mut v = self.audio_seek.unwrap_or(pos as f32);
+            let r = ui.add_enabled(active && dur > 0, egui::Slider::new(&mut v, 0.0..=dur.max(1) as f32).show_value(false));
+            if r.dragged() {
+                self.audio_seek = Some(v);
+            }
+            if r.drag_stopped() || r.clicked() {
+                self.audio_seek = None;
+                self.act(Cmd::AudioSeek { secs: v as u32 });
+            }
+            ui.label(t(dur));
+        });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!a.tracks.is_empty(), cbutton("◀ Пред.", BLUE)).clicked() {
+                self.act(Cmd::AudioPrev);
+            }
+            let (label, color, cmd) = match (ins, if ins { a.insert_state } else { a.state }) {
+                (_, AudioState::Playing) => ("⏸ Пауза", BLUE, Cmd::AudioToggle),
+                (_, AudioState::Paused) => ("▶ Продолжить", GREEN, Cmd::AudioToggle),
+                _ => match sel.or(a.current).or(a.tracks.first().map(|t| t.id)) {
+                    Some(id) => ("▶ Старт", GREEN, Cmd::AudioPlay { id }),
+                    None => ("▶ Старт", GREEN, Cmd::AudioToggle),
+                },
+            };
+            if ui.add_enabled(!a.tracks.is_empty(), cbutton(label, color)).on_hover_text("Двойной щелчок по треку — играть его").clicked() {
+                self.act(cmd);
+            }
+            let playing = a.state != AudioState::Stopped || ins;
+            let stopping = a.state == AudioState::Stopping || a.insert_state == AudioState::Stopping;
+            let tip = if stopping { "Остановить сразу" } else { "Остановить с плавным затуханием (повторное нажатие — сразу)" };
+            if ui.add_enabled(playing, cbutton("■ Стоп", RED)).on_hover_text(tip).clicked() {
+                self.act(Cmd::AudioStop);
+            }
+            if ui.add_enabled(!a.tracks.is_empty(), cbutton("След. ▶", BLUE)).clicked() {
+                self.act(Cmd::AudioNext);
+            }
+            ui.add_space(10.0);
+            if ui
+                .add_enabled(sel.is_some(), cbutton("Вставкой", INSERT))
+                .on_hover_text("Сыграть выбранный трек один раз (фанфары): музыка встанет на паузу и после него продолжится с того же места")
+                .clicked()
+            {
+                self.act(Cmd::AudioInsert { id: sel.unwrap() });
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(sel.is_some(), cbutton("Удалить", GRAY)).clicked() {
+                    if let Some(id) = self.audio_selected.take() {
+                        self.act(Cmd::AudioRemove { id });
+                    }
+                }
+            });
+        });
+        // Пока звучит — обновлять позицию (сервер присылает её раз в секунду).
+        if active {
+            ui.ctx().request_repaint_after(Duration::from_millis(500));
+        }
     }
 
     fn list(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
@@ -2361,6 +2644,16 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("PowerPoint", "Картинки слайдов делает PowerPoint во время показа, первые — через долю секунды после открытия. При следующем показе того же файла они уже готовы."),
         ("Видео", "Для видео превью нет."),
     ]),
+    ("Плеер: музыка и фанфары", &[
+        ("Вкладка «Плеер»", "Свой список музыки, отдельно от презентаций. Звук идёт из компьютера показа (сервера). Музыка играет и во время показа."),
+        ("Добавить", "«Добавить» или перетащить файлы в окно: mp3, wav, flac, ogg, m4a, aac, wma и др. Музыка сама попадает в плеер."),
+        ("Играть", "Двойной щелчок по треку или «Старт». «Пауза» / «Продолжить», «Пред.» / «След.», перемотка — полосой позиции."),
+        ("Один трек / По списку", "«Один трек» — сыграть и остановиться. «По списку» — после трека следующий."),
+        ("Повтор", "По кругу: один трек (в режиме «Один трек») или весь список (в режиме «По списку»)."),
+        ("Вставкой", "Для фанфар: выбранный трек играет один раз, музыка на это время встаёт на паузу и потом продолжается с того же места."),
+        ("Стоп", "Звук плавно затихает за 2 секунды. Нажать ещё раз — остановить сразу. Красная кнопка справа от вкладок — то же с любой вкладки."),
+        ("Громкость", "Ползунок справа вверху; запоминается на сервере."),
+    ]),
     ("PowerPoint и видео", &[
         ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
         ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон."),
@@ -2442,6 +2735,26 @@ fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
     out
 }
 
+/// «01:23 / 03:45» (длительность, если известна).
+fn audio_time(pos: u32, dur: u32) -> String {
+    let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
+    if dur > 0 { format!("{} / {}", t(pos), t(dur)) } else { t(pos) }
+}
+
+/// Что играет плеер — для строки вкладок (None — тишина).
+fn now_playing(a: &AudioInfo) -> Option<(String, Color32)> {
+    let name = |id: Option<u64>| id.and_then(|id| a.tracks.iter().find(|t| t.id == id)).map(|t| t.name.clone()).unwrap_or_default();
+    if a.insert.is_some() && a.insert_state != AudioState::Stopped {
+        return Some((format!("Вставка: {} {}", name(a.insert), audio_time(a.insert_pos, a.insert_dur)), INSERT));
+    }
+    match a.state {
+        AudioState::Playing => Some((format!("Музыка: {} {}", name(a.current), audio_time(a.pos, a.dur)), GREEN)),
+        AudioState::Paused => Some((format!("Музыка на паузе: {}", name(a.current)), BLUE)),
+        AudioState::Stopping => Some(("Музыка затихает…".into(), GRAY)),
+        AudioState::Stopped => None,
+    }
+}
+
 /// Состояние видео для строки списка и нижней панели.
 fn video_label(v: &VideoInfo) -> (String, Color32) {
     let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
@@ -2514,14 +2827,16 @@ impl eframe::App for App {
         self.help_window(ctx);
         egui::TopBottomPanel::bottom("bottom").frame(margin).show(ctx, |ui| self.bottom_bar(ui, &view));
         // Превью — над нижней панелью, пока открыта презентация (у видео превью нет).
-        if !self.net_panel && view.active.is_some() && view.video.is_none() {
+        if self.tab == Tab::List && view.active.is_some() && view.video.is_none() {
             egui::TopBottomPanel::bottom("preview").frame(margin).show(ctx, |ui| self.preview_bar(ui, &view));
         }
         egui::CentralPanel::default().frame(margin).show(ctx, |ui| {
-            if self.net_panel {
-                self.network_panel(ui);
-            } else {
-                self.list(ui, &view);
+            self.tab_row(ui, &view);
+            ui.add_space(4.0);
+            match self.tab {
+                Tab::List => self.list(ui, &view),
+                Tab::Player => self.player_panel(ui, &view),
+                Tab::Net => self.network_panel(ui),
             }
         });
 
@@ -2725,6 +3040,10 @@ mod tests {
                     println!("ITEM {} {} | {} | готов: {} | {}", n + 1, i.name, i.kind, i.ready, i.status);
                 }
                 println!("ITEMS {}", s.items.len());
+                for (n, t) in s.audio.tracks.iter().enumerate() {
+                    println!("AUDIO {} {}", n + 1, t.name);
+                }
+                println!("AUDIO_TRACKS {} режим: по списку {}, повтор {}, громкость {}", s.audio.tracks.len(), s.audio.list, s.audio.repeat, s.audio.volume);
                 let active = s.active.and_then(|id| s.items.iter().find(|i| i.id == id)).map(|i| i.name.clone());
                 println!("ACTIVE {:?} слайд {} из {}", active, s.page + 1, s.pages);
                 return;
@@ -2759,6 +3078,90 @@ mod tests {
             }
         }
         panic!("не открылось");
+    }
+
+    /// Плеер против запущенного `presentator --server`:
+    /// TEST_AUDIO="музыка 1.wav;музыка 2.wav;фанфары.wav" cargo test --release e2e_audio -- --ignored --nocapture
+    /// Нужны три файла: длинный (≥ 6 с), второй и короткий (вставка, ≤ 3 с).
+    #[test]
+    #[ignore]
+    fn e2e_audio() {
+        let files: Vec<PathBuf> = std::env::var("TEST_AUDIO").unwrap().split(';').map(PathBuf::from).collect();
+        let (tx, rx) = channel();
+        let t0 = Instant::now();
+        let wait = |what: &str, secs: u64, f: &dyn Fn(&AudioInfo) -> bool| -> AudioInfo {
+            let t = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(secs).saturating_sub(t.elapsed())).unwrap_or_else(|_| panic!("timeout: {what}")) {
+                    CliEvent::Closed(r) => panic!("closed: {r}"),
+                    CliEvent::State(s) => {
+                        let a = s.audio;
+                        if f(&a) {
+                            println!(
+                                "{:>6} ms OK {what}: музыка {:?} {:?} {}/{} с, вставка {:?} {:?} {}/{} с",
+                                t0.elapsed().as_millis(), a.current, a.state, a.pos, a.dur, a.insert, a.insert_state, a.insert_pos, a.insert_dur
+                            );
+                            return a;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        c.send(CliReq::Cmd(Cmd::AudioClear));
+        wait("cleared", 10, &|a| a.tracks.is_empty());
+        for f in &files {
+            c.send(CliReq::Upload(f.clone()));
+        }
+        let a = wait("uploaded", 30, &|a| a.tracks.len() == 3);
+        let (m1, m2, fan) = (a.tracks[0].id, a.tracks[1].id, a.tracks[2].id);
+        c.send(CliReq::Cmd(Cmd::AudioMode { list: true, repeat: false }));
+        c.send(CliReq::Cmd(Cmd::AudioVolume { volume: 60 }));
+        wait("mode list, volume 60", 10, &|a| a.list && !a.repeat && a.volume == 60);
+
+        // Музыка, через 2 с — вставка: музыка на паузе, после вставки продолжается с того же места.
+        c.send(CliReq::Cmd(Cmd::AudioPlay { id: m1 }));
+        let a = wait("music 1 playing 2 s", 10, &|a| a.current == Some(m1) && a.state == AudioState::Playing && a.pos >= 2);
+        c.send(CliReq::Cmd(Cmd::AudioInsert { id: fan }));
+        let before = wait("insert playing, music paused", 10, &|a| a.insert == Some(fan) && a.state == AudioState::Paused).pos;
+        assert!(before >= a.pos);
+        wait("insert done, music resumed", 10, &|a| a.insert.is_none() && a.state == AudioState::Playing && a.current == Some(m1));
+        let a = wait("music continues", 10, &|a| a.state == AudioState::Playing && a.pos > before);
+        assert!(a.pos < before + 3, "музыка должна продолжиться с того же места, а не начаться заново");
+
+        // По списку: после первого трека сам пошёл второй.
+        wait("list: next track", 15, &|a| a.current == Some(m2) && a.state == AudioState::Playing);
+        // Стоп — плавно (затухание), затем тишина.
+        c.send(CliReq::Cmd(Cmd::AudioStop));
+        wait("stopping (fade)", 5, &|a| a.state == AudioState::Stopping);
+        let t = Instant::now();
+        wait("stopped", 5, &|a| a.state == AudioState::Stopped);
+        println!("затухание: {} мс", t.elapsed().as_millis());
+
+        // Один трек по кругу: короткий трек всё ещё играет после своей длительности.
+        c.send(CliReq::Cmd(Cmd::AudioMode { list: false, repeat: true }));
+        c.send(CliReq::Cmd(Cmd::AudioPlay { id: fan }));
+        wait("one + repeat playing", 10, &|a| a.current == Some(fan) && a.state == AudioState::Playing);
+        std::thread::sleep(Duration::from_millis(4500));
+        wait("still playing after 4.5 s", 5, &|a| a.state == AudioState::Playing);
+        // Один трек без повтора: доиграл и остановился, трек остался выбранным.
+        c.send(CliReq::Cmd(Cmd::AudioMode { list: false, repeat: false }));
+        c.send(CliReq::Cmd(Cmd::AudioPlay { id: fan }));
+        wait("one: playing", 10, &|a| a.state == AudioState::Playing);
+        wait("one: stopped by itself", 10, &|a| a.state == AudioState::Stopped && a.current == Some(fan));
+        // Повторный «Стоп» во время затухания — сразу.
+        c.send(CliReq::Cmd(Cmd::AudioPlay { id: m1 }));
+        wait("music 1 again", 10, &|a| a.state == AudioState::Playing && a.pos >= 1);
+        c.send(CliReq::Cmd(Cmd::AudioStop));
+        wait("stopping", 5, &|a| a.state == AudioState::Stopping);
+        let t = Instant::now();
+        c.send(CliReq::Cmd(Cmd::AudioStop));
+        wait("stopped at once", 5, &|a| a.state == AudioState::Stopped);
+        println!("второй «Стоп»: {} мс", t.elapsed().as_millis());
+        c.send(CliReq::Cmd(Cmd::AudioMode { list: true, repeat: false }));
+        c.send(CliReq::Cmd(Cmd::AudioVolume { volume: 100 }));
+        wait("restore mode", 10, &|a| a.list && a.volume == 100);
     }
 
     /// Отправить одну команду (JSON) на сервер TEST_PORT: TEST_CMD='{"c":"Clock"}'

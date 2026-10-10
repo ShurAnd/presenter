@@ -33,12 +33,17 @@ pub enum Out {
     /// Свежие показатели этого компьютера (сборщик работает, пока запущен сервер).
     Health(crate::health::HealthInfo),
     Video { gen: u64, ev: crate::video::VideoEvent },
+    /// События плеера (музыка и вставки).
+    Audio(crate::audio::AudioEvent),
     Page { key: PageKey, image: ColorImage },
     PageErr { key: PageKey, msg: String },
     /// Миниатюра слайда для превью: картинка и она же в JPEG (для клиентов).
     Thumb { id: u64, page: usize, image: ColorImage, jpg: Vec<u8> },
     ThumbErr { id: u64, page: usize },
 }
+
+/// Расширения звуковых файлов — они идут в плеер, а не в список презентаций.
+pub const AUDIO_EXTS: [&str; 12] = ["mp3", "wav", "flac", "ogg", "oga", "opus", "m4a", "aac", "wma", "aif", "aiff", "mka"];
 
 /// Расширения видеофайлов, которые отдаём встроенному проигрывателю.
 pub const VIDEO_EXTS: [&str; 12] = ["mp4", "m4v", "mov", "wmv", "avi", "mkv", "mpg", "mpeg", "ts", "m2ts", "webm", "3gp"];

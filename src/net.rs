@@ -44,6 +44,80 @@ pub enum Cmd {
     TimerRun { run: bool },
     /// Таймер — на начало (и остановить).
     TimerReset,
+    /// Плеер: играть трек (музыка; вставка, если играла, прекращается).
+    AudioPlay { id: u64 },
+    /// Плеер: сыграть трек один раз «вставкой» — музыка на это время на паузе, потом продолжается.
+    AudioInsert { id: u64 },
+    /// Плеер: пауза / продолжить; если ничего не играет — старт.
+    AudioToggle,
+    /// Плеер: стоп с плавным затуханием; повторный «Стоп» во время затухания — сразу.
+    AudioStop,
+    AudioNext,
+    AudioPrev,
+    /// Перемотка того, что сейчас звучит, на `secs` секунд от начала.
+    AudioSeek { secs: u32 },
+    /// Режим: `list` — играть по списку (иначе один трек), `repeat` — по кругу.
+    AudioMode { list: bool, repeat: bool },
+    /// Громкость, 0–100.
+    AudioVolume { volume: u8 },
+    AudioRemove { id: u64 },
+    AudioMove { id: u64, up: bool },
+    AudioClear,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub enum AudioState {
+    #[default]
+    Stopped,
+    Playing,
+    Paused,
+    /// Идёт плавное затухание после «Стоп».
+    Stopping,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TrackInfo {
+    pub id: u64,
+    pub name: String,
+}
+
+/// Состояние плеера на сервере.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(default)]
+pub struct AudioInfo {
+    pub tracks: Vec<TrackInfo>,
+    /// Трек «музыки» (выбран для игры), его состояние, позиция и длительность в секундах.
+    pub current: Option<u64>,
+    pub state: AudioState,
+    pub pos: u32,
+    pub dur: u32,
+    /// Вставка, пока она звучит (музыка на это время на паузе).
+    pub insert: Option<u64>,
+    pub insert_state: AudioState,
+    pub insert_pos: u32,
+    pub insert_dur: u32,
+    pub list: bool,
+    pub repeat: bool,
+    pub volume: u8,
+}
+
+impl Default for AudioInfo {
+    fn default() -> Self {
+        Self {
+            tracks: Vec::new(),
+            current: None,
+            state: AudioState::Stopped,
+            pos: 0,
+            dur: 0,
+            insert: None,
+            insert_state: AudioState::Stopped,
+            insert_pos: 0,
+            insert_dur: 0,
+            list: true,
+            repeat: false,
+            volume: 100,
+        }
+    }
 }
 
 /// Что на сцене сервера, когда показа нет.
@@ -112,6 +186,8 @@ pub struct StateMsg {
     pub screen: Screen,
     #[serde(default)]
     pub timer: TimerInfo,
+    #[serde(default)]
+    pub audio: AudioInfo,
 }
 
 /// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).
