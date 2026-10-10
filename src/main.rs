@@ -5,6 +5,7 @@ mod health;
 mod net;
 mod ppt;
 mod render;
+mod screen;
 #[cfg(windows)]
 mod mpv;
 mod video;
@@ -18,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
-use render::{Out, PageKey, Renderer, VIDEO_EXTS};
+use net::{CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
+use render::{Out, PageKey, Renderer, THUMB_H, THUMB_W, VIDEO_EXTS};
 use serde::{Deserialize, Serialize};
 
 const BLUE: Color32 = Color32::from_rgb(0x5b, 0xc0, 0xde);
@@ -79,7 +80,7 @@ struct Config {
     windowed: bool,
     /// Клавиши в окне программы (стрелки, PageUp/PageDown, пробел, цифры + Enter) управляют показом.
     keyboard: bool,
-    /// Монитор для показа (видеостена): системное имя `\\.\DISPLAY2`; пусто — основной.
+    /// Монитор для показа: системное имя `\\.\DISPLAY2`; пусто — основной.
     monitor: String,
     /// Серверы, к которым подключались, — последний использованный первым.
     #[serde(deserialize_with = "null_as_empty")]
@@ -132,6 +133,9 @@ impl SavedServer {
         if self.name.trim().is_empty() { self.key() } else { format!("{} — {}", self.name.trim(), self.key()) }
     }
 }
+
+/// Папка в рабочей папке для слайдов PPTX в картинках (превью).
+const SLIDES_DIR: &str = "slides";
 
 /// Элемент списка в list.json.
 #[derive(Serialize, Deserialize)]
@@ -230,6 +234,8 @@ struct Item {
     pdf: Option<PathBuf>,
     pages: usize,
     status: Status,
+    /// Папка, куда мост к PowerPoint сохраняет слайды PPTX картинками (для превью).
+    slides: Option<PathBuf>,
 }
 
 enum ShowKind {
@@ -317,6 +323,23 @@ struct App {
     /// Что последний раз записано в list.json — пишем только при изменениях.
     saved_list: String,
 
+    // Экран сцены без показа (фон, часы, таймер) и таймер
+    screen: Screen,
+    timer: screen::Timer,
+    /// Поля «минуты» и «секунды» таймера в главном окне.
+    timer_min: String,
+    timer_sec: String,
+    /// Когда пришло последнее состояние сервера — от него клиент досчитывает идущий таймер.
+    remote_at: Instant,
+
+    // Превью: миниатюры текущего и следующего слайда (у клиента — присланные сервером)
+    previews: HashMap<(u64, usize), egui::TextureHandle>,
+    /// Те же миниатюры в JPEG — для рассылки клиентам (на сервере).
+    thumb_jpg: HashMap<(u64, usize), Arc<Vec<u8>>>,
+    /// Миниатюры PPTX, которые сейчас читаются с диска, и те, что не удались.
+    thumb_busy: HashSet<(u64, usize)>,
+    thumb_failed: HashSet<(u64, usize)>,
+
     // Состояние сервера (показатели)
     /// Счётчик кадров интерфейса: по нему сборщик понимает, что программа не зависла.
     ui_frames: Arc<AtomicU64>,
@@ -348,6 +371,7 @@ struct App {
     /// Автопереподключение после обрыва: номер попытки и когда делать следующую.
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
+    help_open: bool,
 
     // Сцена — полноэкранное окно с фоном, на котором идут показы
     stage: bool,
@@ -433,6 +457,15 @@ impl App {
             goto_field: String::new(),
             forgotten: HashSet::new(),
             saved_list: String::new(),
+            screen: Screen::Background,
+            timer: screen::Timer::default(),
+            timer_min: String::new(),
+            timer_sec: String::new(),
+            remote_at: Instant::now(),
+            previews: HashMap::new(),
+            thumb_jpg: HashMap::new(),
+            thumb_busy: HashSet::new(),
+            thumb_failed: HashSet::new(),
             ui_frames: Arc::new(AtomicU64::new(0)),
             collector: None,
             local_health: None,
@@ -451,6 +484,7 @@ impl App {
             pending_add: Vec::new(),
             autostart: watchdog::autostart_enabled(),
             health_open: false,
+            help_open: false,
             stage: false,
             stage_sent: None,
             bg: None,
@@ -530,6 +564,8 @@ impl App {
             pages: self.show.as_ref().map_or(0, |s| s.pages),
             message: self.status.clone(),
             video: self.show.as_ref().and_then(Show::video).map(|v| VideoInfo { state: v.state, pos: v.pos as u32, dur: v.dur as u32 }),
+            screen: self.screen,
+            timer: self.timer.info(),
         }
     }
 
@@ -557,11 +593,12 @@ impl App {
                 if !matches!(it.status, Status::Ready) {
                     return;
                 }
-                let (pages, pdf, src, name, is_video) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone(), it.kind == "ВИДЕО");
+                let (pages, pdf, src, name, is_video, slides) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone(), it.kind == "ВИДЕО", it.slides.clone());
                 // Прежний показ закрываем: на экране остаётся сцена с фоном,
                 // новый показ появится на ней, только когда будет готов.
                 self.close_show();
                 self.stage = true;
+                self.screen = Screen::Background;
                 self.show_gen += 1;
                 let gen = self.show_gen;
                 let kind = match pdf {
@@ -590,7 +627,7 @@ impl App {
                         } else {
                             display::target(&self.cfg.monitor).map(|m| m.device).unwrap_or_default()
                         };
-                        if let Err(e) = self.ppt_host.open(gen, &src, self.cfg.windowed, &monitor) {
+                        if let Err(e) = self.ppt_host.open(gen, &src, self.cfg.windowed, &monitor, slides.as_deref(), THUMB_W) {
                             self.status = format!("PowerPoint: {e}");
                             return;
                         }
@@ -629,10 +666,18 @@ impl App {
             Cmd::Prev if self.show.as_ref().is_some_and(Show::is_ppt) => self.ppt_host.send("prev"),
             Cmd::Next => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
             Cmd::Prev => self.go(|s| s.page.saturating_sub(1)),
-            Cmd::Background => {
+            Cmd::Background | Cmd::Clock | Cmd::Timer => {
                 self.close_show();
                 self.stage = true;
+                self.screen = match cmd {
+                    Cmd::Clock => Screen::Clock,
+                    Cmd::Timer => Screen::Timer,
+                    _ => Screen::Background,
+                };
             }
+            Cmd::TimerSet { countdown, secs } => self.timer.set(countdown, secs),
+            Cmd::TimerRun { run } => self.timer.run(run),
+            Cmd::TimerReset => self.timer.reset(),
             Cmd::GoTo { page } => self.go(|s| page.min(s.pages.saturating_sub(1))),
             Cmd::Close => self.close_show(),
             Cmd::Remove { id } => {
@@ -695,6 +740,7 @@ impl App {
             self.ppt_host.close();
         }
         self.goto_buf.clear();
+        self.thumb_failed.clear();
         self.reset_pages(true);
     }
 
@@ -730,6 +776,43 @@ impl App {
                 }
             }
             PptPhase::Shown => {}
+        }
+    }
+
+    /// Превью: держим миниатюры рядом с текущим слайдом; на сервере — готовим миниатюры PPTX
+    /// (из сохранённых картинок слайдов) и рассылаем клиентам предыдущую, текущую и следующую.
+    /// Миниатюры PDF заказываются вместе со страницами в `stage_window`.
+    fn tick_previews(&mut self, view: &StateMsg) {
+        let cur = view.active.filter(|_| view.video.is_none()).map(|id| (id, view.page));
+        let near = |k: &(u64, usize)| cur.is_some_and(|(id, p)| k.0 == id && thumb_near(k.1, p));
+        self.previews.retain(|k, _| near(k));
+        self.thumb_jpg.retain(|k, _| near(k));
+        if self.connected {
+            return;
+        }
+        let ppt = self.show.as_ref().filter(|s| s.is_ppt()).and_then(|s| {
+            let dir = self.items.iter().find(|i| i.id == s.id)?.slides.clone()?;
+            Some((s.id, s.page, s.pages, dir))
+        });
+        if let Some((id, page, pages, dir)) = ppt {
+            // Текущий, следующий, предыдущий — в порядке важности.
+            for k in [Some((id, page)), Some((id, page + 1)), page.checked_sub(1).map(|p| (id, p))].into_iter().flatten() {
+                if k.1 < pages && !self.previews.contains_key(&k) && !self.thumb_busy.contains(&k) && !self.thumb_failed.contains(&k) {
+                    // Картинки ещё нет — мост сохранит её и сообщит (`PptEvent::Slide`), тогда и прочитаем.
+                    let file = dir.join(format!("{}.jpg", k.1 + 1));
+                    if file.is_file() {
+                        self.thumb_busy.insert(k);
+                        let ctx = self.ctx.clone();
+                        render::load_thumb(id, k.1, file, self.out_tx.clone(), move || ctx.request_repaint());
+                    }
+                }
+            }
+        }
+        if let Some(srv) = &self.server {
+            let set = cur.map_or(Vec::new(), |(id, page)| {
+                [page.checked_sub(1), Some(page), Some(page + 1)].into_iter().flatten().filter_map(|p| self.thumb_jpg.get(&(id, p)).map(|j| (id, p, j.clone()))).collect()
+            });
+            srv.publish_thumbs(set);
         }
     }
 
@@ -801,6 +884,15 @@ impl App {
                 }
             }
         }
+        // Картинки слайдов файлов, которых нет ни в одном списке, тоже не нужны.
+        let used: HashSet<PathBuf> = keep.iter().map(|p| self.slides_dir(p)).collect();
+        if let Ok(dir) = std::fs::read_dir(self.work_dir.join(SLIDES_DIR)) {
+            for e in dir.flatten() {
+                if !used.contains(&e.path()) {
+                    let _ = std::fs::remove_dir_all(e.path());
+                }
+            }
+        }
         let mut missing = 0;
         for it in list {
             if it.src.is_file() {
@@ -825,6 +917,25 @@ impl App {
                 let _ = std::fs::remove_file(p);
             }
         }
+        // Картинки слайдов — если этот же файл не остался в списке ещё раз.
+        if let Some(dir) = &it.slides {
+            if !self.items.iter().any(|i| i.slides.as_ref() == Some(dir)) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// Папка для слайдов PPTX в картинках: своя для каждого файла (по пути, размеру и времени
+    /// изменения). Картинки переживают перезапуск — PowerPoint второй раз их не делает.
+    fn slides_dir(&self, src: &Path) -> PathBuf {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        src.hash(&mut h);
+        if let Ok(m) = std::fs::metadata(src) {
+            m.len().hash(&mut h);
+            m.modified().ok().hash(&mut h);
+        }
+        self.work_dir.join(SLIDES_DIR).join(format!("{:016x}", h.finish()))
     }
 
     fn add_local(&mut self, path: PathBuf, name: Option<String>, ctx: &egui::Context) {
@@ -841,7 +952,8 @@ impl App {
         let id = self.next_id;
         self.next_id += 1;
         let name = name.unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-        self.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing });
+        let slides = (kind == "PPTX").then(|| self.slides_dir(&path));
+        self.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing, slides });
         if kind == "PPTX" {
             // PowerPoint запускаем заранее (скрыто) — к показу он уже будет готов.
             self.ppt_host.prewarm();
@@ -888,8 +1000,8 @@ impl App {
                 }
                 Out::Ppt { gen, ev } => {
                     if self.show.as_ref().is_some_and(|s| s.gen == gen) {
-                        // Позиция без изменений рассылки не требует.
-                        self.dirty |= !matches!(ev, ppt::PptEvent::Pos(..));
+                        // Позиция без изменений и сохранённые слайды рассылки не требуют.
+                        self.dirty |= !matches!(ev, ppt::PptEvent::Pos(..) | ppt::PptEvent::Slide(_));
                         match ev {
                             ppt::PptEvent::Ready(total, hwnd) => {
                                 self.status.clear();
@@ -906,6 +1018,12 @@ impl App {
                                     let (page, pages) = (cur.saturating_sub(1), total.max(1));
                                     self.dirty |= (s.page, s.pages) != (page, pages);
                                     (s.page, s.pages) = (page, pages);
+                                }
+                            }
+                            // Мост сохранил слайд картинкой — превью может его прочитать.
+                            ppt::PptEvent::Slide(n) => {
+                                if let Some(s) = &self.show {
+                                    self.thumb_failed.remove(&(s.id, n.saturating_sub(1)));
                                 }
                             }
                             ppt::PptEvent::Ended => self.close_show(),
@@ -966,6 +1084,19 @@ impl App {
                         self.render_error = Some(msg);
                     }
                 }
+                Out::Thumb { id, page, image, jpg } => {
+                    self.thumb_busy.remove(&(id, page));
+                    // Пока миниатюра готовилась, могли перелистнуть — ненужную не держим.
+                    if self.show.as_ref().is_some_and(|s| s.id == id && thumb_near(page, s.page)) {
+                        let tex = ctx.load_texture(format!("t{id}_{page}"), image, egui::TextureOptions::LINEAR);
+                        self.previews.insert((id, page), tex);
+                        self.thumb_jpg.insert((id, page), Arc::new(jpg));
+                    }
+                }
+                Out::ThumbErr { id, page } => {
+                    self.thumb_busy.remove(&(id, page));
+                    self.thumb_failed.insert((id, page));
+                }
             }
         }
 
@@ -987,7 +1118,7 @@ impl App {
                     }
                     self.dirty = true;
                     self.start_collector();
-                    self.stage = true; // сервер стоит у видеостены — сразу выводим фон
+                    self.stage = true; // на мониторе показа сервера сразу выводим фон
                     self.net_status = format!("Сервер запущен на порту {}", self.cfg.port);
                     self.dirty = true;
                 }
@@ -1036,6 +1167,7 @@ impl App {
                     self.last_seen = Some(Instant::now());
                     self.connected = true;
                     self.close_show();
+                    self.previews.clear(); // номера элементов у сервера свои
                     self.net_status = format!("Подключено к {}:{}", self.cfg.ip, self.cfg.port);
                     self.status.clear();
                     self.remember_server();
@@ -1055,10 +1187,12 @@ impl App {
                     self.connected = false;
                     self.client = None;
                     self.remote = StateMsg::default();
+                    self.previews.clear();
                     self.net_status = if reason.is_empty() { "Отключено".into() } else { reason };
                 }
                 CliEvent::State(s) => {
                     self.last_seen = Some(Instant::now());
+                    self.remote_at = Instant::now();
                     if s.message != self.remote.message {
                         self.status = s.message.clone();
                     }
@@ -1074,6 +1208,12 @@ impl App {
                 }
                 CliEvent::UploadOk(name) => self.status = format!("Файл «{name}» передан на сервер"),
                 CliEvent::UploadErr { name, msg } => self.status = format!("Не удалось передать «{name}»: {msg}"),
+                CliEvent::Thumb { id, page, image } => {
+                    if self.connected && self.remote.active == Some(id) {
+                        let tex = ctx.load_texture(format!("t{id}_{page}"), image, egui::TextureOptions::LINEAR);
+                        self.previews.insert((id, page), tex);
+                    }
+                }
             }
         }
     }
@@ -1119,6 +1259,7 @@ impl App {
         if self.client.take().is_some() {
             self.connected = false;
             self.remote = StateMsg::default();
+            self.previews.clear();
         }
     }
 
@@ -1481,9 +1622,6 @@ impl App {
             if ui.add_enabled(active, cbutton("■ Закрыть показ", RED)).clicked() {
                 self.act(Cmd::Close);
             }
-            if btn(ui, "Фон", GRAY).on_hover_text("Закрыть показ и вывести на экран сервера фон").clicked() {
-                self.act(Cmd::Background);
-            }
             if ui.add_enabled(self.selected.is_some(), cbutton("Удалить", GRAY)).clicked() {
                 if let Some(id) = self.selected.take() {
                     self.act(Cmd::Remove { id });
@@ -1495,7 +1633,7 @@ impl App {
                     ui.label(RichText::new(t).strong().size(15.0).color(c));
                 } else if active {
                     if !self.goto_buf.is_empty() {
-                        // Номер, набранный с клавиатуры, — подсказка оператору (на стене его не видно).
+                        // Номер, набранный с клавиатуры, — подсказка оператору (на экране показа его не видно).
                         ui.label(RichText::new(format!("К слайду {} — Enter", self.goto_buf)).strong().size(15.0).color(GREEN));
                     } else {
                         ui.label(RichText::new(format!("Слайд {} из {}", view.page + 1, view.pages)).strong().size(15.0));
@@ -1505,26 +1643,24 @@ impl App {
                 }
             });
         });
-        let hint = if !self.cfg.keyboard {
-            "Клавиатура выключена (кнопка ⌨ вверху) — управляйте кнопками."
-        } else if self.connected {
-            "Вы управляете сервером. Стрелки и PageUp/PageDown — слайды, пробел — следующий шаг или старт/пауза видео, цифры + Enter — переход к слайду."
-        } else {
-            "Двойной щелчок открывает файл. Пробел — следующий шаг или старт/пауза видео. Двойной Esc на экране показа закрывает его, на фоне — убирает фон."
-        };
-        let text = if self.status.is_empty() { hint } else { self.status.as_str() }.to_owned();
-        let status = |ui: &mut egui::Ui| {
-            ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(Color32::from_gray(0x66))).truncate());
-        };
-        if !(active && view.video.is_none()) {
-            status(ui);
-            return;
-        }
-        // Слева строка состояния, справа переход к слайду по номеру (Enter в поле тоже работает).
-        egui::Sides::new().show(
-            ui,
-            status,
-            |ui| {
+        let text = self.status.clone();
+        // Справа экран сервера (фон, часы, таймер) и переход к слайду по номеру, слева — «Справка»
+        // и строка состояния в оставшееся место (обрезается, а не наезжает на кнопки).
+        ui.horizontal(|ui| ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Справа налево. Текущий экран сервера (когда показа нет) подсвечен.
+            let screens = [
+                (Screen::Timer, Cmd::Timer, "Таймер", "Закрыть показ и вывести на экран сервера таймер"),
+                (Screen::Clock, Cmd::Clock, "Часы", "Закрыть показ и вывести на экран сервера часы"),
+                (Screen::Background, Cmd::Background, "Фон", "Закрыть показ и вывести на экран сервера фон"),
+            ];
+            for (scr, cmd, label, tip) in screens {
+                let on = !active && view.screen == scr;
+                if btn(ui, label, if on { BLUE } else { GRAY }).on_hover_text(tip).clicked() {
+                    self.act(cmd);
+                }
+            }
+            if active && view.video.is_none() {
+                ui.add_space(10.0);
                 let go = btn(ui, "Перейти", BLUE).on_hover_text("Перейти к слайду с этим номером");
                 let field = ui.add(egui::TextEdit::singleline(&mut self.goto_field).hint_text("№").desired_width(44.0));
                 ui.label("Слайд №");
@@ -1534,8 +1670,157 @@ impl App {
                     let n = std::mem::take(&mut self.goto_field);
                     self.goto_number(&n, view);
                 }
-            },
-        );
+            }
+            ui.add_space(6.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                if btn(ui, "Справка", GRAY).on_hover_text("Что где нажимать: клавиши, экраны сервера, превью, сеть").clicked() {
+                    self.help_open = !self.help_open;
+                }
+                ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(Color32::from_gray(0x66))).truncate());
+            });
+        }));
+        if !active && view.screen == Screen::Timer {
+            self.timer_bar(ui, view);
+        }
+    }
+
+    /// Управление таймером — пока на экране сервера таймер.
+    fn timer_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+        let t = view.timer.clone();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Таймер:").strong());
+            if ui.selectable_label(t.countdown, "Обратный отсчёт").clicked() && !t.countdown {
+                self.act(Cmd::TimerSet { countdown: true, secs: t.total });
+            }
+            if ui.selectable_label(!t.countdown, "Секундомер").clicked() && t.countdown {
+                self.act(Cmd::TimerSet { countdown: false, secs: t.total });
+            }
+            if t.countdown {
+                ui.add_space(6.0);
+                if ui.add_enabled(t.total > 60, egui::Button::new(" - ")).on_hover_text("На минуту меньше").clicked() {
+                    self.act(Cmd::TimerSet { countdown: true, secs: t.total - 60 });
+                }
+                // Поля показывают значение сервера, пока их не редактируют. Длительность задаётся,
+                // когда поле теряет фокус (Enter, Tab или щелчок мимо).
+                let field = |ui: &mut egui::Ui, text: &mut String, salt: &str, value: String, hint: &str| {
+                    let id = ui.make_persistent_id(salt);
+                    if !ui.memory(|m| m.has_focus(id)) {
+                        *text = value;
+                    }
+                    let r = ui.add(egui::TextEdit::singleline(text).id(id).desired_width(30.0).horizontal_align(egui::Align::Center)).on_hover_text(hint);
+                    text.retain(|c| c.is_ascii_digit());
+                    text.truncate(4);
+                    r.lost_focus()
+                };
+                let done_min = field(ui, &mut self.timer_min, "timer_min", (t.total / 60).to_string(), "Минуты");
+                ui.label(":");
+                let done_sec = field(ui, &mut self.timer_sec, "timer_sec", format!("{:02}", t.total % 60), "Секунды");
+                if done_min || done_sec {
+                    let m: u32 = self.timer_min.parse().unwrap_or(0);
+                    let sec: u32 = self.timer_sec.parse().unwrap_or(0);
+                    let secs = m * 60 + sec;
+                    if secs >= 1 && secs != t.total {
+                        self.act(Cmd::TimerSet { countdown: true, secs });
+                    }
+                }
+                if ui.button(" + ").on_hover_text("На минуту больше (и для идущего отсчёта)").clicked() {
+                    self.act(Cmd::TimerSet { countdown: true, secs: t.total + 60 });
+                }
+                ui.label("мин : сек");
+            }
+            ui.add_space(6.0);
+            let (label, color) = if t.running { ("⏸ Пауза", BLUE) } else { ("▶ Старт", GREEN) };
+            if btn(ui, label, color).on_hover_text("Пробел").clicked() {
+                self.act(Cmd::TimerRun { run: !t.running });
+            }
+            if btn(ui, "Сброс", GRAY).clicked() {
+                self.act(Cmd::TimerReset);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let (text, phase) = screen::timer_text(&t, self.timer_extra());
+                let color = if phase == screen::Phase::Normal { Color32::from_gray(0x22) } else { screen::phase_color(phase).gamma_multiply(0.85) };
+                ui.label(RichText::new(text).strong().size(18.0).color(color));
+            });
+        });
+    }
+
+    /// Сколько мс назад снято состояние таймера: у клиента — с прихода состояния сервера.
+    fn timer_extra(&self) -> u64 {
+        if self.connected { self.remote_at.elapsed().as_millis() as u64 } else { 0 }
+    }
+
+    /// Превью у оператора: миниатюры предыдущего, текущего и следующего слайда.
+    fn preview_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+        let Some(id) = view.active else { return };
+        const GAP: f32 = 12.0;
+        // Три миниатюры 16:9 по ширине окна, но не выше 112 точек.
+        let h = ((ui.available_width() - 2.0 * GAP) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
+        let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| {
+            ui.vertical(|ui| {
+                let color = if current { Color32::from_gray(0x22) } else { Color32::from_gray(0x77) };
+                ui.label(RichText::new(title).size(12.0).color(color).strong());
+                // Слайды не 16:9 вписываются в ту же рамку.
+                let frame = egui::vec2(h * 16.0 / 9.0, h);
+                let (rect, _) = ui.allocate_exact_size(frame, egui::Sense::hover());
+                let p = ui.painter();
+                p.rect_filled(rect, 3.0, Color32::from_gray(0xe8));
+                let rect = tex.map_or(rect, |t| {
+                    let s = t.size_vec2();
+                    let k = (frame.x / s.x.max(1.0)).min(frame.y / s.y.max(1.0));
+                    egui::Rect::from_center_size(rect.center(), s * k)
+                });
+                match tex {
+                    Some(t) => {
+                        p.image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    }
+                    None => {
+                        p.text(rect.center(), egui::Align2::CENTER_CENTER, empty, egui::FontId::proportional(12.0), GRAY);
+                    }
+                }
+                // Текущий слайд — в зелёной рамке, как активная строка списка.
+                let stroke = if current { egui::Stroke::new(3.0_f32, GREEN) } else { egui::Stroke::new(1.0_f32, Color32::from_gray(0xbb)) };
+                p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Outside);
+            });
+        };
+        ui.horizontal(|ui| {
+            let page = view.page;
+            match page.checked_sub(1) {
+                Some(prev) => slot(ui, format!("Предыдущий — слайд {}", prev + 1), self.previews.get(&(id, prev)), "готовится…", false),
+                None => slot(ui, "Предыдущий".into(), None, "начало презентации", false),
+            }
+            ui.add_space(GAP);
+            slot(ui, format!("Сейчас — слайд {}", page + 1), self.previews.get(&(id, page)), "готовится…", true);
+            ui.add_space(GAP);
+            if page + 1 < view.pages {
+                slot(ui, format!("Далее — слайд {}", page + 2), self.previews.get(&(id, page + 1)), "готовится…", false);
+            } else {
+                slot(ui, "Далее".into(), None, "конец презентации", false);
+            }
+        });
+    }
+
+    /// Окно справки: что где нажимать.
+    fn help_window(&mut self, ctx: &egui::Context) {
+        if !self.help_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Справка").open(&mut open).collapsible(false).default_width(600.0).default_height(470.0).show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                for (n, (title, rows)) in HELP.iter().enumerate() {
+                    egui::CollapsingHeader::new(RichText::new(*title).strong().size(14.0)).default_open(n == 0).show(ui, |ui| {
+                        egui::Grid::new(("help", n)).num_columns(2).spacing([14.0, 5.0]).striped(true).show(ui, |ui| {
+                            for (key, text) in rows.iter() {
+                                ui.label(RichText::new(*key).strong());
+                                ui.add(egui::Label::new(*text).wrap());
+                                ui.end_row();
+                            }
+                        });
+                    });
+                }
+            });
+        });
+        self.help_open = open;
     }
 
     fn list(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
@@ -1680,7 +1965,7 @@ impl App {
                     });
                 });
             });
-            // Монитор для показа — для сервера (видеостены).
+            // Монитор для показа — на сервере: основной или любой из подключённых.
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label("Монитор для показа:");
@@ -1708,7 +1993,7 @@ impl App {
                 }
             })
             .response
-            .on_hover_text("Куда выводить фон, PDF, видео и PowerPoint на сервере — обычно монитор видеостены");
+            .on_hover_text("На какой монитор сервера выводить фон, часы, PDF, видео и PowerPoint: основной или любой из подключённых");
 
             // Резервный сервер — просто настройка, менять можно и во время подключения.
             ui.add_space(8.0);
@@ -1762,7 +2047,7 @@ impl App {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "💡 На компьютере с видеостеной нажмите «Запустить сервер».\n\
+                    "💡 На компьютере, который выводит показ на монитор, нажмите «Запустить сервер».\n\
                      На управляющем компьютере выберите сервер из списка или введите его IP и нажмите «Подключиться».\n\
                      Серверы, к которым удалось подключиться, запоминаются в списке.\n\
                      Для теста на одном компьютере оставьте IP 127.0.0.1.",
@@ -1873,6 +2158,10 @@ impl App {
         let mut hide = false;
         let mut esc = false;
         let mut typed = (String::new(), false);
+        // Без показа на сцене может быть экран часов или таймера.
+        let scr = if self.show.is_none() { self.screen } else { Screen::Background };
+        let timer = self.timer.info();
+        let mut repaint: Option<Duration> = None;
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
         let (textures, last_tex, error, bg, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg, &self.failed);
@@ -1915,7 +2204,7 @@ impl App {
                     let max_side = ctx.input(|i| i.max_texture_side).min(16384) as f32;
                     let w = (rect.width() * ppp).round().clamp(16.0, max_side) as u32;
                     let h = (rect.height() * ppp).round().clamp(16.0, max_side) as u32;
-                    let key = PageKey { id, page, w, h };
+                    let key = PageKey { id, page, w, h, thumb: false };
                     let tex = textures.get(&key).cloned();
                     if tex.is_some() {
                         *last_tex = tex.clone();
@@ -1953,8 +2242,17 @@ impl App {
                 if let (Some(e), Some(_)) = (error, &pdf) {
                     ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, e, egui::FontId::proportional(20.0), Color32::LIGHT_RED);
                 }
+                match scr {
+                    Screen::Clock => repaint = Some(screen::draw_clock(ui.painter(), rect)),
+                    Screen::Timer => repaint = screen::draw_timer(ui.painter(), rect, &timer),
+                    Screen::Background => {}
+                }
             });
         });
+        // Часы и идущий таймер перерисовываем ровно при смене секунды.
+        if let Some(d) = repaint {
+            ctx.request_repaint_after(d);
+        }
         // Уровень окна сцены дублируем напрямую через Windows: при смене, а пока PowerPoint
         // готовит показ за сценой — каждый кадр (его окно не должно вылезти поверх фона).
         let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
@@ -1975,7 +2273,13 @@ impl App {
             }
         }
 
-        if let Some((_, _, _, pdf)) = pdf {
+        if let Some((id, page, pages, pdf)) = pdf {
+            // Миниатюры для превью — после страниц для экрана.
+            for p in [Some(page), Some(page + 1), page.checked_sub(1)].into_iter().flatten().filter(|&p| p < pages) {
+                if !self.previews.contains_key(&(id, p)) && !self.thumb_failed.contains(&(id, p)) {
+                    wanted.push(PageKey { id, page: p, w: THUMB_W, h: THUMB_H, thumb: true });
+                }
+            }
             self.renderer.want(&pdf, wanted);
         }
         for cmd in cmds {
@@ -1987,6 +2291,8 @@ impl App {
         self.goto_typed(&typed.0, typed.1, &self.local_state());
         if hide && self.show.is_none() {
             self.stage = false;
+            self.screen = Screen::Background;
+            self.dirty = true;
         }
     }
 
@@ -2000,6 +2306,10 @@ impl App {
         self.esc_at = None;
         if self.show.is_some() {
             self.apply(Cmd::Close);
+        } else if self.screen != Screen::Background {
+            // Часы или таймер — сначала возвращаем фон.
+            self.screen = Screen::Background;
+            self.dirty = true;
         } else {
             self.stage = false;
         }
@@ -2016,6 +2326,64 @@ fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     Some(ctx.load_texture("background", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR))
+}
+
+/// Справка: разделы и строки «что — как».
+const HELP: &[(&str, &[(&str, &str)])] = &[
+    ("С чего начать", &[
+        ("Сервер", "Компьютер, который выводит показ: «Сеть», затем «Запустить сервер». На мониторе показа сразу появляется фон."),
+        ("Клиент", "Компьютер оператора: «Сеть», затем выбрать сервер из списка (или ввести IP, порт, пароль) и нажать «Подключиться». Дальше всё, что вы делаете, выполняется на сервере."),
+        ("Добавить файлы", "Кнопка «Добавить» или перетащить файлы в окно. PDF, PowerPoint (pptx, ppt, ppsx, pps), видео (mp4, mov, mkv, webm, avi, wmv и др.). У клиента файлы уходят на сервер."),
+        ("Открыть", "Двойной щелчок по файлу, кнопка «Показать» или Enter по выбранному. Shift+1…9 — файл с этим номером в списке."),
+        ("Порядок", "«Вверх» / «Вниз» двигают выбранный файл, «Удалить» убирает его, «Очистить» — весь список. Список сервера сохраняется и после перезапуска."),
+    ]),
+    ("Клавиши показа", &[
+        ("Стрелки вправо и вниз, PageDown", "Вперёд (кликер). В PowerPoint — следующий шаг анимации."),
+        ("Стрелки влево и вверх, PageUp, Backspace", "Назад."),
+        ("Пробел", "Следующий шаг; у видео — старт и пауза; на экране таймера — старт и пауза таймера."),
+        ("Home / End", "Первый / последний слайд. У видео Home — в начало, стрелки — перемотка на 10 с."),
+        ("Цифры, затем Enter", "Перейти к слайду с этим номером (номер виден внизу окна, на экране показа — нет). Или поле «Слайд №» и «Перейти»."),
+        ("Shift+0", "Закрыть показ."),
+        ("Двойной Esc", "На экране показа: закрыть показ. На часах или таймере — вернуть фон. На фоне — убрать сцену. Одиночный Esc ничего не делает."),
+        ("Кнопка ⌨", "Зелёная — клавиши в окне программы управляют показом. Серая — не управляют (на самом экране показа клавиши работают всегда)."),
+    ]),
+    ("Экран сервера: фон, часы, таймер", &[
+        ("Фон", "Закрыть показ и оставить на экране показа фоновую картинку."),
+        ("Часы", "Крупные часы с датой на экране показа. Открытие презентации возвращает фон."),
+        ("Таймер", "Таймер на экране показа; внизу окна появляется строка управления."),
+        ("Режим", "«Обратный отсчёт» или «Секундомер». Смена режима сбрасывает таймер."),
+        ("мин : сек", "Длительность отсчёта: впишите минуты и секунды и нажмите Enter или Tab. «-» / «+» — на минуту меньше или больше, «+» работает и на идущем отсчёте."),
+        ("Старт / Пауза, Сброс", "Запустить, остановить, вернуть на начало. Пробел — то же, что «Старт / Пауза»."),
+        ("Цвета", "Последняя минута — жёлтым. Время вышло — «00:00», затем перерасход красным: «+00:12»."),
+    ]),
+    ("Превью слайдов", &[
+        ("Предыдущий / Сейчас / Далее", "Над кнопками — предыдущий, текущий (в зелёной рамке) и следующий слайд открытой презентации. И на сервере, и у клиента."),
+        ("PowerPoint", "Картинки слайдов делает PowerPoint во время показа, первые — через долю секунды после открытия. При следующем показе того же файла они уже готовы."),
+        ("Видео", "Для видео превью нет."),
+    ]),
+    ("PowerPoint и видео", &[
+        ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
+        ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон."),
+        ("Закрыть показ", "Кнопка «Закрыть показ», Shift+0 или двойной Esc на экране показа. На экране показа остаётся фон."),
+    ]),
+    ("Сеть, состояние сервера, резерв", &[
+        ("Индикатор вверху", "Зелёный — норма, жёлтый — внимание, красный — проблема. Щелчок — показатели сервера: процессор, память, видеокарта, мониторы, связь."),
+        ("Красная полоса", "Проблема на сервере или пропала связь. Клиент сам переподключается (до 15 попыток), можно сразу перейти на резерв."),
+        ("Резервный сервер", "«Сеть», затем «Резервный сервер». Файлы можно сразу дублировать на него. «Переключиться на резерв» откроет там тот же файл на том же слайде."),
+        ("Сохранённые серверы", "Сервер запоминается после успешного подключения. «Забыть» убирает его из списка."),
+    ]),
+    ("Настройки сервера", &[
+        ("Монитор для показа", "«Сеть», затем «Монитор для показа»: основной или любой из подключённых (на компьютере с одним монитором — он же). Отключили выбранный — показ идёт на основном."),
+        ("Автозапуск", "Галочка «Запускать сервер при входе в Windows»: сервер стартует сам и перезапускается при сбое или зависании."),
+        ("Своя картинка фона", "Положите background.png (или .jpg) рядом с программой — она заменит встроенный фон."),
+        ("Брандмауэр", "При первом запуске сервера Windows спросит разрешение — разрешите, иначе клиенты с других компьютеров не подключатся."),
+        ("Порт и пароль", "По умолчанию 14999 и default_password; должны совпадать на сервере и клиенте."),
+    ]),
+];
+
+/// Миниатюра нужна: предыдущий слайд, текущий и два следующих (при листании назад не ждём).
+fn thumb_near(page: usize, cur: usize) -> bool {
+    page + 1 >= cur && page <= cur + 2
 }
 
 /// Цифры, набранные без Shift (Shift+цифра открывает презентацию по номеру), и нажат ли Enter.
@@ -2052,6 +2420,9 @@ fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
             if i.key_pressed(Key::End) {
                 out.push(Cmd::GoTo { page: usize::MAX });
             }
+        } else if view.screen == Screen::Timer && i.key_pressed(Key::Space) {
+            // На экране таймера пробел запускает и останавливает его.
+            out.push(Cmd::TimerRun { run: !view.timer.running });
         }
         // Shift+1…9 — открыть презентацию с этим номером, Shift+0 — закрыть показ.
         if i.modifiers.shift && !i.modifiers.ctrl {
@@ -2130,12 +2501,22 @@ impl eframe::App for App {
 
         let view = self.view();
         self.keys(ctx, &view);
+        self.tick_previews(&view);
+        // Идущий таймер в главном окне — обновлять при смене секунды.
+        if view.active.is_none() && view.screen == Screen::Timer && view.timer.running {
+            ctx.request_repaint_after(screen::timer_tick(&view.timer, self.timer_extra()));
+        }
 
         let margin = egui::Frame::new().fill(Color32::from_gray(0xfa)).inner_margin(6.0);
         egui::TopBottomPanel::top("top").frame(margin).show(ctx, |ui| self.top_bar(ui, &view));
         self.alarm_bar(ctx);
         self.health_window(ctx);
+        self.help_window(ctx);
         egui::TopBottomPanel::bottom("bottom").frame(margin).show(ctx, |ui| self.bottom_bar(ui, &view));
+        // Превью — над нижней панелью, пока открыта презентация (у видео превью нет).
+        if !self.net_panel && view.active.is_some() && view.video.is_none() {
+            egui::TopBottomPanel::bottom("preview").frame(margin).show(ctx, |ui| self.preview_bar(ui, &view));
+        }
         egui::CentralPanel::default().frame(margin).show(ctx, |ui| {
             if self.net_panel {
                 self.network_panel(ui);
@@ -2380,6 +2761,26 @@ mod tests {
         panic!("не открылось");
     }
 
+    /// Отправить одну команду (JSON) на сервер TEST_PORT: TEST_CMD='{"c":"Clock"}'
+    /// cargo test --release e2e_send -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_send() {
+        let cmd: Cmd = serde_json::from_str(&std::env::var("TEST_CMD").unwrap()).expect("TEST_CMD — команда в JSON");
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let (tx, rx) = channel();
+        let c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
+        while !matches!(rx.recv_timeout(Duration::from_secs(10)).expect("нет связи"), CliEvent::Connected) {}
+        c.send(CliReq::Cmd(cmd));
+        // Ждём состояние после команды, чтобы она точно ушла.
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(2) {
+            if let Ok(CliEvent::State(s)) = rx.recv_timeout(Duration::from_millis(500)) {
+                println!("screen={:?} active={:?} timer={:?}", s.screen, s.active, s.timer);
+            }
+        }
+    }
+
     /// Команды во время загрузки большого файла: TEST_PDF (≥ 10 стр.), TEST_BIG (большой файл).
     /// cargo test --release e2e_upload_cmd -- --ignored --nocapture
     #[test]
@@ -2439,6 +2840,109 @@ mod tests {
                 break;
             }
         }
+    }
+
+    /// Превью и таймер против запущенного `presentator --server`:
+    /// TEST_FILES="a.pptx;b.pdf" cargo test --release e2e_preview -- --ignored --nocapture
+    /// Каждый файл: открыть → миниатюры слайдов 1 и 2 → вперёд → миниатюра слайда 3.
+    /// Затем слайд 5 → миниатюры 4, 5, 6. Затем экран таймера: обратный отсчёт 1:35, старт, пауза; экран часов; «Фон».
+    #[test]
+    #[ignore]
+    fn e2e_preview() {
+        let files: Vec<PathBuf> = std::env::var("TEST_FILES").unwrap().split(';').map(PathBuf::from).collect();
+        let (tx, rx) = channel();
+        let t0 = Instant::now();
+        let thumbs = std::cell::RefCell::new(HashSet::<(u64, usize)>::new());
+        let wait = |what: &str, f: &dyn Fn(&StateMsg, &HashSet<(u64, usize)>) -> bool| -> StateMsg {
+            let t = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(90).saturating_sub(t.elapsed())).unwrap_or_else(|_| panic!("timeout: {what}")) {
+                    CliEvent::Closed(r) => panic!("closed: {r}"),
+                    CliEvent::Thumb { id, page, image } => {
+                        println!("{:>6} ms THUMB id={id} слайд {} {}×{}", t0.elapsed().as_millis(), page + 1, image.size[0], image.size[1]);
+                        thumbs.borrow_mut().insert((id, page));
+                    }
+                    CliEvent::State(s) => {
+                        if f(&s, &thumbs.borrow()) {
+                            println!("{:>6} ms OK {what}", t0.elapsed().as_millis());
+                            return s;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        };
+        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        c.send(CliReq::Cmd(Cmd::Clear));
+        wait("cleared", &|s, _| s.items.is_empty());
+        for f in &files {
+            c.send(CliReq::Upload(f.clone()));
+        }
+        let n = files.len();
+        let s = wait("ready", &|s, _| s.items.len() == n && s.items.iter().all(|i| i.ready));
+        for it in s.items.clone() {
+            c.send(CliReq::Cmd(Cmd::Open { id: it.id }));
+            let s = wait("open", &|s, _| s.active == Some(it.id) && s.pages > 2);
+            let mut last = s;
+            // Состояние после миниатюр может не прийти — ждём миниатюры отдельно, опрашивая очередь.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !(thumbs.borrow().contains(&(it.id, 0)) && thumbs.borrow().contains(&(it.id, 1))) {
+                assert!(Instant::now() < deadline, "нет миниатюр слайдов 1–2 для {}", it.name);
+                match rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(CliEvent::Thumb { id, page, image }) => {
+                        println!("{:>6} ms THUMB id={id} слайд {} {}×{}", t0.elapsed().as_millis(), page + 1, image.size[0], image.size[1]);
+                        thumbs.borrow_mut().insert((id, page));
+                    }
+                    Ok(CliEvent::State(s)) => last = s,
+                    _ => {}
+                }
+            }
+            println!("{:>6} ms OK «{}»: миниатюры 1 и 2 (слайд {} из {})", t0.elapsed().as_millis(), it.name, last.page + 1, last.pages);
+            c.send(CliReq::Cmd(Cmd::GoTo { page: 1 }));
+            wait("goto 2", &|s, _| s.page == 1);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !thumbs.borrow().contains(&(it.id, 2)) {
+                assert!(Instant::now() < deadline, "нет миниатюры слайда 3 для {}", it.name);
+                if let Ok(CliEvent::Thumb { id, page, .. }) = rx.recv_timeout(Duration::from_millis(500)) {
+                    println!("{:>6} ms THUMB id={id} слайд {}", t0.elapsed().as_millis(), page + 1);
+                    thumbs.borrow_mut().insert((id, page));
+                }
+            }
+            println!("{:>6} ms OK «{}»: миниатюра 3 после перехода", t0.elapsed().as_millis(), it.name);
+            // Переход на слайд 5: нужны предыдущий (4), текущий (5) и следующий (6) — их ещё не присылали.
+            c.send(CliReq::Cmd(Cmd::GoTo { page: 4 }));
+            wait("goto 5", &|s, _| s.page == 4);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while ![3, 4, 5].iter().all(|&p| thumbs.borrow().contains(&(it.id, p))) {
+                assert!(Instant::now() < deadline, "нет миниатюр слайдов 4–6 для {}", it.name);
+                if let Ok(CliEvent::Thumb { id, page, .. }) = rx.recv_timeout(Duration::from_millis(500)) {
+                    println!("{:>6} ms THUMB id={id} слайд {}", t0.elapsed().as_millis(), page + 1);
+                    thumbs.borrow_mut().insert((id, page));
+                }
+            }
+            println!("{:>6} ms OK «{}»: миниатюры 4, 5, 6 (предыдущий, текущий, следующий)", t0.elapsed().as_millis(), it.name);
+            std::thread::sleep(Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0)));
+        }
+        // Таймер и часы.
+        c.send(CliReq::Cmd(Cmd::Timer));
+        wait("timer screen", &|s, _| s.active.is_none() && s.screen == Screen::Timer);
+        c.send(CliReq::Cmd(Cmd::TimerSet { countdown: true, secs: 95 }));
+        c.send(CliReq::Cmd(Cmd::TimerReset));
+        let s = wait("timer 1:35", &|s, _| s.timer.countdown && s.timer.total == 95 && s.timer.elapsed == 0);
+        assert_eq!(screen::timer_text(&s.timer, 0).0, "01:35");
+        c.send(CliReq::Cmd(Cmd::TimerRun { run: true }));
+        wait("timer running", &|s, _| s.timer.running);
+        std::thread::sleep(Duration::from_millis(2300));
+        c.send(CliReq::Cmd(Cmd::TimerRun { run: false }));
+        let s = wait("timer paused", &|s, _| !s.timer.running);
+        println!("таймер на паузе: {} мс, на экране {}", s.timer.elapsed, screen::timer_text(&s.timer, 0).0);
+        assert!((2200..3000).contains(&s.timer.elapsed));
+        std::thread::sleep(Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0)));
+        c.send(CliReq::Cmd(Cmd::Clock));
+        wait("clock screen", &|s, _| s.screen == Screen::Clock);
+        std::thread::sleep(Duration::from_secs(std::env::var("TEST_HOLD").ok().and_then(|s| s.parse().ok()).unwrap_or(0)));
+        c.send(CliReq::Cmd(Cmd::Background));
+        wait("background", &|s, _| s.screen == Screen::Background);
     }
 
     /// Видео против запущенного `presentator --server`:

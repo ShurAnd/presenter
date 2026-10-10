@@ -34,6 +34,36 @@ pub enum Cmd {
     Background,
     /// Пробел или «Старт»: видео — запуск, затем пауза/продолжить; презентация — следующий шаг.
     Play,
+    /// Закрыть показ и вывести на сервере экран часов.
+    Clock,
+    /// Закрыть показ и вывести на сервере экран таймера.
+    Timer,
+    /// Режим таймера (обратный отсчёт на `secs` секунд или секундомер).
+    TimerSet { countdown: bool, secs: u32 },
+    /// Запустить или остановить таймер.
+    TimerRun { run: bool },
+    /// Таймер — на начало (и остановить).
+    TimerReset,
+}
+
+/// Что на сцене сервера, когда показа нет.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub enum Screen {
+    #[default]
+    Background,
+    Clock,
+    Timer,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct TimerInfo {
+    /// Обратный отсчёт; иначе секундомер.
+    pub countdown: bool,
+    /// Длительность обратного отсчёта, с.
+    pub total: u32,
+    /// Сколько прошло на момент отправки состояния, мс. Пока таймер идёт, клиент досчитывает сам.
+    pub elapsed: u64,
+    pub running: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -77,6 +107,35 @@ pub struct StateMsg {
     /// Состояние видео, если сейчас открыто видео.
     #[serde(default)]
     pub video: Option<VideoInfo>,
+    /// Экран сцены без показа: фон, часы или таймер.
+    #[serde(default)]
+    pub screen: Screen,
+    #[serde(default)]
+    pub timer: TimerInfo,
+}
+
+/// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).
+pub type Thumbs = Arc<Vec<(u64, usize, Arc<Vec<u8>>)>>;
+
+/// Миниатюра уходит клиенту бинарным кадром: id (8 байт LE), страница (4 байта LE), JPEG.
+fn thumb_frame(id: u64, page: usize, jpg: &[u8]) -> Message {
+    let mut b = Vec::with_capacity(12 + jpg.len());
+    b.extend_from_slice(&id.to_le_bytes());
+    b.extend_from_slice(&(page as u32).to_le_bytes());
+    b.extend_from_slice(jpg);
+    Message::binary(b)
+}
+
+fn parse_thumb(b: &[u8]) -> Option<(u64, usize, &[u8])> {
+    let id = u64::from_le_bytes(b.get(..8)?.try_into().ok()?);
+    let page = u32::from_le_bytes(b.get(8..12)?.try_into().ok()?) as usize;
+    Some((id, page, &b[12..]))
+}
+
+/// Картинка (JPEG, PNG) → изображение для текстуры egui.
+pub fn decode_image(data: &[u8]) -> Option<eframe::egui::ColorImage> {
+    let img = image::load_from_memory(data).ok()?.to_rgba8();
+    Some(eframe::egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw()))
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -125,6 +184,7 @@ pub enum SrvEvent {
 pub struct ServerHandle {
     state_tx: watch::Sender<String>,
     health_tx: Arc<watch::Sender<String>>,
+    thumbs_tx: watch::Sender<Thumbs>,
     _stop: oneshot::Sender<()>,
 }
 
@@ -138,6 +198,17 @@ impl ServerHandle {
                 *cur = s;
             }
             changed
+        });
+    }
+
+    /// Миниатюры, нужные клиентам сейчас (текущий и следующий слайд). Рассылка — только при смене набора.
+    pub fn publish_thumbs(&self, thumbs: Vec<(u64, usize, Arc<Vec<u8>>)>) {
+        self.thumbs_tx.send_if_modified(|cur| {
+            let same = cur.len() == thumbs.len() && cur.iter().zip(&thumbs).all(|(a, b)| (a.0, a.1) == (b.0, b.1));
+            if !same {
+                *cur = Arc::new(thumbs);
+            }
+            !same
         });
     }
 
@@ -161,6 +232,7 @@ pub fn start_server(
 ) -> ServerHandle {
     let (state_tx, state_rx) = watch::channel(String::new());
     let (health_tx, health_rx) = watch::channel(String::new());
+    let (thumbs_tx, thumbs_rx) = watch::channel(Thumbs::default());
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
     std::thread::spawn(move || {
@@ -189,8 +261,9 @@ pub fn start_server(
                     let Ok((stream, _)) = listener.accept().await else { continue };
                     let (ev, wake, clients) = (ev.clone(), wake.clone(), clients.clone());
                     let (password, dir, state_rx, health_rx) = (password.clone(), dir.clone(), state_rx.clone(), health_rx.clone());
+                    let thumbs_rx = thumbs_rx.clone();
                     tokio::spawn(async move {
-                        serve_client(stream, password, dir, state_rx, health_rx, &ev, &wake, &clients).await;
+                        serve_client(stream, password, dir, state_rx, health_rx, thumbs_rx, &ev, &wake, &clients).await;
                     });
                 }
             };
@@ -198,7 +271,7 @@ pub fn start_server(
         });
         // Runtime уничтожается здесь — все соединения закрываются.
     });
-    ServerHandle { state_tx, health_tx: Arc::new(health_tx), _stop: stop_tx }
+    ServerHandle { state_tx, health_tx: Arc::new(health_tx), thumbs_tx, _stop: stop_tx }
 }
 
 fn safe_name(name: &str) -> String {
@@ -225,6 +298,7 @@ async fn serve_client(
     dir: PathBuf,
     mut state_rx: watch::Receiver<String>,
     mut health_rx: watch::Receiver<String>,
+    mut thumbs_rx: watch::Receiver<Thumbs>,
     ev: &Sender<SrvEvent>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     clients: &AtomicUsize,
@@ -256,13 +330,26 @@ async fn serve_client(
         if !first.is_empty() {
             let _ = ws.send(Message::text(first)).await;
         }
+        thumbs_rx.mark_changed(); // новому клиенту — миниатюры, которые уже есть
     }
 
     // Текущая загрузка: (имя, путь, файл, ожидаемый размер, принято)
     let mut upload: Option<(String, PathBuf, tokio::fs::File, u64, u64)> = None;
+    // Миниатюры из прошлой рассылки — их клиенту уже отправили.
+    let mut sent_thumbs: Vec<(u64, usize)> = Vec::new();
 
     loop {
         tokio::select! {
+            changed = thumbs_rx.changed(), if !upload_only => {
+                if changed.is_err() { break; }
+                let set = thumbs_rx.borrow_and_update().clone();
+                let mut ok = true;
+                for (id, page, jpg) in set.iter().filter(|t| !sent_thumbs.contains(&(t.0, t.1))) {
+                    if ws.send(thumb_frame(*id, *page, jpg)).await.is_err() { ok = false; break; }
+                }
+                if !ok { break; }
+                sent_thumbs = set.iter().map(|t| (t.0, t.1)).collect();
+            }
             changed = state_rx.changed(), if !upload_only => {
                 if changed.is_err() { break; }
                 let s = state_rx.borrow_and_update().clone();
@@ -344,6 +431,8 @@ pub enum CliEvent {
     /// Задержка связи (пинг туда и обратно), мс.
     Rtt(u32),
     Health(HealthInfo),
+    /// Миниатюра слайда (уже раскодирована).
+    Thumb { id: u64, page: usize, image: eframe::egui::ColorImage },
 }
 
 pub enum CliReq {
@@ -458,6 +547,12 @@ async fn client_task(
                         Ok(S2C::Health { health }) => { let _ = ev.send(CliEvent::Health(health)); wake(); }
                         _ => {}
                     },
+                    Message::Binary(b) => {
+                        if let Some((id, page, image)) = parse_thumb(&b).and_then(|(id, page, jpg)| Some((id, page, decode_image(jpg)?))) {
+                            let _ = ev.send(CliEvent::Thumb { id, page, image });
+                            wake();
+                        }
+                    }
                     Message::Close(_) => break,
                     _ => {}
                 }
@@ -606,4 +701,16 @@ where
     }
     ws.send(js(&C2S::UploadEnd)).await.map_err(e2s)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thumb_frame_roundtrip() {
+        let Message::Binary(b) = thumb_frame(0x0102_0304_0506_0708, 41, b"jpeg") else { panic!("ожидался бинарный кадр") };
+        assert_eq!(parse_thumb(&b), Some((0x0102_0304_0506_0708, 41, &b"jpeg"[..])));
+        assert_eq!(parse_thumb(&b[..11]), None);
+    }
 }

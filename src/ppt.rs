@@ -16,6 +16,8 @@ pub enum PptEvent {
     Pos(usize, usize),
     /// Показ завершён (в том числе закрыт на самом сервере).
     Ended,
+    /// Слайд (с единицы) сохранён картинкой для превью.
+    Slide(usize),
     Error(String),
 }
 
@@ -24,15 +26,21 @@ pub enum PptEvent {
 /// Переключение — закрыть файл и открыть другой в том же PowerPoint: без перезапуска,
 /// поэтому нет гонки, когда новый показ подключался к ещё закрывающемуся PowerPoint.
 ///
-/// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или ->`, `next`, `prev`, `goto N`,
-/// `poll`, `show`, `close`, `quit`. Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`,
-/// `ended <sid>`, `error <sid> текст`.
+/// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или -> <папка слайдов
+/// в base64 или -> <ширина картинки>`, `next`, `prev`, `goto N`, `poll`, `show`, `close`, `quit`.
+/// Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`, `slide <sid> N`, `ended <sid>`, `error <sid> текст`.
+///
+/// Слайды для превью мост сохраняет сам, по одному в паузах между командами: команды ждут не дольше
+/// одного слайда. Отдельный процесс для этого не годится — второй клиент того же PowerPoint
+/// получает отказ «занят», пока первый с ним работает, и наоборот.
 const SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
 function Say($s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
 function Msg($e) { $e.Exception.Message -replace '\s+', ' ' }
 $script:app = $null; $script:pres = $null; $script:win = $null; $script:total = 0; $script:sid = '0'
+# Сохранение слайдов картинками: папка, размер и какие слайды ещё не сохранены.
+$script:exp = $null
 
 # Живой PowerPoint; если его закрыли или он упал — запускаем заново.
 function App {
@@ -45,7 +53,43 @@ function CloseShow {
     # Exit у показа файла, открытого без окна, закрывает и сам файл; Close — на всякий случай.
     if ($script:win) { try { $script:win.View.Exit() } catch {} }
     if ($script:pres) { try { $script:pres.Saved = -1; $script:pres.Close() } catch {} }
-    $script:win = $null; $script:pres = $null
+    $script:win = $null; $script:pres = $null; $script:exp = $null
+}
+
+# Какие слайды сохранить картинками (уже сохранённые — пропускаем; все готовы — отметка done).
+function PlanSlides($dir, $width) {
+    if (-not $dir -or (Test-Path -LiteralPath (Join-Path $dir 'done'))) { return }
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $w = [int]$width
+    $h = [int][math]::Round($w * $script:pres.PageSetup.SlideHeight / $script:pres.PageSetup.SlideWidth)
+    $todo = New-Object 'Collections.Generic.List[int]'
+    for ($i = 1; $i -le $script:total; $i++) {
+        if (-not (Test-Path -LiteralPath (Join-Path $dir ([string]$i + '.jpg')))) { $todo.Add($i) }
+    }
+    $script:exp = @{ dir = $dir; w = $w; h = $h; todo = $todo }
+}
+
+# Сохранить один слайд — сначала текущий и следующие за ним: они нужны превью раньше остальных.
+# Пишем во временный файл и переименовываем: программа не прочитает недописанную картинку.
+function SlideStep {
+    $e = $script:exp
+    try {
+        if ($e.todo.Count -eq 0) {
+            [IO.File]::WriteAllText((Join-Path $e.dir 'done'), '')
+            $script:exp = $null
+            return
+        }
+        $cur = 1; try { $cur = $script:win.View.CurrentShowPosition } catch {}
+        $n = $e.todo | Where-Object { $_ -ge $cur } | Select-Object -First 1
+        if ($n -eq $null) { $n = $e.todo[0] }
+        $null = $e.todo.Remove($n)
+        $f = Join-Path $e.dir ([string]$n + '.jpg')
+        $tmp = Join-Path $e.dir ([string]$n + '.part.jpg')
+        $script:pres.Slides.Item($n).Export($tmp, 'JPG', $e.w, $e.h)
+        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f }
+        Move-Item -LiteralPath $tmp -Destination $f
+        Say ('slide ' + $script:sid + ' ' + $n)
+    } catch { $script:exp = $null }
 }
 
 # Монитор для показа (\\.\DISPLAY2) — в собственную настройку PowerPoint «Показ на мониторе».
@@ -78,8 +122,14 @@ function OpenShow($path, $windowed, $monitor) {
 try { $null = App } catch {}
 Say 'host'
 
+# Ввод читаем асинхронно: пока команд нет, сохраняем слайды для превью.
+$stdin = New-Object IO.StreamReader([Console]::OpenStandardInput())
+$pending = $null
 while ($true) {
-    $line = [Console]::In.ReadLine()
+    if (-not $pending) { $pending = $stdin.ReadLineAsync() }
+    $wait = -1; if ($script:exp) { $wait = 0 }
+    if (-not $pending.Wait($wait)) { SlideStep; continue }
+    $line = $pending.Result; $pending = $null
     if ($line -eq $null -or $line -eq 'quit') { break }
     $parts = $line.Split(' ')
     $cmd = $parts[0]
@@ -96,6 +146,9 @@ while ($true) {
             }
             $hwnd = 0; try { $hwnd = $script:win.HWND } catch {}
             Say ('ready ' + $script:sid + ' ' + $script:total + ' ' + $hwnd)
+            if ($parts.Count -gt 6 -and $parts[5] -ne '-') {
+                try { PlanSlides ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[5]))) $parts[6] } catch {}
+            }
         } catch {
             Say ('error ' + $script:sid + ' ' + (Msg $_)); CloseShow
         }
@@ -382,6 +435,11 @@ impl Host {
                             }
                         }
                     }
+                    "slide" => {
+                        if let Some(n) = num(0) {
+                            on_event(sid, PptEvent::Slide(n));
+                        }
+                    }
                     "ended" => on_event(sid, PptEvent::Ended),
                     "error" => on_event(sid, PptEvent::Error(rest.join(" "))),
                     _ => {}
@@ -404,13 +462,15 @@ impl Host {
 
     /// Открыть презентацию и запустить показ. Прежний показ (если был) мост закроет сам.
     /// `monitor` — системное имя монитора для показа (пусто — как настроено в PowerPoint).
-    pub fn open(&self, sid: u64, src: &Path, windowed: bool, monitor: &str) -> Result<(), String> {
+    /// `slides` — папка, куда во время показа сохранить слайды картинками шириной `width` (превью).
+    pub fn open(&self, sid: u64, src: &Path, windowed: bool, monitor: &str, slides: Option<&Path>, width: u32) -> Result<(), String> {
         self.ensure()?;
         self.current.store(sid, Ordering::SeqCst);
         let path = base64(src.to_string_lossy().as_bytes());
         let mon = if monitor.is_empty() { "-".to_string() } else { base64(monitor.as_bytes()) };
+        let dir = slides.map_or("-".to_string(), |d| base64(d.to_string_lossy().as_bytes()));
         let _ = self.waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
-        self.send(&format!("open {sid} {} {path} {mon}", if windowed { 1 } else { 0 }));
+        self.send(&format!("open {sid} {} {path} {mon} {dir} {width}", if windowed { 1 } else { 0 }));
         Ok(())
     }
 

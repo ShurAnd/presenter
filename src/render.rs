@@ -17,7 +17,13 @@ pub struct PageKey {
     pub page: usize,
     pub w: u32,
     pub h: u32,
+    /// Миниатюра для превью у оператора (готовится и в JPEG — для клиентов).
+    pub thumb: bool,
 }
+
+/// Размер миниатюры превью: страница вписывается в эту рамку.
+pub const THUMB_W: u32 = 480;
+pub const THUMB_H: u32 = 270;
 
 pub enum Out {
     Prepared { id: u64, result: Result<(Option<PathBuf>, usize), String> },
@@ -29,6 +35,9 @@ pub enum Out {
     Video { gen: u64, ev: crate::video::VideoEvent },
     Page { key: PageKey, image: ColorImage },
     PageErr { key: PageKey, msg: String },
+    /// Миниатюра слайда для превью: картинка и она же в JPEG (для клиентов).
+    Thumb { id: u64, page: usize, image: ColorImage, jpg: Vec<u8> },
+    ThumbErr { id: u64, page: usize },
 }
 
 /// Расширения видеофайлов, которые отдаём встроенному проигрывателю.
@@ -47,6 +56,28 @@ pub fn prepare(id: u64, src: PathBuf, out: Sender<Out>, wake: impl Fn() + Send +
         let _ = out.send(Out::Prepared { id, result });
         wake();
     });
+}
+
+/// Миниатюра слайда PPTX из картинки, которую сохранил мост к PowerPoint, — в отдельном потоке.
+pub fn load_thumb(id: u64, page: usize, file: PathBuf, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
+        let loaded = std::fs::read(&file).ok().and_then(|jpg| Some((crate::net::decode_image(&jpg)?, jpg)));
+        let _ = out.send(match loaded {
+            Some((image, jpg)) => Out::Thumb { id, page, image, jpg },
+            None => Out::ThumbErr { id, page },
+        });
+        wake();
+    });
+}
+
+/// Изображение страницы → JPEG для отправки клиентам.
+fn to_jpeg(image: &ColorImage) -> Result<Vec<u8>, String> {
+    let rgb: Vec<u8> = image.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect();
+    let mut buf = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 82)
+        .encode(&rgb, image.size[0] as u32, image.size[1] as u32, image::ExtendedColorType::Rgb8)
+        .map_err(|e| e.to_string())?;
+    Ok(buf)
 }
 
 fn prepare_inner(src: &Path) -> Result<(Option<PathBuf>, usize), String> {
@@ -186,8 +217,14 @@ fn worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync)) {
                 .unwrap_or_else(|_| Err("ошибка рендера страницы".into()))
         });
         shared.queue.lock().unwrap_or_else(|e| e.into_inner()).busy.remove(&key);
+        let (id, page) = (key.id, key.page);
         let _ = out.send(match res {
+            Ok(image) if key.thumb => match to_jpeg(&image) {
+                Ok(jpg) => Out::Thumb { id, page, image, jpg },
+                Err(_) => Out::ThumbErr { id, page },
+            },
             Ok(image) => Out::Page { key, image },
+            Err(_) if key.thumb => Out::ThumbErr { id, page },
             Err(msg) => Out::PageErr { key, msg },
         });
         wake();
@@ -210,7 +247,7 @@ mod tests {
         let r = Renderer::new(tx, || {});
         for i in 0..rounds {
             let pdf = &files[i % files.len()];
-            let keys: Vec<PageKey> = (0..5).map(|page| PageKey { id: i as u64, page, w: 1920, h: 1080 }).collect();
+            let keys: Vec<PageKey> = (0..5).map(|page| PageKey { id: i as u64, page, w: 1920, h: 1080, thumb: false }).collect();
             r.want(pdf, keys);
             for _ in 0..5 {
                 rx.recv().unwrap();
@@ -233,7 +270,7 @@ mod tests {
         let (w, h) = size.split_once('x').map(|(w, h)| (w.parse().unwrap(), h.parse().unwrap())).unwrap();
         for page in 0..pdf.pages().len() {
             let t = Instant::now();
-            render_page(&pdf, PageKey { id: 0, page, w, h }).unwrap();
+            render_page(&pdf, PageKey { id: 0, page, w, h, thumb: false }).unwrap();
             println!("страница {}: {} мс", page + 1, t.elapsed().as_millis());
         }
     }
