@@ -716,6 +716,7 @@ impl App {
             }
             c @ (Cmd::AudioPlay { .. }
             | Cmd::AudioInsert { .. }
+            | Cmd::AudioEndInsert
             | Cmd::AudioToggle
             | Cmd::AudioStop
             | Cmd::AudioNext
@@ -1945,15 +1946,11 @@ impl App {
         let a = view.audio.clone();
         // Режим и громкость.
         ui.horizontal(|ui| {
-            if ui.selectable_label(!a.list, "Один трек").on_hover_text("Сыграть трек и остановиться (с «Повтором» — крутить его по кругу)").clicked() && a.list {
+            if ui.selectable_label(!a.list, "Один трек").on_hover_text("Сыграть трек и остановиться").clicked() && a.list {
                 self.act(Cmd::AudioMode { list: false, repeat: a.repeat });
             }
-            if ui.selectable_label(a.list, "По списку").on_hover_text("После трека — следующий (с «Повтором» — весь список по кругу)").clicked() && !a.list {
+            if ui.selectable_label(a.list, "По списку").on_hover_text("После трека — следующий; после последнего — снова первый").clicked() && !a.list {
                 self.act(Cmd::AudioMode { list: true, repeat: a.repeat });
-            }
-            ui.add_space(6.0);
-            if ui.selectable_label(a.repeat, "Повтор").on_hover_text("По кругу: один трек или весь список").clicked() {
-                self.act(Cmd::AudioMode { list: a.list, repeat: !a.repeat });
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let mut v = a.volume as f32;
@@ -2085,9 +2082,23 @@ impl App {
                 self.act(Cmd::AudioNext);
             }
             ui.add_space(10.0);
-            if ui
+            // «Повтор» — переключатель: включён (синий) — текущий трек по кругу при любом режиме.
+            let (fill, tip) = if a.repeat {
+                (BLUE, "Повтор включён: текущий трек играет по кругу. Нажмите, чтобы выключить")
+            } else {
+                (GRAY, "Повтор выключен. Нажмите — текущий трек будет играть по кругу (и в режиме «По списку»)")
+            };
+            if btn(ui, "Повтор", fill).on_hover_text(tip).clicked() {
+                self.act(Cmd::AudioMode { list: a.list, repeat: !a.repeat });
+            }
+            // «Вставкой»: пока вставка звучит — та же кнопка обрывает её, и музыка продолжается.
+            if ins {
+                if btn(ui, "■ Стоп вставки", INSERT).on_hover_text("Оборвать вставку — музыка продолжится с того же места").clicked() {
+                    self.act(Cmd::AudioEndInsert);
+                }
+            } else if ui
                 .add_enabled(sel.is_some(), cbutton("Вставкой", INSERT))
-                .on_hover_text("Сыграть выбранный трек один раз (фанфары): музыка встанет на паузу и после него продолжится с того же места")
+                .on_hover_text("Сыграть выбранный трек один раз (фанфары): музыка встанет на паузу и после него продолжится с того же места. Повторное нажатие — оборвать вставку")
                 .clicked()
             {
                 self.act(Cmd::AudioInsert { id: sel.unwrap() });
@@ -2648,9 +2659,9 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Вкладка «Плеер»", "Свой список музыки, отдельно от презентаций. Звук идёт из компьютера показа (сервера). Музыка играет и во время показа."),
         ("Добавить", "«Добавить» или перетащить файлы в окно: mp3, wav, flac, ogg, m4a, aac, wma и др. Музыка сама попадает в плеер."),
         ("Играть", "Двойной щелчок по треку или «Старт». «Пауза» / «Продолжить», «Пред.» / «След.», перемотка — полосой позиции."),
-        ("Один трек / По списку", "«Один трек» — сыграть и остановиться. «По списку» — после трека следующий."),
-        ("Повтор", "По кругу: один трек (в режиме «Один трек») или весь список (в режиме «По списку»)."),
-        ("Вставкой", "Для фанфар: выбранный трек играет один раз, музыка на это время встаёт на паузу и потом продолжается с того же места."),
+        ("Один трек / По списку", "«Один трек» — сыграть и остановиться. «По списку» — после трека следующий, после последнего — снова первый."),
+        ("Повтор", "Кнопка рядом со «Стоп»: синяя — текущий трек играет по кругу, в любом режиме."),
+        ("Вставкой", "Для фанфар: выбранный трек играет один раз, музыка на это время встаёт на паузу и потом продолжается с того же места. Пока вставка звучит, кнопка называется «Стоп вставки» — оборвать вставку и вернуть музыку."),
         ("Стоп", "Звук плавно затихает за 2 секунды. Нажать ещё раз — остановить сразу. Красная кнопка справа от вкладок — то же с любой вкладки."),
         ("Громкость", "Ползунок справа вверху; запоминается на сервере."),
     ]),
@@ -3082,7 +3093,7 @@ mod tests {
 
     /// Плеер против запущенного `presentator --server`:
     /// TEST_AUDIO="музыка 1.wav;музыка 2.wav;фанфары.wav" cargo test --release e2e_audio -- --ignored --nocapture
-    /// Нужны три файла: длинный (≥ 6 с), второй и короткий (вставка, ≤ 3 с).
+    /// Нужны три файла: длинный (≥ 6 с), второй (≥ 3 с) и короткий (вставка, ≤ 3 с).
     #[test]
     #[ignore]
     fn e2e_audio() {
@@ -3108,7 +3119,8 @@ mod tests {
                 }
             }
         };
-        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
         c.send(CliReq::Cmd(Cmd::AudioClear));
         wait("cleared", 10, &|a| a.tracks.is_empty());
         for f in &files {
@@ -3139,12 +3151,24 @@ mod tests {
         wait("stopped", 5, &|a| a.state == AudioState::Stopped);
         println!("затухание: {} мс", t.elapsed().as_millis());
 
-        // Один трек по кругу: короткий трек всё ещё играет после своей длительности.
-        c.send(CliReq::Cmd(Cmd::AudioMode { list: false, repeat: true }));
+        // «Стоп вставки»: вставка обрывается сразу, музыка продолжается с того же места.
+        c.send(CliReq::Cmd(Cmd::AudioPlay { id: m1 }));
+        wait("music 1 for end-insert", 10, &|a| a.current == Some(m1) && a.state == AudioState::Playing && a.pos >= 1);
+        c.send(CliReq::Cmd(Cmd::AudioInsert { id: m2 }));
+        let before = wait("long insert playing", 10, &|a| a.insert == Some(m2) && a.insert_pos >= 1).pos;
+        c.send(CliReq::Cmd(Cmd::AudioEndInsert));
+        let a = wait("insert ended by button, music resumed", 5, &|a| a.insert.is_none() && a.state == AudioState::Playing);
+        assert!(a.pos <= before + 1, "музыка должна продолжиться с того же места");
+        // По списку: после последнего трека — снова первый.
         c.send(CliReq::Cmd(Cmd::AudioPlay { id: fan }));
-        wait("one + repeat playing", 10, &|a| a.current == Some(fan) && a.state == AudioState::Playing);
+        wait("last track playing", 10, &|a| a.current == Some(fan) && a.state == AudioState::Playing);
+        wait("list wraps to first", 10, &|a| a.current == Some(m1) && a.state == AudioState::Playing);
+        // «Повтор» и в режиме «По списку» крутит текущий трек: короткий всё ещё играет после своей длительности.
+        c.send(CliReq::Cmd(Cmd::AudioMode { list: true, repeat: true }));
+        c.send(CliReq::Cmd(Cmd::AudioPlay { id: fan }));
+        wait("list + repeat playing", 10, &|a| a.current == Some(fan) && a.state == AudioState::Playing);
         std::thread::sleep(Duration::from_millis(4500));
-        wait("still playing after 4.5 s", 5, &|a| a.state == AudioState::Playing);
+        wait("same track still playing after 4.5 s", 5, &|a| a.current == Some(fan) && a.state == AudioState::Playing);
         // Один трек без повтора: доиграл и остановился, трек остался выбранным.
         c.send(CliReq::Cmd(Cmd::AudioMode { list: false, repeat: false }));
         c.send(CliReq::Cmd(Cmd::AudioPlay { id: fan }));

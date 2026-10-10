@@ -1,8 +1,9 @@
 //! Плеер: список треков на сервере и правила воспроизведения. Звук — в `audio.rs`.
 //!
-//! Режим общий на плеер: «один трек» или «по списку», плюс «повтор» (один трек по кругу
-//! или весь список по кругу). Отдельно — «вставка» (фанфары): выбранный трек играет один раз,
-//! музыка на это время стоит на паузе и потом продолжается с того же места.
+//! Режим общий на плеер: «один трек» (сыграть и остановиться) или «по списку» (после трека —
+//! следующий, после последнего — снова первый), плюс «повтор» — текущий трек по кругу при любом
+//! режиме. Отдельно — «вставка» (фанфары): выбранный трек играет один раз, музыка на это время
+//! стоит на паузе и потом продолжается с того же места; повторное нажатие обрывает вставку.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -96,9 +97,9 @@ impl Player {
         self.tracks.iter().find(|t| t.id == id).map(|t| t.src.clone())
     }
 
-    /// Один трек по кругу — это делает сам mpv, без перезагрузки файла.
+    /// Текущий трек по кругу (при любом режиме) — это делает сам mpv, без перезагрузки файла.
     fn loop_file(&self) -> bool {
-        !self.list && self.repeat
+        self.repeat
     }
 
     /// Команда плеера. Возвращает файлы, которые больше не нужны (удалённые из списка).
@@ -106,6 +107,12 @@ impl Player {
         match cmd {
             Cmd::AudioPlay { id } => self.play(id),
             Cmd::AudioInsert { id } => self.insert(id),
+            Cmd::AudioEndInsert => {
+                if self.ins.track.is_some() {
+                    self.halt(Deck::Insert);
+                    self.end_insert();
+                }
+            }
             Cmd::AudioToggle => self.toggle(),
             Cmd::AudioStop => self.stop(),
             Cmd::AudioNext => self.step(true),
@@ -274,24 +281,13 @@ impl Player {
         }
     }
 
-    /// Музыка доиграла: дальше по режиму.
+    /// Музыка доиграла (с «повтором» сюда не попадаем — трек крутит сам mpv): по списку — следующий,
+    /// после последнего — первый; один трек — стоп.
     fn main_ended(&mut self) {
         self.main.state = AudioState::Stopped;
         self.main.pos = 0.0;
-        if !self.list {
-            return; // один трек (по кругу его крутит сам mpv, сюда не попадаем)
-        }
-        let n = self.tracks.len();
-        let cur = self.main.track.and_then(|id| self.tracks.iter().position(|t| t.id == id));
-        let next = match cur {
-            Some(i) if i + 1 < n => Some(i + 1),
-            Some(_) if self.repeat => Some(0),
-            None if n > 0 && self.repeat => Some(0),
-            _ => None,
-        };
-        if let Some(i) = next {
-            let id = self.tracks[i].id;
-            self.play(id);
+        if self.list && !self.tracks.is_empty() {
+            self.step(true);
         }
     }
 
