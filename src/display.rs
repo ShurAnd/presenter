@@ -37,6 +37,11 @@ pub fn fit_window(title: &str, rect: (i32, i32, i32, i32), extra_h: i32) {
     win::fit_window(title, rect, extra_h);
 }
 
+/// Окно (по дескриптору) — на этом мониторе: его центр внутри прямоугольника.
+pub fn window_on(hwnd: isize, rect: (i32, i32, i32, i32)) -> bool {
+    win::window_on(hwnd, rect)
+}
+
 /// Поставить окно (по дескриптору) на прямоугольник монитора, если оно не там.
 pub fn fit_hwnd(hwnd: isize, rect: (i32, i32, i32, i32)) {
     win::fit_hwnd(hwnd, rect, 0);
@@ -49,6 +54,9 @@ mod win {
         Vec::new()
     }
     pub fn fit_window(_: &str, _: (i32, i32, i32, i32), _: i32) {}
+    pub fn window_on(_: isize, _: (i32, i32, i32, i32)) -> bool {
+        false
+    }
     pub fn fit_hwnd(_: isize, _: (i32, i32, i32, i32), _: i32) {}
 }
 
@@ -99,6 +107,15 @@ mod win {
                 let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
             }
         }
+    }
+
+    pub fn window_on(hwnd: isize, rect: (i32, i32, i32, i32)) -> bool {
+        let mut r = RECT::default();
+        if hwnd == 0 || unsafe { GetWindowRect(HWND(hwnd as *mut _), &mut r) }.is_err() {
+            return false;
+        }
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        cx >= rect.0 && cx < rect.0 + rect.2 && cy >= rect.1 && cy < rect.1 + rect.3
     }
 
     pub fn fit_window(title: &str, rect: (i32, i32, i32, i32), extra_h: i32) {

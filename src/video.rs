@@ -4,8 +4,12 @@
 //!
 //! Видео играет в собственном окне на весь экран. При открытии окно лежит под сценой с фоном,
 //! а видео загружено и стоит на паузе — поэтому по команде «старт» оно начинается сразу:
-//! окно выходит поверх сцены и включается воспроизведение. Окно не забирает фокус —
-//! клавиши по-прежнему ловит сцена.
+//! окно выходит наверх и включается воспроизведение, сцена опускается прямо под него
+//! (`stage_under_video`, как с PowerPoint). Окно не забирает фокус — клавиши по-прежнему ловит сцена.
+//!
+//! Через «поверх всех» (HWND_TOPMOST) окно видео не поднимаем: на части компьютеров Windows молча
+//! не пускает его в этот слой (найдено 11.10.2026 — звук идёт, а на экране фон; та же картина и у
+//! версии 1.0.4), хотя обычное окно с теми же стилями туда пускает. Обычный HWND_TOP работает везде.
 
 use std::path::Path;
 use std::sync::mpsc::{channel, Sender};
@@ -79,6 +83,14 @@ impl Video {
     pub fn seek_to(&self, secs: f64) {
         self.send(VCmd::SeekTo(secs));
     }
+}
+
+/// Пока видео идёт: окно видео наверху, сцена прямо под ним (см. `win::stage_under_video`).
+pub fn stage_under_video(stage_title: &str) {
+    #[cfg(windows)]
+    win::stage_under_video(stage_title);
+    #[cfg(not(windows))]
+    let _ = stage_title;
 }
 
 impl Drop for Video {
@@ -290,6 +302,21 @@ mod win {
 
     // ------------------------------------------------------------ окно и цикл
 
+    /// Пока видео идёт: окно видео наверху, сцена прямо под ним. Вызывается из GUI на каждой
+    /// перерисовке сцены; если порядок уже такой — ничего не делает.
+    pub fn stage_under_video(stage_title: &str) {
+        unsafe {
+            let Ok(video) = FindWindowW(w!("PresentatorVideo"), PCWSTR::null()) else { return };
+            let Ok(stage) = FindWindowW(PCWSTR::null(), &HSTRING::from(stage_title)) else { return };
+            if GetWindow(video, GW_HWNDNEXT).ok() == Some(stage) {
+                return;
+            }
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            let _ = SetWindowPos(video, HWND_TOP, 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(stage, video, 0, 0, 0, 0, flags);
+        }
+    }
+
     pub fn wake(thread: u32) {
         unsafe {
             let _ = PostThreadMessageW(thread, WM_APP, WPARAM(0), LPARAM(0));
@@ -374,8 +401,8 @@ mod win {
                         VCmd::Quit => break 'outer,
                         VCmd::Start if ready && !started => {
                             started = true;
-                            // Поверх сцены, не отнимая фокус, — и сразу воспроизведение.
-                            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                            // Наверх, не отнимая фокус, — и сразу воспроизведение (сцену под окно видео опустит GUI).
+                            let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
                             engine.play();
                         }
                         VCmd::Toggle if started => engine.toggle(),
@@ -404,10 +431,7 @@ mod win {
                     }
                     continue;
                 }
-                if started {
-                    // Сцену могли поднять наверх — держим видео поверх неё.
-                    let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                }
+
                 // Сообщаем только об изменениях: иначе GUI 10 раз в секунду перерисовывал бы окна впустую.
                 let now = (t.pos as u32, t.dur as u32, t.playing);
                 if last_pos != Some(now) {

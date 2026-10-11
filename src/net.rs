@@ -44,6 +44,8 @@ pub enum Cmd {
     TimerRun { run: bool },
     /// Таймер — на начало (и остановить).
     TimerReset,
+    /// Вернуть стандартный фон сцены (выбранный удаляется).
+    BackgroundReset,
     /// Плеер: играть трек (музыка; вставка, если играла, прекращается).
     AudioPlay { id: u64 },
     /// Плеер: сыграть трек один раз «вставкой» — музыка на это время на паузе, потом продолжается.
@@ -190,6 +192,9 @@ pub struct StateMsg {
     pub timer: TimerInfo,
     #[serde(default)]
     pub audio: AudioInfo,
+    /// Выбранный фон сцены (имя исходного файла); пусто — стандартный.
+    #[serde(default)]
+    pub background: String,
 }
 
 /// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).
@@ -226,7 +231,13 @@ enum C2S {
         upload: bool,
     },
     Cmd { cmd: Cmd },
-    UploadBegin { name: String, size: u64 },
+    /// `background` — это картинка фона сцены, а не файл для списка.
+    UploadBegin {
+        name: String,
+        size: u64,
+        #[serde(default)]
+        background: bool,
+    },
     UploadEnd,
     /// Замер задержки: сервер сразу отвечает `Pong` с тем же `ts`.
     Ping { ts: u64 },
@@ -257,6 +268,8 @@ pub enum SrvEvent {
     Clients(usize),
     Cmd(Cmd),
     File { name: String, path: PathBuf },
+    /// Принята картинка фона сцены (лежит в рабочей папке, её надо забрать).
+    Background { name: String, path: PathBuf },
 }
 
 pub struct ServerHandle {
@@ -412,7 +425,7 @@ async fn serve_client(
     }
 
     // Текущая загрузка: (имя, путь, файл, ожидаемый размер, принято)
-    let mut upload: Option<(String, PathBuf, tokio::fs::File, u64, u64)> = None;
+    let mut upload: Option<(String, PathBuf, tokio::fs::File, u64, u64, bool)> = None;
     // Миниатюры из прошлой рассылки — их клиенту уже отправили.
     let mut sent_thumbs: Vec<(u64, usize)> = Vec::new();
 
@@ -446,23 +459,23 @@ async fn serve_client(
                         Ok(C2S::Ping { ts }) => {
                             if ws.send(js(&S2C::Pong { ts })).await.is_err() { break; }
                         }
-                        Ok(C2S::UploadBegin { name, size }) => {
+                        Ok(C2S::UploadBegin { name, size, background }) => {
                             let name = safe_name(&name);
                             let path = dir.join(format!("{}_{}", unique_prefix(), name));
                             let _ = tokio::fs::create_dir_all(&dir).await;
                             match tokio::fs::File::create(&path).await {
-                                Ok(f) => upload = Some((name, path, f, size, 0)),
+                                Ok(f) => upload = Some((name, path, f, size, 0, background)),
                                 Err(e) => {
                                     let _ = ws.send(js(&S2C::UploadErr { name, msg: e.to_string() })).await;
                                 }
                             }
                         }
                         Ok(C2S::UploadEnd) => {
-                            if let Some((name, path, mut f, size, got)) = upload.take() {
+                            if let Some((name, path, mut f, size, got, background)) = upload.take() {
                                 let _ = f.flush().await;
                                 drop(f);
                                 if got == size {
-                                    let _ = ev.send(SrvEvent::File { name: name.clone(), path });
+                                    let _ = ev.send(if background { SrvEvent::Background { name: name.clone(), path } } else { SrvEvent::File { name: name.clone(), path } });
                                     wake();
                                     let _ = ws.send(js(&S2C::UploadOk { name })).await;
                                 } else {
@@ -475,7 +488,7 @@ async fn serve_client(
                         _ => {}
                     },
                     Message::Binary(b) => {
-                        if let Some((_, _, f, _, got)) = upload.as_mut() {
+                        if let Some((_, _, f, _, got, _)) = upload.as_mut() {
                             if f.write_all(&b).await.is_ok() { *got += b.len() as u64; }
                         }
                     }
@@ -486,7 +499,7 @@ async fn serve_client(
         }
     }
     // Недокачанный файл не оставляем.
-    if let Some((_, path, f, _, _)) = upload.take() {
+    if let Some((_, path, f, _, _, _)) = upload.take() {
         drop(f);
         let _ = tokio::fs::remove_file(&path).await;
     }
@@ -516,6 +529,8 @@ pub enum CliEvent {
 pub enum CliReq {
     Cmd(Cmd),
     Upload(PathBuf),
+    /// Загрузить картинку фона сцены на сервер.
+    UploadBackground(PathBuf),
 }
 
 /// Пока жив этот объект — живо соединение.
@@ -564,7 +579,7 @@ async fn client_task(
 ) -> String {
     let url = format!("ws://{host}:{port}");
     // Загрузки — отдельной задачей по своему соединению: команды не ждут, пока едет большой файл.
-    let (up_tx, up_rx) = tmpsc::unbounded_channel::<PathBuf>();
+    let (up_tx, up_rx) = tmpsc::unbounded_channel::<(PathBuf, bool)>();
     let uploader = tokio::spawn(upload_worker(url.clone(), password.clone(), up_rx, ev.clone(), wake.clone()));
     let _stop_uploader = AbortOnDrop(uploader);
     let conn = tokio::time::timeout(Duration::from_secs(5), tokio_tungstenite::connect_async(&url)).await;
@@ -606,7 +621,10 @@ async fn client_task(
                         if ws.send(js(&C2S::Cmd { cmd })).await.is_err() { break; }
                     }
                     CliReq::Upload(path) => {
-                        let _ = up_tx.send(path);
+                        let _ = up_tx.send((path, false));
+                    }
+                    CliReq::UploadBackground(path) => {
+                        let _ = up_tx.send((path, true));
                     }
                 }
             }
@@ -643,12 +661,17 @@ async fn client_task(
 /// Загрузчик файлов на сервер без управляющего соединения — для дублирования на резервный сервер.
 /// Пока жив — живёт; события — те же `CliEvent::Progress / UploadOk / UploadErr`.
 pub struct Uploader {
-    tx: tmpsc::UnboundedSender<PathBuf>,
+    tx: tmpsc::UnboundedSender<(PathBuf, bool)>,
 }
 
 impl Uploader {
     pub fn send(&self, path: PathBuf) {
-        let _ = self.tx.send(path);
+        let _ = self.tx.send((path, false));
+    }
+
+    /// Картинка фона сцены.
+    pub fn send_background(&self, path: PathBuf) {
+        let _ = self.tx.send((path, true));
     }
 }
 
@@ -676,18 +699,18 @@ impl Drop for AbortOnDrop {
 async fn upload_worker(
     url: String,
     password: String,
-    mut rx: tmpsc::UnboundedReceiver<PathBuf>,
+    mut rx: tmpsc::UnboundedReceiver<(PathBuf, bool)>,
     ev: Sender<CliEvent>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
     let mut conn: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>> = None;
-    while let Some(path) = rx.recv().await {
+    while let Some((path, background)) = rx.recv().await {
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
         if conn.is_none() {
             conn = open_upload_conn(&url, &password).await.ok();
         }
         let result = match conn.as_mut() {
-            Some(ws) => upload(ws, &path, &name, &ev, &*wake).await,
+            Some(ws) => upload(ws, &path, &name, background, &ev, &*wake).await,
             None => Err("не удалось открыть соединение для передачи файла".into()),
         };
         let result = match (result, conn.as_mut()) {
@@ -755,6 +778,7 @@ async fn upload<S>(
     ws: &mut tokio_tungstenite::WebSocketStream<S>,
     path: &PathBuf,
     name: &str,
+    background: bool,
     ev: &Sender<CliEvent>,
     wake: &(dyn Fn() + Send + Sync),
 ) -> Result<(), String>
@@ -764,7 +788,7 @@ where
     let mut f = tokio::fs::File::open(path).await.map_err(|e| e.to_string())?;
     let total = f.metadata().await.map_err(|e| e.to_string())?.len();
     let e2s = |e: tokio_tungstenite::tungstenite::Error| e.to_string();
-    ws.send(js(&C2S::UploadBegin { name: name.to_string(), size: total })).await.map_err(e2s)?;
+    ws.send(js(&C2S::UploadBegin { name: name.to_string(), size: total, background })).await.map_err(e2s)?;
     let mut buf = vec![0u8; CHUNK];
     let mut sent = 0u64;
     loop {

@@ -33,6 +33,10 @@ pub enum Out {
     /// Свежие показатели этого компьютера (сборщик работает, пока запущен сервер).
     Health(crate::health::HealthInfo),
     Video { gen: u64, ev: crate::video::VideoEvent },
+    /// Фон сцены загружен (номер загрузки — устаревшие отбрасываются).
+    Background { gen: u64, result: Result<crate::background::Frames, String> },
+    /// Картинка, открытая как презентация, загружена (номер показа — устаревшие отбрасываются).
+    Image { gen: u64, result: Result<crate::background::Frames, String> },
     /// События плеера (музыка и вставки).
     Audio(crate::audio::AudioEvent),
     Page { key: PageKey, image: ColorImage },
@@ -75,6 +79,32 @@ pub fn load_thumb(id: u64, page: usize, file: PathBuf, out: Sender<Out>, wake: i
     });
 }
 
+/// Картинка, открытая как презентация: загрузить в отдельном потоке (кадры — на сцену) и сделать
+/// миниатюру для превью.
+pub fn load_image(id: u64, gen: u64, path: PathBuf, max_side: u32, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
+        let result = crate::background::load_file(&path, max_side);
+        let thumb = result.as_ref().ok().and_then(|f| f.first()).and_then(|f| thumb_of(&f.0));
+        let _ = out.send(Out::Image { gen, result });
+        if let Some((image, jpg)) = thumb {
+            let _ = out.send(Out::Thumb { id, page: 0, image, jpg });
+        }
+        wake();
+    });
+}
+
+/// Миниатюра (вписана в THUMB_W×THUMB_H) и она же в JPEG.
+fn thumb_of(img: &ColorImage) -> Option<(ColorImage, Vec<u8>)> {
+    let (w, h) = (img.size[0] as u32, img.size[1] as u32);
+    let rgba = image::RgbaImage::from_raw(w, h, img.pixels.iter().flat_map(|c| c.to_srgba_unmultiplied()).collect())?;
+    let k = (THUMB_W as f32 / w as f32).min(THUMB_H as f32 / h as f32).min(1.0);
+    let (tw, th) = (((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1));
+    let small = image::imageops::resize(&rgba, tw, th, image::imageops::FilterType::Triangle);
+    let thumb = ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], small.as_raw());
+    let jpg = to_jpeg(&thumb).ok()?;
+    Some((thumb, jpg))
+}
+
 /// Изображение страницы → JPEG для отправки клиентам.
 fn to_jpeg(image: &ColorImage) -> Result<Vec<u8>, String> {
     let rgb: Vec<u8> = image.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect();
@@ -97,6 +127,11 @@ fn prepare_inner(src: &Path) -> Result<(Option<PathBuf>, usize), String> {
         }
         // PPTX показывает сам PowerPoint; здесь только считаем слайды для списка.
         "pptx" | "ppsx" => Ok((None, count_slides(src)?)),
+        // Картинка — презентация из одного слайда; проверяем, что она читается.
+        e if crate::background::EXTS.contains(&e) => {
+            image::image_dimensions(src).map_err(|e| format!("не удалось прочитать картинку: {e}"))?;
+            Ok((None, 1))
+        }
         "ppt" | "pps" => {
             std::fs::File::open(src).map_err(|e| format!("не удалось прочитать файл: {e}"))?;
             Ok((None, 0))

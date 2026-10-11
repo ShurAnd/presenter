@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
+mod background;
 mod display;
 mod health;
 mod net;
@@ -34,8 +35,6 @@ const OFF: Color32 = Color32::from_rgb(0x6c, 0x75, 0x7d);
 const INSERT: Color32 = Color32::from_rgb(0xe0, 0x8a, 0x00);
 /// Фон сцены, если картинки фона нет.
 const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
-/// Файлы фона рядом с exe — если есть, заменяют вшитую картинку. Берётся первый найденный.
-const BG_FILES: [&str; 3] = ["background.png", "background.jpg", "background.jpeg"];
 /// Сколько ждать после «ready» от PowerPoint, прежде чем убрать сцену: слайд-шоу должно успеть отрисоваться.
 const PPT_SETTLE: Duration = Duration::from_millis(300);
 /// PowerPoint не открыл показ за это время — считаем, что он завис, и перезапускаем мост.
@@ -97,6 +96,8 @@ struct Config {
     audio_list: bool,
     audio_repeat: bool,
     audio_volume: u8,
+    /// Выбранный фон сцены — имя исходного файла (для показа); пусто — стандартный.
+    background: String,
 }
 
 /// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
@@ -121,6 +122,7 @@ impl Default for Config {
             audio_list: true,
             audio_repeat: false,
             audio_volume: 100,
+            background: String::new(),
         }
     }
 }
@@ -152,6 +154,9 @@ enum Tab {
     Player,
     Net,
 }
+
+/// Вид элемента списка «картинка» (открывается как презентация из одного слайда).
+const KIND_IMAGE: &str = "КАРТИНКА";
 
 /// Папка в рабочей папке для слайдов PPTX в картинках (превью).
 const SLIDES_DIR: &str = "slides";
@@ -214,6 +219,16 @@ fn initial_geometry() -> Option<(egui::Pos2, egui::Vec2)> {
     None
 }
 
+/// Дескриптор главного окна — своего, а не найденного по заголовку (у двух копий программы
+/// на одном компьютере заголовки одинаковые). 0 — не Windows или не удалось.
+fn main_hwnd(cc: &eframe::CreationContext<'_>) -> isize {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match cc.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get(),
+        _ => 0,
+    }
+}
+
 /// Значок окон (тот же, что вшит в exe). Декодируется один раз.
 fn app_icon() -> Arc<egui::IconData> {
     static ICON: std::sync::OnceLock<Arc<egui::IconData>> = std::sync::OnceLock::new();
@@ -264,6 +279,8 @@ enum ShowKind {
     Ppt(PptShow),
     /// Видео — встроенный проигрыватель поверх сцены.
     Video(VideoShow),
+    /// Картинка — рисуем сами на сцене, как страницу PDF (анимированная GIF движется).
+    Image(Option<background::Background>),
 }
 
 struct VideoShow {
@@ -306,7 +323,16 @@ impl Show {
 
     /// Сцена должна быть поверх всех окон всегда, кроме времени, когда на экране PowerPoint.
     fn stage_on_top(&self) -> bool {
-        !matches!(&self.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Lowered(_) | PptPhase::Shown))
+        match &self.kind {
+            ShowKind::Ppt(p) => !matches!(p.phase, PptPhase::Lowered(_) | PptPhase::Shown),
+            // Идущее видео — наверху, сцена прямо под ним (через «поверх всех» видео не поднять).
+            ShowKind::Video(v) => !matches!(v.state, VideoState::Playing | VideoState::Paused),
+            ShowKind::Pdf(_) | ShowKind::Image(_) => true,
+        }
+    }
+
+    fn video_on_screen(&self) -> bool {
+        self.video().is_some_and(|v| matches!(v.state, VideoState::Playing | VideoState::Paused))
     }
 }
 
@@ -396,9 +422,18 @@ struct App {
     stage: bool,
     /// Что уже отправлено окну сцены: (поверх всех окон, на весь экран).
     stage_sent: Option<(bool, bool)>,
-    bg: Option<egui::TextureHandle>,
+    bg: Option<background::Background>,
+    /// Фон загружен (или грузится) для этого появления сцены; номер загрузки.
     bg_checked: bool,
+    bg_gen: u64,
+    /// На прошлом кадре фон был виден — анимацию двигаем только тогда.
+    bg_shown: bool,
     esc_at: Option<Instant>,
+    /// Дескриптор главного окна (Windows) и свернули ли мы его на время сцены.
+    main_hwnd: isize,
+    main_minimized: bool,
+    /// Сцена была на экране на прошлом кадре (сворачиваем только в момент её появления).
+    stage_up: bool,
 
     // Рендер
     renderer: Renderer,
@@ -527,7 +562,12 @@ impl App {
             stage_sent: None,
             bg: None,
             bg_checked: false,
+            bg_gen: 0,
+            bg_shown: false,
             esc_at: None,
+            main_hwnd: main_hwnd(cc),
+            main_minimized: false,
+            stage_up: false,
             renderer,
             out_tx,
             out_rx,
@@ -555,9 +595,12 @@ impl App {
         // `--add <файл>` (можно несколько): добавить в список; при `--connect` — загрузить на сервер.
         app.pending_add = args.windows(2).filter(|w| w[0] == "--add").map(|w| PathBuf::from(&w[1])).collect();
         if args.iter().any(|a| a == "--server") {
-            app.toggle_server(&cc.egui_ctx);
+            app.toggle_server(&cc.egui_ctx); // файлы добавятся, когда сервер восстановит свой список
         } else if args.iter().any(|a| a == "--connect") {
-            app.toggle_client(&cc.egui_ctx);
+            app.toggle_client(&cc.egui_ctx); // файлы уйдут на сервер после подключения
+        } else {
+            let add = std::mem::take(&mut app.pending_add);
+            app.add_files(add, &cc.egui_ctx);
         }
         app
     }
@@ -605,6 +648,7 @@ impl App {
             screen: self.screen,
             timer: self.timer.info(),
             audio: self.player.info(),
+            background: self.cfg.background.clone(),
         }
     }
 
@@ -633,6 +677,7 @@ impl App {
                     return;
                 }
                 let (pages, pdf, src, name, is_video, slides) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone(), it.kind == "ВИДЕО", it.slides.clone());
+                let is_image = it.kind == KIND_IMAGE;
                 // Прежний показ закрываем: на экране остаётся сцена с фоном,
                 // новый показ появится на ней, только когда будет готов.
                 self.close_show();
@@ -642,6 +687,13 @@ impl App {
                 let gen = self.show_gen;
                 let kind = match pdf {
                     Some(pdf) => ShowKind::Pdf(pdf),
+                    // Картинка грузится в отдельном потоке; пока не готова — виден фон.
+                    None if is_image => {
+                        let ctx = self.ctx.clone();
+                        let max_side = self.ctx.input(|i| i.max_texture_side) as u32;
+                        render::load_image(id, gen, src.clone(), max_side, self.out_tx.clone(), move || ctx.request_repaint());
+                        ShowKind::Image(None)
+                    }
                     // Видео сразу загружается за фоном и ждёт пробела или «Старт».
                     None if is_video => {
                         let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
@@ -742,6 +794,13 @@ impl App {
                     }
                 }
             }
+            Cmd::BackgroundReset => {
+                background::reset();
+                self.cfg.background.clear();
+                self.save_cfg();
+                self.bg_checked = false; // сцена перечитает фон
+                self.status = "Фон: стандартный".into();
+            }
             Cmd::TimerSet { countdown, secs } => self.timer.set(countdown, secs),
             Cmd::TimerRun { run } => self.timer.run(run),
             Cmd::TimerReset => self.timer.reset(),
@@ -795,7 +854,7 @@ impl App {
                         self.trim_pages(id, p);
                     }
                 }
-                ShowKind::Video(_) => {}
+                ShowKind::Video(_) | ShowKind::Image(_) => {}
             }
         }
     }
@@ -843,6 +902,42 @@ impl App {
                 }
             }
             PptPhase::Shown => {}
+        }
+    }
+
+    /// Сделать картинку фоном сцены (на сервере и в автономном режиме).
+    fn set_background(&mut self, path: &Path, name: &str) {
+        match background::set(path) {
+            Ok(()) => {
+                self.cfg.background = name.to_string();
+                self.save_cfg();
+                self.bg_checked = false; // сцена перечитает фон
+                self.status = format!("Фон: «{name}»");
+            }
+            Err(e) => self.status = format!("Не удалось сменить фон: {e}"),
+        }
+        self.dirty = true;
+    }
+
+    /// «Выбрать фон…»: у клиента картинка уходит на сервер (и на резерв), иначе — фон этого компьютера.
+    fn pick_background(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Картинка или анимация (GIF, WebP, APNG)", &background::EXTS).pick_file() else { return };
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        if self.connected {
+            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            if !background::EXTS.contains(&ext.as_str()) {
+                self.status = format!("Формат .{ext} не подходит для фона (нужен PNG, JPG, BMP, GIF или WebP)");
+                return;
+            }
+            if let Some(c) = &self.client {
+                c.send(CliReq::UploadBackground(path.clone()));
+            }
+            if let Some(m) = self.mirror_uploader() {
+                m.send_background(path);
+            }
+            self.status = format!("Фон «{name}» отправляется на сервер…");
+        } else {
+            self.set_background(&path, &name);
         }
     }
 
@@ -1026,10 +1121,11 @@ impl App {
         }
         let kind = match ext.as_str() {
             "pdf" => "PDF",
+            e if background::EXTS.contains(&e) => KIND_IMAGE,
             "pptx" | "ppt" | "ppsx" | "pps" => "PPTX",
             e if VIDEO_EXTS.contains(&e) => "ВИДЕО",
             _ => {
-                self.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX, видео или музыка)");
+                self.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX, картинка, видео или музыка)");
                 return;
             }
         };
@@ -1119,6 +1215,24 @@ impl App {
                     }
                 }
                 Out::ShowEsc => self.esc_press(),
+                Out::Image { gen, result } => {
+                    if let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) {
+                        match result {
+                            Ok(frames) if !frames.is_empty() => s.kind = ShowKind::Image(Some(background::Background::new(ctx, frames))),
+                            Ok(_) => {}
+                            Err(e) => self.status = format!("Картинка: {e}"),
+                        }
+                    }
+                }
+                Out::Background { gen, result } => {
+                    if gen == self.bg_gen {
+                        match result {
+                            Ok(frames) if !frames.is_empty() => self.bg = Some(background::Background::new(ctx, frames)),
+                            Ok(_) => {}
+                            Err(e) => self.status = format!("Фон: {e}"),
+                        }
+                    }
+                }
                 Out::Audio(ev) => {
                     self.dirty |= self.player.on_event(ev);
                     if let Some(m) = self.player.message.take() {
@@ -1207,6 +1321,9 @@ impl App {
                     if self.items.is_empty() && self.player.tracks.is_empty() {
                         self.load_list(ctx);
                     }
+                    // Файлы из `--add` — после восстановления списка (иначе он не восстановился бы).
+                    let add = std::mem::take(&mut self.pending_add);
+                    self.add_files(add, ctx);
                     self.dirty = true;
                     self.start_collector();
                     self.stage = true; // на мониторе показа сервера сразу выводим фон
@@ -1223,6 +1340,12 @@ impl App {
                     if self.server.is_some() {
                         self.apply(cmd);
                     }
+                }
+                SrvEvent::Background { name, path } => {
+                    if self.server.is_some() {
+                        self.set_background(&path, &name);
+                    }
+                    let _ = std::fs::remove_file(&path); // копия уже в папке настроек
                 }
                 SrvEvent::File { name, path } => {
                     if self.server.is_some() {
@@ -1616,7 +1739,8 @@ impl App {
         ui.horizontal(|ui| {
             if btn(ui, "➕ Добавить", BLUE).clicked() {
                 if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("Презентации, видео и музыка", &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &VIDEO_EXTS[..], &AUDIO_EXTS[..]].concat())
+                    .add_filter("Презентации, картинки, видео и музыка", &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &background::EXTS[..], &VIDEO_EXTS[..], &AUDIO_EXTS[..]].concat())
+                    .add_filter("Картинки", &background::EXTS)
                     .add_filter("Музыка", &AUDIO_EXTS)
                     .pick_files()
                 {
@@ -1748,8 +1872,13 @@ impl App {
             ];
             for (scr, cmd, label, tip) in screens {
                 let on = !active && view.screen == scr;
-                if btn(ui, label, if on { BLUE } else { GRAY }).on_hover_text(tip).clicked() {
+                let tip = if scr == Screen::Background { format!("{tip}. Правый щелчок — выбрать картинку фона") } else { tip.to_string() };
+                let r = btn(ui, label, if on { BLUE } else { GRAY }).on_hover_text(tip);
+                if r.clicked() {
                     self.act(cmd);
+                }
+                if scr == Screen::Background {
+                    r.context_menu(|ui| self.background_menu(ui, &view.background));
                 }
             }
             if active && view.video.is_none() {
@@ -1840,6 +1969,18 @@ impl App {
     /// Сколько мс назад снято состояние таймера: у клиента — с прихода состояния сервера.
     fn timer_extra(&self) -> u64 {
         if self.connected { self.remote_at.elapsed().as_millis() as u64 } else { 0 }
+    }
+
+    /// Кнопки «Выбрать…» и «Стандартный» (во вкладке «Сеть» и в меню кнопки «Фон»).
+    fn background_menu(&mut self, ui: &mut egui::Ui, current: &str) {
+        if ui.button("Выбрать фон…").clicked() {
+            ui.close_menu();
+            self.pick_background();
+        }
+        if ui.add_enabled(!current.is_empty(), egui::Button::new("Стандартный фон")).clicked() {
+            ui.close_menu();
+            self.act(Cmd::BackgroundReset);
+        }
     }
 
     /// Превью у оператора: миниатюры предыдущего, текущего и следующего слайда.
@@ -2168,7 +2309,7 @@ impl App {
                             (format!("{} · {t}", it.kind), c)
                         } else if is_active {
                             (format!("{} · слайд {}/{}", it.kind, view.page + 1, view.pages), GREEN)
-                        } else if it.pages == 0 {
+                        } else if it.pages == 0 || it.kind == KIND_IMAGE {
                             (it.kind.clone(), GRAY)
                         } else {
                             (format!("{} · {} стр.", it.kind, it.pages), GRAY)
@@ -2288,6 +2429,17 @@ impl App {
             })
             .response
             .on_hover_text("На какой монитор сервера выводить фон, часы, PDF, видео и PowerPoint: основной или любой из подключённых");
+
+            // Фон экрана показа — у клиента меняется на сервере.
+            ui.add_space(8.0);
+            let current = self.view().background;
+            ui.horizontal(|ui| {
+                ui.label("Фон экрана показа:");
+                ui.label(RichText::new(if current.is_empty() { "стандартный" } else { current.as_str() }).strong());
+                self.background_menu(ui, &current);
+            })
+            .response
+            .on_hover_text("Картинка (PNG, JPG, BMP) или анимация (GIF, анимированные WebP и PNG). Копируется в папку настроек сервера; прежний выбранный фон заменяется");
 
             // Резервный сервер — просто настройка, менять можно и во время подключения.
             ui.add_space(8.0);
@@ -2415,13 +2567,29 @@ impl App {
             return;
         }
         if !self.bg_checked {
+            // Фон перечитывается при каждом появлении сцены и после смены; пока грузится — прежний.
             self.bg_checked = true;
-            self.bg = load_background(ctx);
+            self.bg_gen += 1;
+            let (gen, tx, c) = (self.bg_gen, self.out_tx.clone(), ctx.clone());
+            let max_side = ctx.input(|i| i.max_texture_side) as u32;
+            std::thread::spawn(move || {
+                let _ = tx.send(Out::Background { gen, result: background::load(max_side) });
+                c.request_repaint();
+            });
         }
+        // Анимация фона — только пока он виден (на прошлом кадре был на экране).
+        let bg_next = if self.bg_shown { self.bg.as_mut().and_then(background::Background::tick) } else { None };
+        // Под слайд-шоу PowerPoint и под играющим видео фона не видно — анимацию не двигаем.
+        let bg_hidden = self.show.as_ref().is_some_and(|s| match &s.kind {
+            ShowKind::Ppt(p) => matches!(p.phase, PptPhase::Lowered(_) | PptPhase::Shown),
+            ShowKind::Video(v) => matches!(v.state, VideoState::Playing | VideoState::Paused),
+            ShowKind::Pdf(_) | ShowKind::Image(_) => false,
+        });
+        let mut bg_drawn = false;
         let pdf = match &self.show {
             Some(s) => match &s.kind {
                 ShowKind::Pdf(pdf) => Some((s.id, s.page, s.pages, pdf.clone())),
-                ShowKind::Ppt(_) | ShowKind::Video(_) => None,
+                ShowKind::Ppt(_) | ShowKind::Video(_) | ShowKind::Image(_) => None,
             },
             None => None,
         };
@@ -2430,6 +2598,14 @@ impl App {
         if !hold.is_zero() {
             ctx.request_repaint_after(hold);
         }
+        // Картинка, открытая как презентация (анимация — по своим кадрам).
+        let (img_tex, img_next) = match self.show.as_mut().map(|s| &mut s.kind) {
+            Some(ShowKind::Image(Some(b))) => {
+                let next = if hold.is_zero() { b.tick() } else { None };
+                (Some(b.texture().clone()), next)
+            }
+            _ => (None, None),
+        };
         let view = self.local_state();
         let windowed = self.cfg.windowed;
         let top = !windowed && self.show.as_ref().is_none_or(Show::stage_on_top);
@@ -2458,7 +2634,8 @@ impl App {
         let mut repaint: Option<Duration> = None;
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
-        let (textures, last_tex, error, bg, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.bg, &self.failed);
+        let bg = self.bg.as_ref().map(background::Background::texture);
+        let (textures, last_tex, error, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.failed);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
             if sent.is_none_or(|(_, fs)| fs == windowed) {
@@ -2512,6 +2689,9 @@ impl App {
                     // До первой готовой страницы новой презентации виден фон.
                     page_tex = tex.or(last_tex.clone()).filter(|_| hold.is_zero());
                 }
+                if page_tex.is_none() {
+                    page_tex = img_tex.clone().filter(|_| hold.is_zero());
+                }
                 let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 match page_tex {
                     Some(t) => {
@@ -2527,6 +2707,7 @@ impl App {
                             let k = (rect.width() / ts.x).max(rect.height() / ts.y);
                             let r = egui::Rect::from_center_size(rect.center(), ts * k);
                             ui.painter().with_clip_rect(rect).image(t.id(), r, uv, Color32::WHITE);
+                            bg_drawn = true;
                         }
                         None => {
                             ui.painter().rect_filled(rect, 0.0, STAGE_BG);
@@ -2547,6 +2728,19 @@ impl App {
         if let Some(d) = repaint {
             ctx.request_repaint_after(d);
         }
+        if let Some(d) = img_next {
+            ctx.request_repaint_after(d);
+        }
+        // Анимированный фон: следующий кадр — в свой срок; фон только что показался — сразу.
+        let bg_drawn = bg_drawn && !bg_hidden;
+        if bg_drawn {
+            match bg_next {
+                Some(d) => ctx.request_repaint_after(d),
+                None if !self.bg_shown && self.bg.as_ref().is_some_and(background::Background::animated) => ctx.request_repaint(),
+                None => {}
+            }
+        }
+        self.bg_shown = bg_drawn;
         // Уровень окна сцены дублируем напрямую через Windows: при смене, а пока PowerPoint
         // готовит показ за сценой — каждый кадр (его окно не должно вылезти поверх фона).
         let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
@@ -2554,6 +2748,9 @@ impl App {
         // и не получала его обратно — тогда подготовленное видео оказывалось над фоном.
         if !windowed {
             ppt::stage_topmost(top);
+        }
+        if self.show.as_ref().is_some_and(Show::video_on_screen) {
+            video::stage_under_video(ppt::STAGE_TITLE);
         }
         if ppt_loading {
             ctx.request_repaint_after(Duration::from_millis(15));
@@ -2590,6 +2787,26 @@ impl App {
         }
     }
 
+    /// Пока на мониторе главного окна сцена (фон, презентации, видео), главное окно свёрнуто —
+    /// чтобы не проскакивало между открытиями и закрытиями окон показа. Сцену убрали (двойной Esc
+    /// на фоне) — окно разворачивается. Сцена на другом мониторе или «в окне» — окно не трогаем.
+    /// Действуем только при смене: если оператор сам развернул окно, оно так и останется.
+    fn minimize_for_stage(&mut self, ctx: &egui::Context) {
+        let stage = self.stage && !self.connected && !self.cfg.windowed;
+        if stage && !self.main_minimized && !self.stage_up {
+            let same = display::target(&self.cfg.monitor).is_some_and(|m| display::window_on(self.main_hwnd, m.rect));
+            if same {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(true));
+                self.main_minimized = true;
+            }
+        } else if !stage && self.main_minimized {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            self.main_minimized = false;
+        }
+        self.stage_up = stage;
+    }
+
     /// Esc на сцене или в слайд-шоу PowerPoint. Одиночное нажатие ничего не делает.
     /// Двойное: закрывает презентацию, а если её нет — убирает сцену с фоном.
     fn esc_press(&mut self) {
@@ -2610,24 +2827,12 @@ impl App {
     }
 }
 
-/// Картинка фона: background.png / .jpg рядом с exe, иначе вшитая assets/background.png. Не удалось — None, сцена будет залита цветом.
-fn load_background(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    // Файл рядом с exe заменяет вшитую картинку (можно поменять фон без пересборки).
-    let file = BG_FILES.iter().map(|n| app_dir().join(n)).find(|p| p.is_file()).and_then(|p| image::open(p).ok());
-    let img = file.or_else(|| image::load_from_memory(include_bytes!("../assets/background.png")).ok())?;
-    let max = ctx.input(|i| i.max_texture_side).min(8192) as u32;
-    let img = if img.width() > max || img.height() > max { img.resize(max, max, image::imageops::FilterType::Triangle) } else { img };
-    let rgba = img.to_rgba8();
-    let size = [rgba.width() as usize, rgba.height() as usize];
-    Some(ctx.load_texture("background", egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), egui::TextureOptions::LINEAR))
-}
-
 /// Справка: разделы и строки «что — как».
 const HELP: &[(&str, &[(&str, &str)])] = &[
     ("С чего начать", &[
         ("Сервер", "Компьютер, который выводит показ: «Сеть», затем «Запустить сервер». На мониторе показа сразу появляется фон."),
         ("Клиент", "Компьютер оператора: «Сеть», затем выбрать сервер из списка (или ввести IP, порт, пароль) и нажать «Подключиться». Дальше всё, что вы делаете, выполняется на сервере."),
-        ("Добавить файлы", "Кнопка «Добавить» или перетащить файлы в окно. PDF, PowerPoint (pptx, ppt, ppsx, pps), видео (mp4, mov, mkv, webm, avi, wmv и др.). У клиента файлы уходят на сервер."),
+        ("Добавить файлы", "Кнопка «Добавить» или перетащить файлы в окно. PDF, PowerPoint (pptx, ppt, ppsx, pps), картинки (png, jpg, bmp, gif, webp — открываются как презентация из одного слайда, анимированная GIF движется), видео (mp4, mov, mkv, webm, avi, wmv и др.). У клиента файлы уходят на сервер."),
         ("Открыть", "Двойной щелчок по файлу, кнопка «Показать» или Enter по выбранному. Shift+1…9 — файл с этим номером в списке."),
         ("Порядок", "«Вверх» / «Вниз» двигают выбранный файл, «Удалить» убирает его, «Очистить» — весь список. Список сервера сохраняется и после перезапуска."),
     ]),
@@ -2679,7 +2884,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Настройки сервера", &[
         ("Монитор для показа", "«Сеть», затем «Монитор для показа»: основной или любой из подключённых (на компьютере с одним монитором — он же). Отключили выбранный — показ идёт на основном."),
         ("Автозапуск", "Галочка «Запускать сервер при входе в Windows»: сервер стартует сам и перезапускается при сбое или зависании."),
-        ("Своя картинка фона", "Положите background.png (или .jpg) рядом с программой — она заменит встроенный фон."),
+        ("Фон экрана показа", "Вкладка «Сеть» или правый щелчок по кнопке «Фон»: «Выбрать фон…» — картинка (PNG, JPG, BMP) или анимация (GIF, анимированные WebP и PNG). С клиента она уходит на сервер. Новый фон заменяет прежний; «Стандартный фон» — вернуть встроенный. Видео фоном не ставится — сделайте из ролика GIF любым конвертером (лучше до 1280 точек по ширине и 10–20 секунд)."),
         ("Брандмауэр", "При первом запуске сервера Windows спросит разрешение — разрешите, иначе клиенты с других компьютеров не подключатся."),
         ("Порт и пароль", "По умолчанию 14999 и default_password; должны совпадать на сервере и клиенте."),
     ]),
@@ -2852,6 +3057,7 @@ impl eframe::App for App {
         });
 
         self.tick_ppt(ctx);
+        self.minimize_for_stage(ctx);
         ppt::grab_esc(self.show.as_ref().is_some_and(|s| matches!(s.kind, ShowKind::Ppt(_))));
         if !self.connected {
             self.stage_window(ctx);
@@ -2992,7 +3198,8 @@ mod tests {
                 }
             }
         };
-        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
         c.send(CliReq::Cmd(Cmd::Clear)); // список на сервере переживает перезапуск — начинаем с чистого
         wait("cleared", &|s| s.items.is_empty());
         for f in &files {
@@ -3186,6 +3393,39 @@ mod tests {
         c.send(CliReq::Cmd(Cmd::AudioMode { list: true, repeat: false }));
         c.send(CliReq::Cmd(Cmd::AudioVolume { volume: 100 }));
         wait("restore mode", 10, &|a| a.list && a.volume == 100);
+    }
+
+    /// Фон сцены с клиента: TEST_BG="картинка.gif" (загрузить как фон) или без неё — вернуть стандартный.
+    /// TEST_PORT — порт сервера. cargo test --release e2e_background -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_background() {
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let (tx, rx) = channel();
+        let c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
+        let t0 = Instant::now();
+        let wait = |what: &str, f: &dyn Fn(&StateMsg) -> bool| loop {
+            match rx.recv_timeout(Duration::from_secs(30)).unwrap_or_else(|_| panic!("timeout: {what}")) {
+                CliEvent::Closed(r) => panic!("closed: {r}"),
+                CliEvent::UploadErr { msg, .. } => panic!("upload: {msg}"),
+                CliEvent::State(s) if f(&s) => {
+                    println!("{:>6} ms OK {what}: фон «{}», сообщение «{}»", t0.elapsed().as_millis(), s.background, s.message);
+                    return;
+                }
+                _ => {}
+            }
+        };
+        match std::env::var("TEST_BG").ok().map(PathBuf::from) {
+            Some(path) => {
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                c.send(CliReq::UploadBackground(path));
+                wait("background set", &|s| s.background == name);
+            }
+            None => {
+                c.send(CliReq::Cmd(Cmd::BackgroundReset));
+                wait("background reset", &|s| s.background.is_empty());
+            }
+        }
     }
 
     /// Отправить одну команду (JSON) на сервер TEST_PORT: TEST_CMD='{"c":"Clock"}'
@@ -3396,7 +3636,8 @@ mod tests {
                 }
             }
         };
-        let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
         c.send(CliReq::Cmd(Cmd::Clear)); // список на сервере переживает перезапуск — начинаем с чистого
         wait("cleared", &|s| s.items.is_empty());
         c.send(CliReq::Upload(file));
