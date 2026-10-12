@@ -31,11 +31,6 @@ fn log(msg: &str) {
     }
 }
 
-/// «ГГГГ-ММ-ДД ЧЧ:ММ:СС» по местному времени — сейчас.
-pub fn local_stamp() -> String {
-    local_time(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
-}
-
 /// «ГГГГ-ММ-ДД ЧЧ:ММ:СС» по местному времени.
 fn local_time(_unix: u64) -> String {
     #[cfg(windows)]
