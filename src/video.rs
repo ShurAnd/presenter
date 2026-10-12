@@ -3,7 +3,9 @@
 //! который есть в самой Windows. Ничего докладывать не нужно.
 //!
 //! Видео играет в собственном окне на весь экран. При открытии окно лежит под сценой с фоном,
-//! а видео загружено и стоит на паузе — поэтому по команде «старт» оно начинается сразу:
+//! а видео загружено и стоит на паузе — поэтому по команде «старт» оно начинается сразу.
+//! Доиграло — окно снова под сценой, видео в начале на паузе: повторный «старт» тоже сразу.
+//! Сам «старт»:
 //! окно выходит наверх и включается воспроизведение, сцена опускается прямо под него
 //! (`stage_under_video`, как с PowerPoint). Окно не забирает фокус — клавиши по-прежнему ловит сцена.
 //!
@@ -19,7 +21,8 @@ pub enum VideoEvent {
     Ready(f64),
     /// Позиция и длительность в секундах; идёт ли воспроизведение.
     Pos { pos: f64, dur: f64, playing: bool },
-    /// Видео доиграло до конца.
+    /// Видео доиграло до конца. Окно уже ушло под сцену, видео перемотано в начало и стоит на паузе —
+    /// снова готово к запуску (без повторной загрузки).
     Ended,
     Error(String),
 }
@@ -137,6 +140,8 @@ mod win {
         fn play(&mut self);
         fn toggle(&mut self);
         fn seek(&mut self, secs: f64, relative: bool);
+        /// После конца: пауза и в начало — снова готово к запуску.
+        fn rearm(&mut self);
     }
 
     // ------------------------------------------------------------ libmpv
@@ -206,6 +211,12 @@ mod win {
 
         fn seek(&mut self, secs: f64, relative: bool) {
             let _ = self.mpv.command(&["seek", &format!("{secs:.3}"), if relative { "relative" } else { "absolute" }]);
+        }
+
+        fn rearm(&mut self) {
+            // keep-open: mpv стоит на последнем кадре; перемотка в начало сбрасывает «конец файла».
+            let _ = self.mpv.set("pause", "yes");
+            let _ = self.mpv.command(&["seek", "0", "absolute"]);
         }
     }
 
@@ -296,6 +307,17 @@ mod win {
                 let base = if relative { secs(self.player.GetPosition(&MFP_POSITIONTYPE_100NS)) } else { 0.0 };
                 let to = (base + d).clamp(0.0, (dur - 0.5).max(0.0));
                 let _ = self.player.SetPosition(&MFP_POSITIONTYPE_100NS, &PROPVARIANT::from((to * 1e7) as i64));
+            }
+        }
+
+        fn rearm(&mut self) {
+            // В конце MFPlay «остановлен»: в начало и пауза (выводит первый кадр). Конец снова
+            // засчитаем, только когда видео опять поиграет.
+            self.played = false;
+            self.started = None;
+            unsafe {
+                let _ = self.player.SetPosition(&MFP_POSITIONTYPE_100NS, &PROPVARIANT::from(0i64));
+                let _ = self.player.Pause();
             }
         }
     }
@@ -390,7 +412,7 @@ mod win {
 
     unsafe fn event_loop(engine: &mut dyn Engine, hwnd: HWND, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
         let timer = SetTimer(None, 0, TICK_MS, None);
-        let (mut ready, mut started, mut ended) = (false, false, false);
+        let (mut ready, mut started) = (false, false);
         let mut last_pos: Option<(u32, u32, bool)> = None;
         let mut ticks = 0u32;
         let mut msg = MSG::default();
@@ -438,8 +460,13 @@ mod win {
                     last_pos = Some(now);
                     on_event(VideoEvent::Pos { pos: t.pos, dur: t.dur, playing: t.playing });
                 }
-                if started && !ended && t.eof {
-                    ended = true;
+                // Доиграло: окно — под сцену (зритель видит фон), видео — в начало на паузу.
+                // Следующий «старт» запускает его сразу, без повторной загрузки.
+                if started && t.eof {
+                    started = false;
+                    let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    engine.rearm();
+                    last_pos = None;
                     on_event(VideoEvent::Ended);
                 }
                 continue;

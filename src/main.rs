@@ -1262,9 +1262,11 @@ impl App {
                             }
                             (v.pos, v.dur, v.state) = (pos, dur, state);
                         }
-                        // Доиграло — возвращаем фон.
+                        // Доиграло — на экране фон, а видео остаётся загруженным, в начале:
+                        // пробел или «Старт» запускают его снова сразу. Закрыть — «Закрыть показ».
                         video::VideoEvent::Ended => {
-                            self.close_show();
+                            (v.state, v.pos) = (VideoState::Armed, 0.0);
+                            self.status = "Видео доиграло — снова готово к запуску (пробел или «Старт»)".into();
                             self.dirty = true;
                         }
                         video::VideoEvent::Error(e) => {
@@ -2872,7 +2874,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("PowerPoint и видео", &[
         ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
-        ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон."),
+        ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон, а видео остаётся готовым: пробел — показать ещё раз с начала, без загрузки. Убрать видео — «Закрыть показ»."),
         ("Закрыть показ", "Кнопка «Закрыть показ», Shift+0 или двойной Esc на экране показа. На экране показа остаётся фон."),
     ]),
     ("Сеть, состояние сервера, резерв", &[
@@ -3655,6 +3657,13 @@ mod tests {
         std::thread::sleep(hold);
         c.send(CliReq::Cmd(Cmd::Play));
         wait("playing", &|s| s.video.as_ref().is_some_and(|v| v.state == VideoState::Playing));
-        wait("ended", &|s| s.active.is_none());
+        // Доиграло — остаётся открытым и снова готово; повторный старт — без загрузки.
+        wait("rearmed", &|s| s.active == Some(id) && s.video.as_ref().is_some_and(|v| v.state == VideoState::Armed));
+        std::thread::sleep(hold);
+        c.send(CliReq::Cmd(Cmd::Play));
+        wait("playing again", &|s| s.video.as_ref().is_some_and(|v| v.state == VideoState::Playing));
+        wait("rearmed again", &|s| s.active == Some(id) && s.video.as_ref().is_some_and(|v| v.state == VideoState::Armed));
+        c.send(CliReq::Cmd(Cmd::Close));
+        wait("closed", &|s| s.active.is_none());
     }
 }
