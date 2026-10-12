@@ -7,6 +7,8 @@ mod health;
 mod net;
 mod player;
 mod ppt;
+mod rec_panel;
+mod record;
 mod render;
 mod screen;
 #[cfg(windows)]
@@ -98,6 +100,12 @@ struct Config {
     audio_volume: u8,
     /// Выбранный фон сцены — имя исходного файла (для показа); пусто — стандартный.
     background: String,
+    /// Запись (на этом компьютере): видео- и звуковое устройство («-» — без него, пусто — подобрать),
+    /// формат видео (подпись, пусто — лучший) и папка (пусто — «Записи» в рабочей папке).
+    rec_video: String,
+    rec_audio: String,
+    rec_mode: String,
+    rec_dir: String,
 }
 
 /// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
@@ -123,6 +131,10 @@ impl Default for Config {
             audio_repeat: false,
             audio_volume: 100,
             background: String::new(),
+            rec_video: String::new(),
+            rec_audio: String::new(),
+            rec_mode: String::new(),
+            rec_dir: String::new(),
         }
     }
 }
@@ -152,6 +164,7 @@ impl SavedServer {
 enum Tab {
     List,
     Player,
+    Record,
     Net,
 }
 
@@ -417,6 +430,8 @@ struct App {
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
     help_open: bool,
+    /// Вкладка «Запись» (запись идёт на этом компьютере).
+    rec: rec_panel::RecUi,
 
     // Сцена — полноэкранное окно с фоном, на котором идут показы
     stage: bool,
@@ -558,6 +573,7 @@ impl App {
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             help_open: false,
+            rec: rec_panel::RecUi::new(),
             stage: false,
             stage_sent: None,
             bg: None,
@@ -585,7 +601,13 @@ impl App {
             cli_tx,
             cli_rx,
             remote: StateMsg::default(),
-            tab: if std::env::args().any(|a| a == "--net") { Tab::Net } else { Tab::List },
+            tab: if std::env::args().any(|a| a == "--net") {
+                Tab::Net
+            } else if std::env::args().any(|a| a == "--record") {
+                Tab::Record
+            } else {
+                Tab::List
+            },
             selected: None,
             net_status: String::new(),
             status: String::new(),
@@ -2060,7 +2082,7 @@ impl App {
     /// Вкладки «Презентации / Плеер / Сеть»; справа — что играет плеер (видно с любой вкладки).
     fn tab_row(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(Tab::List, "Презентации"), (Tab::Player, "Плеер"), (Tab::Net, "Сеть")] {
+            for (tab, label) in [(Tab::List, "Презентации"), (Tab::Player, "Плеер"), (Tab::Record, "Запись"), (Tab::Net, "Сеть")] {
                 let on = self.tab == tab;
                 let text = RichText::new(label).size(14.0).strong().color(if on { Color32::WHITE } else { Color32::from_gray(0x44) });
                 let b = egui::Button::new(text).fill(if on { BLUE } else { Color32::from_gray(0xe4) }).corner_radius(5.0).min_size(egui::vec2(96.0, 0.0));
@@ -2071,12 +2093,26 @@ impl App {
                     self.tab = tab;
                 }
             }
-            if let Some((text, color)) = now_playing(&view.audio) {
+            let playing = now_playing(&view.audio);
+            let rec = self.rec_badge();
+            if playing.is_some() || rec.is_some() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(cbutton("■", RED)).on_hover_text("Остановить музыку (плавно)").clicked() {
-                        self.act(Cmd::AudioStop);
+                    // Идёт запись — видно с любой вкладки; щелчок открывает «Запись».
+                    if let Some((text, color)) = rec {
+                        if ui.add(egui::Label::new(RichText::new(text).color(color).strong()).sense(egui::Sense::click())).on_hover_text("Вкладка «Запись»").clicked() {
+                            self.tab = Tab::Record;
+                        }
+                        // Кружок рисуем сами: в шрифте egui нет символа «●».
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 6.0, color);
+                        ui.add_space(10.0);
                     }
-                    ui.add(egui::Label::new(RichText::new(text).color(color).strong()).truncate());
+                    if let Some((text, color)) = playing {
+                        if ui.add(cbutton("■", RED)).on_hover_text("Остановить музыку (плавно)").clicked() {
+                            self.act(Cmd::AudioStop);
+                        }
+                        ui.add(egui::Label::new(RichText::new(text).color(color).strong()).truncate());
+                    }
                 });
             }
         });
@@ -2888,6 +2924,15 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Брандмауэр", "При первом запуске сервера Windows спросит разрешение — разрешите, иначе клиенты с других компьютеров не подключатся."),
         ("Порт и пароль", "По умолчанию 14999 и default_password; должны совпадать на сервере и клиенте."),
     ]),
+    ("Запись мероприятия", &[
+        ("Где пишется", "На том компьютере, где нажали «Начать запись» (обычно у оператора), — не на сервере. По сети ничего не передаётся."),
+        ("Источники", "Вкладка «Запись»: видео — карта захвата HDMI или камера, звук — звук той же карты, пульт в линейный вход или микрофон. Карту захвата программа выбирает сама, если она подключена. «Без видео» — запись только звука."),
+        ("Проверить сигнал", "Картинка и уровень звука без записи в файл — проверить перед началом. «Нет звука» — 10 секунд тишины."),
+        ("Запись", "«Начать запись» / «Остановить запись». Пока идёт запись, справа от вкладок — красное «Запись» и время (видно с любой вкладки). Видео сжимает видеокарта, если умеет, процессор почти не занят."),
+        ("Файлы", "Папка «Записи» рядом с программой (можно выбрать другую). Имя — дата и время начала. Во время записи файл — MKV (не пропадёт при сбое), после остановки — MP4 (только звук — M4A)."),
+        ("Устройство занято", "Карту захвата одновременно может держать только одна программа: закройте OBS (или уберите в нём этот источник)."),
+        ("Выход", "Закрыть программу во время записи — она спросит, остановить ли запись, и закроется, когда файл сохранится."),
+    ]),
 ];
 
 /// Миниатюра нужна: предыдущий слайд, текущий и два следующих (при листании назад не ждём).
@@ -3008,6 +3053,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui_frames.fetch_add(1, Ordering::SeqCst);
         self.poll(ctx);
+        self.poll_rec(ctx);
         if let Some((n, at)) = self.reconnect {
             if self.client.is_none() && Instant::now() >= at {
                 self.reconnect = Some((n + 1, Instant::now() + Duration::from_secs(3600)));
@@ -3041,6 +3087,7 @@ impl eframe::App for App {
         self.alarm_bar(ctx);
         self.health_window(ctx);
         self.help_window(ctx);
+        self.rec_close_guard(ctx);
         egui::TopBottomPanel::bottom("bottom").frame(margin).show(ctx, |ui| self.bottom_bar(ui, &view));
         // Превью — над нижней панелью, пока открыта презентация (у видео превью нет).
         if self.tab == Tab::List && view.active.is_some() && view.video.is_none() {
@@ -3052,6 +3099,7 @@ impl eframe::App for App {
             match self.tab {
                 Tab::List => self.list(ui, &view),
                 Tab::Player => self.player_panel(ui, &view),
+                Tab::Record => self.record_panel(ui),
                 Tab::Net => self.network_panel(ui),
             }
         });
@@ -3073,6 +3121,8 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Запись (или проверка сигнала) — дописать файл, не бросать FFmpeg.
+        self.rec.finish();
         self.save_cfg();
         // Список и присланные файлы остаются — при следующем запуске список восстановится.
         self.save_list();
