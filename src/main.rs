@@ -166,6 +166,9 @@ const SLIDES_DIR: &str = "slides";
 struct SavedItem {
     name: String,
     src: PathBuf,
+    /// Видео: повтор по кругу.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    repeat: bool,
 }
 
 /// Автопереподключение: попыток и пауза между ними (всего около 30 с).
@@ -270,6 +273,8 @@ struct Item {
     status: Status,
     /// Папка, куда мост к PowerPoint сохраняет слайды PPTX картинками (для превью).
     slides: Option<PathBuf>,
+    /// Видео: по окончании начинать заново (значок повтора в строке списка).
+    repeat: bool,
 }
 
 enum ShowKind {
@@ -638,6 +643,7 @@ impl App {
                         Status::Ready => String::new(),
                         Status::Error(e) => format!("ошибка: {e}"),
                     },
+                    repeat: i.repeat,
                 })
                 .collect(),
             active: self.show.as_ref().map(|s| s.id),
@@ -676,7 +682,8 @@ impl App {
                 if !matches!(it.status, Status::Ready) {
                     return;
                 }
-                let (pages, pdf, src, name, is_video, slides) = (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone(), it.kind == "ВИДЕО", it.slides.clone());
+                let (pages, pdf, src, name, is_video, slides, repeat) =
+                    (it.pages, it.pdf.clone(), it.src.clone(), it.name.clone(), it.kind == "ВИДЕО", it.slides.clone(), it.repeat);
                 let is_image = it.kind == KIND_IMAGE;
                 // Прежний показ закрываем: на экране остаётся сцена с фоном,
                 // новый показ появится на ней, только когда будет готов.
@@ -698,7 +705,7 @@ impl App {
                     None if is_video => {
                         let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
                         let rect = if self.cfg.windowed { None } else { display::target(&self.cfg.monitor).map(|m| m.rect) };
-                        let player = video::Video::start(&src, self.cfg.windowed, rect, move |ev| {
+                        let player = video::Video::start(&src, self.cfg.windowed, rect, repeat, move |ev| {
                             let _ = tx.send(Out::Video { gen, ev });
                             ctx.request_repaint();
                         });
@@ -813,6 +820,15 @@ impl App {
                 if let Some(pos) = self.items.iter().position(|i| i.id == id) {
                     let it = self.items.remove(pos);
                     self.delete_files(&it);
+                }
+            }
+            Cmd::VideoRepeat { id, on } => {
+                if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
+                    it.repeat = on;
+                }
+                // Видео уже открыто — повтор меняется сразу, без перезапуска.
+                if let Some(ShowKind::Video(v)) = self.show.as_ref().filter(|s| s.id == id).map(|s| &s.kind) {
+                    v.player.set_repeat(on);
                 }
             }
             Cmd::Move { id, up } => {
@@ -1009,8 +1025,8 @@ impl App {
         if !self.server_online {
             return;
         }
-        let list: Vec<SavedItem> = self.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone() }).collect();
-        let audio: Vec<SavedItem> = self.player.tracks.iter().map(|t| SavedItem { name: t.name.clone(), src: t.src.clone() }).collect();
+        let list: Vec<SavedItem> = self.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone(), repeat: i.repeat }).collect();
+        let audio: Vec<SavedItem> = self.player.tracks.iter().map(|t| SavedItem { name: t.name.clone(), src: t.src.clone(), repeat: false }).collect();
         let (list_path, audio_path) = (self.list_path(), self.audio_path());
         for (list, path, saved) in [(list, list_path, &mut self.saved_list), (audio, audio_path, &mut self.saved_audio)] {
             let Ok(text) = serde_json::to_string_pretty(&list) else { continue };
@@ -1068,7 +1084,13 @@ impl App {
         let mut missing = 0;
         for it in list.into_iter().chain(audio) {
             if it.src.is_file() {
+                let before = self.items.len();
                 self.add_local(it.src, Some(it.name), ctx);
+                if self.items.len() > before {
+                    if let Some(last) = self.items.last_mut() {
+                        last.repeat = it.repeat;
+                    }
+                }
             } else {
                 missing += 1;
             }
@@ -1133,7 +1155,7 @@ impl App {
         self.next_id += 1;
         let name = name.unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
         let slides = (kind == "PPTX").then(|| self.slides_dir(&path));
-        self.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing, slides });
+        self.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing, slides, repeat: false });
         if kind == "PPTX" {
             // PowerPoint запускаем заранее (скрыто) — к показу он уже будет готов.
             self.ppt_host.prewarm();
@@ -2317,7 +2339,19 @@ impl App {
                             (format!("{} · {} стр.", it.kind, it.pages), GRAY)
                         };
                         let info: String = if info.chars().count() > 60 { info.chars().take(60).chain("…".chars()).collect() } else { info };
-                        p.text(rect.right_center() - egui::vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, info, egui::FontId::proportional(12.0), col);
+                        // У видео справа — значок повтора; текст состояния сдвигается левее.
+                        let is_video = it.kind == "ВИДЕО";
+                        let right = if is_video { 44.0 } else { 8.0 };
+                        p.text(rect.right_center() - egui::vec2(right, 0.0), egui::Align2::RIGHT_CENTER, info, egui::FontId::proportional(12.0), col);
+                        if is_video {
+                            let r = egui::Rect::from_center_size(rect.right_center() - egui::vec2(22.0, 0.0), egui::vec2(28.0, 22.0));
+                            let icon = ui.interact(r, ui.id().with(("repeat", it.id)), egui::Sense::click());
+                            repeat_icon(ui.painter(), r, it.repeat, icon.hovered());
+                            let tip = if it.repeat { "Повтор включён: видео по окончании начнётся заново. Щёлкните, чтобы выключить" } else { "Повтор выключен: по окончании — фон. Щёлкните, чтобы видео шло по кругу" };
+                            if icon.on_hover_text(tip).clicked() {
+                                self.act(Cmd::VideoRepeat { id: it.id, on: !it.repeat });
+                            }
+                        }
                         let resp = if it.status.is_empty() { resp } else { resp.on_hover_text(&it.status) };
                         if resp.clicked() {
                             self.selected = Some(it.id);
@@ -2875,6 +2909,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ("PowerPoint и видео", &[
         ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
         ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон, а видео остаётся готовым: пробел — показать ещё раз с начала, без загрузки. Убрать видео — «Закрыть показ»."),
+        ("Повтор видео", "Значок круговой стрелки справа в строке видео: синий — видео идёт по кругу, после конца сразу начинается заново (фон не появляется). По умолчанию выключен; переключать можно и во время показа. Запоминается в списке сервера."),
         ("Закрыть показ", "Кнопка «Закрыть показ», Shift+0 или двойной Esc на экране показа. На экране показа остаётся фон."),
     ]),
     ("Сеть, состояние сервера, резерв", &[
@@ -2990,6 +3025,32 @@ fn level_color(level: health::Level) -> Color32 {
         health::Level::Warn => Color32::from_rgb(0xe0, 0x9a, 0x00),
         health::Level::Bad => RED,
     }
+}
+
+/// Значок повтора (круговая стрелка) — рисуем сами: символов «🔁 ↻» в шрифте egui нет.
+/// Включён — белая стрелка на синем, выключен — серая на светлом.
+fn repeat_icon(p: &egui::Painter, r: egui::Rect, on: bool, hovered: bool) {
+    let (bg, fg) = match (on, hovered) {
+        (true, _) => (BLUE, Color32::WHITE),
+        (false, true) => (Color32::from_gray(0xdd), Color32::from_gray(0x55)),
+        (false, false) => (Color32::from_gray(0xee), Color32::from_gray(0x99)),
+    };
+    p.rect_filled(r, 4.0, bg);
+    let c = r.center();
+    let rad = 6.0;
+    let stroke = egui::Stroke::new(1.8_f32, fg);
+    // Дуга почти по кругу (разрыв справа сверху) и наконечник стрелки на её конце.
+    let (a0, a1) = (-0.35_f32, 4.9_f32);
+    let pts: Vec<egui::Pos2> = (0..=24).map(|k| {
+        let a = a0 + (a1 - a0) * k as f32 / 24.0;
+        c + egui::vec2(a.cos(), -a.sin()) * rad
+    }).collect();
+    p.add(egui::Shape::line(pts, stroke));
+    let end = c + egui::vec2(a1.cos(), -a1.sin()) * rad;
+    // Касательная в конце дуги — направление движения стрелки.
+    let dir = egui::vec2(-a1.sin(), -a1.cos());
+    let side = egui::vec2(-dir.y, dir.x);
+    p.add(egui::Shape::convex_polygon(vec![end + dir * 3.5, end - dir * 1.5 + side * 3.5, end - dir * 1.5 - side * 3.5], fg, egui::Stroke::NONE));
 }
 
 fn cbutton(text: &str, color: Color32) -> egui::Button<'static> {

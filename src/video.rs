@@ -29,6 +29,7 @@ pub enum VideoEvent {
 
 enum VCmd {
     Start,
+    Repeat(bool),
     Toggle,
     Seek(f64),
     SeekTo(f64),
@@ -44,8 +45,10 @@ pub struct Video {
 
 impl Video {
     /// `rect` — монитор для показа (физические пиксели); None — основной монитор.
-    pub fn start(src: &Path, windowed: bool, rect: Option<(i32, i32, i32, i32)>, on_event: impl Fn(VideoEvent) + Send + 'static) -> Video {
+    /// `repeat` — по окончании начинать заново (иначе — под сцену и в начало, ждать «старт»).
+    pub fn start(src: &Path, windowed: bool, rect: Option<(i32, i32, i32, i32)>, repeat: bool, on_event: impl Fn(VideoEvent) + Send + 'static) -> Video {
         let (tx, rx) = channel();
+        let _ = tx.send(VCmd::Repeat(repeat));
         #[cfg(windows)]
         {
             let (id_tx, id_rx) = channel();
@@ -71,6 +74,11 @@ impl Video {
     /// Вывести видео поверх сцены и начать воспроизведение.
     pub fn play(&self) {
         self.send(VCmd::Start);
+    }
+
+    /// Повтор по кругу: включить или выключить (можно и во время воспроизведения).
+    pub fn set_repeat(&self, on: bool) {
+        self.send(VCmd::Repeat(on));
     }
 
     /// Пауза / продолжить.
@@ -142,6 +150,11 @@ mod win {
         fn seek(&mut self, secs: f64, relative: bool);
         /// После конца: пауза и в начало — снова готово к запуску.
         fn rearm(&mut self);
+        /// Повтор по кругу силами самого движка (libmpv — без паузы на стыке); `false` — не умеет,
+        /// тогда в конце перематываем и запускаем сами.
+        fn set_repeat(&mut self, _on: bool) -> bool {
+            false
+        }
     }
 
     // ------------------------------------------------------------ libmpv
@@ -217,6 +230,10 @@ mod win {
             // keep-open: mpv стоит на последнем кадре; перемотка в начало сбрасывает «конец файла».
             let _ = self.mpv.set("pause", "yes");
             let _ = self.mpv.command(&["seek", "0", "absolute"]);
+        }
+
+        fn set_repeat(&mut self, on: bool) -> bool {
+            self.mpv.set("loop-file", if on { "inf" } else { "no" }).is_ok()
         }
     }
 
@@ -412,7 +429,7 @@ mod win {
 
     unsafe fn event_loop(engine: &mut dyn Engine, hwnd: HWND, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
         let timer = SetTimer(None, 0, TICK_MS, None);
-        let (mut ready, mut started) = (false, false);
+        let (mut ready, mut started, mut repeat) = (false, false, false);
         let mut last_pos: Option<(u32, u32, bool)> = None;
         let mut ticks = 0u32;
         let mut msg = MSG::default();
@@ -421,6 +438,10 @@ mod win {
                 while let Ok(c) = rx.try_recv() {
                     match c {
                         VCmd::Quit => break 'outer,
+                        VCmd::Repeat(on) => {
+                            repeat = on;
+                            engine.set_repeat(on);
+                        }
                         VCmd::Start if ready && !started => {
                             started = true;
                             // Наверх, не отнимая фокус, — и сразу воспроизведение (сцену под окно видео опустит GUI).
@@ -462,7 +483,12 @@ mod win {
                 }
                 // Доиграло: окно — под сцену (зритель видит фон), видео — в начало на паузу.
                 // Следующий «старт» запускает его сразу, без повторной загрузки.
-                if started && t.eof {
+                if started && t.eof && repeat {
+                    // Повтор, а движок сам не умеет (MFPlay): в начало и сразу дальше, окно остаётся наверху.
+                    engine.rearm();
+                    engine.play();
+                    last_pos = None;
+                } else if started && t.eof {
                     started = false;
                     let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     engine.rearm();

@@ -67,6 +67,8 @@ pub enum Cmd {
     AudioRemove { id: u64 },
     AudioMove { id: u64, up: bool },
     AudioClear,
+    /// Видео из списка: по окончании начинать заново (значок повтора в строке списка).
+    VideoRepeat { id: u64, on: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -171,6 +173,9 @@ pub struct ItemInfo {
     pub ready: bool,
     /// Пусто, если всё в порядке; иначе текст состояния или ошибки.
     pub status: String,
+    /// Видео: по окончании начинать заново.
+    #[serde(default)]
+    pub repeat: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
