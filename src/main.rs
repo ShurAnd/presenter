@@ -184,6 +184,21 @@ struct Resume {
     since: Instant,
 }
 
+/// Добавить сервер в список сохранённых, не меняя порядок остальных. Такой адрес уже есть —
+/// обновить его на том же месте; список переполнен — уходит самый давний, но не только что добавленный.
+fn upsert_server(list: &mut Vec<SavedServer>, srv: SavedServer) {
+    let key = srv.key();
+    match list.iter_mut().find(|s| s.key() == key) {
+        Some(s) => *s = srv,
+        None => {
+            list.push(srv);
+            if list.len() > MAX_SERVERS {
+                list.remove(MAX_SERVERS - 1);
+            }
+        }
+    }
+}
+
 /// Сколько серверов помнить.
 const MAX_SERVERS: usize = 20;
 
@@ -422,6 +437,8 @@ struct App {
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
     help_open: bool,
+    /// Окно «Резервный сервер»: вводим сервер, которого ещё нет в списке.
+    reserve_form: Option<SavedServer>,
 
     // Сцена — полноэкранное окно с фоном, на котором идут показы
     stage: bool,
@@ -563,6 +580,7 @@ impl App {
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             help_open: false,
+            reserve_form: None,
             stage: false,
             stage_sent: None,
             bg: None,
@@ -1734,6 +1752,68 @@ impl App {
         self.save_cfg();
     }
 
+    /// Сервер из окна «Резервный сервер» — в список сохранённых и сразу резервным.
+    /// Такой адрес уже есть — обновляем его (название, пароль) на том же месте.
+    fn save_reserve(&mut self, srv: SavedServer) {
+        let srv = SavedServer { name: srv.name.trim().to_string(), ip: srv.ip.trim().to_string(), port: srv.port.trim().to_string(), password: srv.password };
+        let key = srv.key();
+        self.forgotten.remove(&key);
+        upsert_server(&mut self.cfg.servers, srv);
+        self.cfg.reserve = key;
+        self.save_cfg();
+    }
+
+    /// Окно ввода резервного сервера — те же поля, что у основного.
+    fn reserve_window(&mut self, ctx: &egui::Context) {
+        let Some(mut srv) = self.reserve_form.take() else { return };
+        let (mut open, mut save, mut cancel) = (true, false, false);
+        let port_ok = srv.port.trim().parse::<u16>().is_ok_and(|p| p > 0);
+        let ip_ok = !srv.ip.trim().is_empty();
+        let main_key = format!("{}:{}", self.cfg.ip.trim(), self.cfg.port.trim());
+        egui::Window::new("Резервный сервер")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("reserve_form").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
+                    ui.label("🏷 Название (необязательно):");
+                    ui.add(egui::TextEdit::singleline(&mut srv.name).hint_text("Например: Зал 2").desired_width(220.0));
+                    ui.end_row();
+                    ui.label("📡 IP адрес сервера:");
+                    ui.add(egui::TextEdit::singleline(&mut srv.ip).hint_text("Например: 192.168.1.101").desired_width(220.0));
+                    ui.end_row();
+                    ui.label("🔌 Порт:");
+                    ui.add(egui::TextEdit::singleline(&mut srv.port).hint_text("14999").desired_width(90.0));
+                    ui.end_row();
+                    ui.label("🔑 Пароль доступа:");
+                    ui.add(egui::TextEdit::singleline(&mut srv.password).password(true).desired_width(220.0));
+                    ui.end_row();
+                });
+                if !port_ok && !srv.port.trim().is_empty() {
+                    ui.label(RichText::new("Порт — число от 1 до 65535").color(RED));
+                }
+                if ip_ok && srv.key() == main_key {
+                    ui.label(RichText::new("Это адрес основного сервера — резервным должен быть другой компьютер").color(RED));
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let ok = ip_ok && port_ok;
+                    if ui.add_enabled(ok, cbutton("Сохранить", GREEN)).on_hover_text("Запомнить сервер и выбрать его резервным").clicked() {
+                        save = true;
+                    }
+                    if btn(ui, "Отмена", GRAY).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if save {
+            self.save_reserve(srv);
+        } else if open && !cancel {
+            self.reserve_form = Some(srv);
+        }
+    }
+
     fn toggle_client(&mut self, ctx: &egui::Context) {
         if self.client.is_some() {
             self.disconnect();
@@ -2500,9 +2580,13 @@ impl App {
                     self.cfg.reserve = k;
                     self.save_cfg();
                 }
+                if ui.button("Добавить…").on_hover_text("Ввести резервный сервер, которого нет в списке").clicked() {
+                    self.reserve_form = Some(SavedServer { port: "14999".into(), password: "default_password".into(), ..Default::default() });
+                }
             })
             .response
             .on_hover_text("Если с основным сервером беда, на резервный можно переключиться одной кнопкой — в красной полосе или в окне показателей");
+            self.reserve_window(&ctx);
             if !self.cfg.reserve.is_empty() {
                 let mut m = self.cfg.mirror;
                 if ui
@@ -2915,7 +2999,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ("Сеть, состояние сервера, резерв", &[
         ("Индикатор вверху", "Зелёный — норма, жёлтый — внимание, красный — проблема. Щелчок — показатели сервера: процессор, память, видеокарта, мониторы, связь."),
         ("Красная полоса", "Проблема на сервере или пропала связь. Клиент сам переподключается (до 15 попыток), можно сразу перейти на резерв."),
-        ("Резервный сервер", "«Сеть», затем «Резервный сервер». Файлы можно сразу дублировать на него. «Переключиться на резерв» откроет там тот же файл на том же слайде."),
+        ("Резервный сервер", "«Сеть», затем «Резервный сервер»: выбрать из списка или «Добавить…» — ввести название, IP, порт и пароль сервера, которого в списке ещё нет. Файлы можно сразу дублировать на него. «Переключиться на резерв» откроет там тот же файл на том же слайде."),
         ("Сохранённые серверы", "Сервер запоминается после успешного подключения. «Забыть» убирает его из списка."),
     ]),
     ("Настройки сервера", &[
@@ -3222,6 +3306,23 @@ mod tests {
         merge_servers(&mut ours, disk, &forgotten);
         let names: Vec<&str> = ours.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["Зал 2", "Зал 1", "Зал 3"]);
+    }
+
+    #[test]
+    fn upsert_server_adds_updates_and_trims() {
+        let srv = |ip: &str, name: &str| SavedServer { name: name.into(), ip: ip.into(), port: "14999".into(), password: "p".into() };
+        let mut list = vec![srv("10.0.0.1", "Зал 1")];
+        upsert_server(&mut list, srv("10.0.0.2", "Зал 2"));
+        assert_eq!(list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Зал 1", "Зал 2"]);
+        // Тот же адрес — обновление на месте, без дубля.
+        upsert_server(&mut list, srv("10.0.0.1", "Главный"));
+        assert_eq!(list.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Главный", "Зал 2"]);
+        // Переполнение: новый остаётся, уходит самый давний (последний).
+        let mut full: Vec<SavedServer> = (0..MAX_SERVERS).map(|i| srv(&format!("10.1.0.{i}"), "")).collect();
+        upsert_server(&mut full, srv("10.9.9.9", "Новый"));
+        assert_eq!(full.len(), MAX_SERVERS);
+        assert_eq!(full.last().unwrap().name, "Новый");
+        assert!(!full.iter().any(|s| s.ip == format!("10.1.0.{}", MAX_SERVERS - 1)));
     }
 
     #[test]
