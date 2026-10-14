@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
 use net::{AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
-use render::{Out, PageKey, Renderer, AUDIO_EXTS, THUMB_H, THUMB_W, VIDEO_EXTS};
+use render::{Out, PageKey, Renderer, AUDIO_EXTS, FULL_VIEW, THUMB_H, THUMB_W, VIDEO_EXTS, ZOOMS};
 use serde::{Deserialize, Serialize};
 
 const BLUE: Color32 = Color32::from_rgb(0x5b, 0xc0, 0xde);
@@ -33,6 +33,8 @@ const GRAY: Color32 = Color32::from_rgb(0x88, 0x88, 0x88);
 const OFF: Color32 = Color32::from_rgb(0x6c, 0x75, 0x7d);
 /// Вставка (фанфары) в плеере.
 const INSERT: Color32 = Color32::from_rgb(0xe0, 0x8a, 0x00);
+/// Рамка видимой части увеличенного слайда на миниатюре.
+const ZOOM_FRAME: Color32 = Color32::from_rgb(0xf0, 0x8c, 0x00);
 /// Фон сцены, если картинки фона нет.
 const STAGE_BG: Color32 = Color32::from_rgb(0x1f, 0x6f, 0xc8);
 /// Сколько ждать после «ready» от PowerPoint, прежде чем убрать сцену: слайд-шоу должно успеть отрисоваться.
@@ -363,6 +365,9 @@ struct Show {
     kind: ShowKind,
     gen: u64,
     opened: Instant,
+    /// Увеличение слайда (1 — весь слайд) и центр видимой части в долях страницы.
+    zoom: f32,
+    center: (f32, f32),
 }
 
 struct App {
@@ -437,6 +442,9 @@ struct App {
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
     help_open: bool,
+    /// Размер сцены в пикселях и пропорции (ширина / высота) текущего слайда — для увеличения.
+    stage_px: (f32, f32),
+    slide_aspect: f32,
     /// Окно «Резервный сервер»: вводим сервер, которого ещё нет в списке.
     reserve_form: Option<SavedServer>,
 
@@ -580,6 +588,8 @@ impl App {
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             help_open: false,
+            stage_px: (1920.0, 1080.0),
+            slide_aspect: 16.0 / 9.0,
             reserve_form: None,
             stage: false,
             stage_sent: None,
@@ -673,7 +683,22 @@ impl App {
             timer: self.timer.info(),
             audio: self.player.info(),
             background: self.cfg.background.clone(),
+            zoom: self.show.as_ref().map_or(1.0, |s| s.zoom),
+            view: self.slide_view(),
         }
+    }
+
+    /// Видимая часть текущего слайда (доли страницы).
+    fn slide_view(&self) -> [f32; 4] {
+        match &self.show {
+            Some(s) => render::viewport(self.slide_aspect, self.stage_px, s.zoom, s.center),
+            None => [0.0, 0.0, 1.0, 1.0],
+        }
+    }
+
+    /// Увеличение и сдвиг — только у того, что рисуем сами: PDF и картинки.
+    fn zoomable(&self) -> bool {
+        self.show.as_ref().is_some_and(|s| matches!(s.kind, ShowKind::Pdf(_) | ShowKind::Image(_)))
     }
 
     /// То, что показывает интерфейс: список сервера, если мы подключены клиентом, иначе свой.
@@ -751,7 +776,7 @@ impl App {
                         ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0 })
                     }
                 };
-                self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now() });
+                self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5) });
             }
             // Видео: стрелки перематывают на 10 с, Home — в начало.
             Cmd::Next | Cmd::Prev | Cmd::GoTo { .. } if self.show.as_ref().is_some_and(|s| s.video().is_some()) => {
@@ -840,6 +865,30 @@ impl App {
                     self.delete_files(&it);
                 }
             }
+            Cmd::Zoom { step } if self.zoomable() => {
+                let view = self.slide_view();
+                if let Some(s) = &mut self.show {
+                    let i = ZOOMS.iter().position(|&z| z >= s.zoom - 0.01).unwrap_or(0) as i32;
+                    let next = if step == 0 { 0 } else { (i + step.signum()).clamp(0, ZOOMS.len() as i32 - 1) };
+                    // Увеличиваем вокруг того, что сейчас в центре экрана.
+                    s.center = ((view[0] + view[2]) / 2.0, (view[1] + view[3]) / 2.0);
+                    s.zoom = ZOOMS[next as usize];
+                    if s.zoom <= 1.0 {
+                        s.center = (0.5, 0.5);
+                    }
+                }
+                self.clamp_center();
+            }
+            Cmd::Pan { dx, dy } if self.zoomable() => {
+                let v = self.slide_view();
+                if let Some(s) = &mut self.show {
+                    // На треть видимой части — соседний кусок частично остаётся на экране, не теряешься.
+                    s.center.0 += dx.signum() as f32 * (v[2] - v[0]) / 3.0;
+                    s.center.1 += dy.signum() as f32 * (v[3] - v[1]) / 3.0;
+                }
+                self.clamp_center();
+            }
+            Cmd::Zoom { .. } | Cmd::Pan { .. } => {}
             Cmd::VideoRepeat { id, on } => {
                 if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
                     it.repeat = on;
@@ -884,6 +933,8 @@ impl App {
                 ShowKind::Pdf(_) => {
                     if p != s.page {
                         s.page = p;
+                        // Новый слайд — снова целиком.
+                        (s.zoom, s.center) = (1.0, (0.5, 0.5));
                         let id = s.id;
                         self.trim_pages(id, p);
                     }
@@ -1013,6 +1064,14 @@ impl App {
     }
 
     /// Держим в памяти только страницы рядом с текущей: PREFETCH_AHEAD вперёд и пару назад.
+    /// Центр видимой части — не дальше, чем позволяет край слайда (иначе сдвиг «копился» бы за краем).
+    fn clamp_center(&mut self) {
+        let v = self.slide_view();
+        if let Some(s) = &mut self.show {
+            s.center = ((v[0] + v[2]) / 2.0, (v[1] + v[3]) / 2.0);
+        }
+    }
+
     fn trim_pages(&mut self, id: u64, cur: usize) {
         self.textures.retain(|k, _| k.id == id && k.page + 2 >= cur && k.page <= cur + PREFETCH_AHEAD);
     }
@@ -1957,7 +2016,8 @@ impl App {
                         // Номер, набранный с клавиатуры, — подсказка оператору (на экране показа его не видно).
                         ui.label(RichText::new(format!("К слайду {} — Enter", self.goto_buf)).strong().size(15.0).color(GREEN));
                     } else {
-                        ui.label(RichText::new(format!("Слайд {} из {}", view.page + 1, view.pages)).strong().size(15.0));
+                        let zoom = if view.zoom > 1.0 { format!(" · {:.0} %", view.zoom * 100.0) } else { String::new() };
+                        ui.label(RichText::new(format!("Слайд {} из {}{zoom}", view.page + 1, view.pages)).strong().size(15.0));
                     }
                 } else {
                     ui.label(RichText::new("Показ не запущен").color(GRAY));
@@ -2091,8 +2151,13 @@ impl App {
     fn preview_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         let Some(id) = view.active else { return };
         const GAP: f32 = 12.0;
+        // Увеличение — у PDF и картинок (их рисуем сами); панель справа от миниатюр.
+        let kind = view.items.iter().find(|i| i.id == id).map(|i| i.kind.as_str()).unwrap_or("");
+        let zoomable = kind == "PDF" || kind == KIND_IMAGE;
+        let panel = if zoomable { ZOOM_PANEL_W + GAP } else { 0.0 };
         // Три миниатюры 16:9 по ширине окна, но не выше 112 точек.
-        let h = ((ui.available_width() - 2.0 * GAP) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
+        let h = ((ui.available_width() - 2.0 * GAP - panel) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
+        let zview = (view.zoom > 1.0).then_some(view.view);
         let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| {
             ui.vertical(|ui| {
                 let color = if current { Color32::from_gray(0x22) } else { Color32::from_gray(0x77) };
@@ -2118,6 +2183,11 @@ impl App {
                 // Текущий слайд — в зелёной рамке, как активная строка списка.
                 let stroke = if current { egui::Stroke::new(3.0_f32, GREEN) } else { egui::Stroke::new(1.0_f32, Color32::from_gray(0xbb)) };
                 p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Outside);
+                // Увеличен — оранжевой рамкой та часть слайда, что сейчас на экране показа.
+                if let (true, Some(v), Some(_)) = (current, zview, tex) {
+                    let r = egui::Rect::from_min_max(rect.lerp_inside(egui::vec2(v[0], v[1])), rect.lerp_inside(egui::vec2(v[2], v[3])));
+                    p.rect_stroke(r, 0.0, egui::Stroke::new(2.0_f32, ZOOM_FRAME), egui::StrokeKind::Inside);
+                }
             });
         };
         ui.horizontal(|ui| {
@@ -2134,7 +2204,69 @@ impl App {
             } else {
                 slot(ui, "Далее".into(), None, "конец презентации", false);
             }
+            if zoomable {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| self.zoom_panel(ui, view));
+            }
         });
+    }
+
+    /// Увеличение слайда: «+», масштаб, «−» и крестовина стрелок с «весь слайд» в центре.
+    fn zoom_panel(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+        let zoom = if view.zoom > 0.0 { view.zoom } else { 1.0 };
+        let (can_in, can_out, zoomed) = (zoom < ZOOMS[ZOOMS.len() - 1] - 0.01, zoom > 1.01, zoom > 1.01);
+        // Двигать можно, только если в ту сторону есть что показать.
+        let v = view.view;
+        let (left, right, up, down) = (zoomed && v[0] > 0.001, zoomed && v[2] < 0.999, zoomed && v[1] > 0.001, zoomed && v[3] < 0.999);
+        let mut cmd = None;
+        ui.vertical(|ui| {
+            ui.set_width(ZOOM_PANEL_W);
+            let title = if zoomed { format!("Увеличение — {:.0} %", zoom * 100.0) } else { "Увеличение".into() };
+            ui.label(RichText::new(title).size(12.0).color(if zoomed { ZOOM_FRAME } else { Color32::from_gray(0x77) }).strong());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                // «+» и «−» столбиком.
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                    let b = |t: &str| egui::Button::new(RichText::new(t).size(20.0).strong()).min_size(egui::vec2(44.0, ZOOM_CELL * 1.5 + 2.0));
+                    if ui.add_enabled(can_in, b("+")).on_hover_text("Крупнее (клавиша «+»)").clicked() {
+                        cmd = Some(Cmd::Zoom { step: 1 });
+                    }
+                    if ui.add_enabled(can_out, b("−")).on_hover_text("Мельче (клавиша «−»)").clicked() {
+                        cmd = Some(Cmd::Zoom { step: -1 });
+                    }
+                });
+                ui.add_space(6.0);
+                // Крестовина: стрелки — сдвиг увеличенного слайда, в центре — снова весь слайд.
+                egui::Grid::new("zoom_pad").spacing([3.0, 3.0]).show(ui, |ui| {
+                    ui.label("");
+                    if arrow_button(ui, 0, up).on_hover_text("Выше (Ctrl+стрелка вверх)").clicked() {
+                        cmd = Some(Cmd::Pan { dx: 0, dy: -1 });
+                    }
+                    ui.label("");
+                    ui.end_row();
+                    if arrow_button(ui, 3, left).on_hover_text("Левее (Ctrl+стрелка влево)").clicked() {
+                        cmd = Some(Cmd::Pan { dx: -1, dy: 0 });
+                    }
+                    let reset = egui::Button::new(RichText::new("1:1").size(11.0).strong()).min_size(egui::vec2(ZOOM_CELL, ZOOM_CELL));
+                    if ui.add_enabled(zoomed, reset).on_hover_text("Весь слайд").clicked() {
+                        cmd = Some(Cmd::Zoom { step: 0 });
+                    }
+                    if arrow_button(ui, 1, right).on_hover_text("Правее (Ctrl+стрелка вправо)").clicked() {
+                        cmd = Some(Cmd::Pan { dx: 1, dy: 0 });
+                    }
+                    ui.end_row();
+                    ui.label("");
+                    if arrow_button(ui, 2, down).on_hover_text("Ниже (Ctrl+стрелка вниз)").clicked() {
+                        cmd = Some(Cmd::Pan { dx: 0, dy: 1 });
+                    }
+                    ui.label("");
+                    ui.end_row();
+                });
+            });
+        });
+        if let Some(c) = cmd {
+            self.act(c);
+        }
     }
 
     /// Окно справки: что где нажимать.
@@ -2755,6 +2887,15 @@ impl App {
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
         let bg = self.bg.as_ref().map(background::Background::texture);
+        // Увеличение: видимая часть слайда; у PDF — ключ куска страницы, который нужен для экрана.
+        let zoom = self.show.as_ref().map_or(1.0, |s| s.zoom);
+        let zview = self.slide_view();
+        let zoomed = zoom > 1.0;
+        // Устаревшие увеличенные куски (другой масштаб или место) не держим.
+        let zkey_view = render::view_key(zview);
+        self.textures.retain(|k, _| k.view == FULL_VIEW || k.view == zkey_view);
+        let mut stage_px = self.stage_px;
+        let mut slide_aspect = self.slide_aspect;
         let (textures, last_tex, error, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.failed);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
@@ -2788,6 +2929,10 @@ impl App {
             ctx.set_cursor_icon(egui::CursorIcon::None);
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ctx, |ui| {
                 let rect = ui.max_rect();
+                stage_px = (rect.width() * ctx.pixels_per_point(), rect.height() * ctx.pixels_per_point());
+                let full_uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                // Увеличенный слайд: текстура и какая её часть на экране.
+                let mut zoom_tex: Option<(egui::TextureHandle, egui::Rect)> = None;
                 let mut page_tex = None;
                 if let Some((id, page, pages, _)) = &pdf {
                     let (id, page, pages) = (*id, *page, *pages);
@@ -2795,10 +2940,25 @@ impl App {
                     let max_side = ctx.input(|i| i.max_texture_side).min(16384) as f32;
                     let w = (rect.width() * ppp).round().clamp(16.0, max_side) as u32;
                     let h = (rect.height() * ppp).round().clamp(16.0, max_side) as u32;
-                    let key = PageKey { id, page, w, h, thumb: false };
+                    let key = PageKey { id, page, w, h, thumb: false, view: FULL_VIEW };
                     let tex = textures.get(&key).cloned();
-                    if tex.is_some() {
+                    if let Some(t) = &tex {
                         *last_tex = tex.clone();
+                        let s = t.size_vec2();
+                        slide_aspect = s.x / s.y.max(1.0);
+                    }
+                    // Увеличен: сначала нужен кусок страницы для экрана; пока он рисуется —
+                    // готовая страница, растянутая до того же куска (чуть мягче, но без пустого кадра).
+                    let zkey = PageKey { view: zkey_view, ..key };
+                    if zoomed {
+                        if let Some(z) = textures.get(&zkey) {
+                            zoom_tex = Some((z.clone(), full_uv));
+                        } else if let Some(t) = &tex {
+                            zoom_tex = Some((t.clone(), egui::Rect::from_min_max(egui::pos2(zview[0], zview[1]), egui::pos2(zview[2], zview[3]))));
+                        }
+                        if !textures.contains_key(&zkey) && !failed.contains(&zkey) {
+                            wanted.push(zkey);
+                        }
                     }
                     // Очередь рендера по важности: текущая, следующие (по ним листают чаще всего),
                     // затем предыдущая. Для очень больших экранов вперёд готовим меньше — бережём память.
@@ -2811,11 +2971,25 @@ impl App {
                 }
                 if page_tex.is_none() {
                     page_tex = img_tex.clone().filter(|_| hold.is_zero());
+                    if let Some(t) = &page_tex {
+                        let s = t.size_vec2();
+                        slide_aspect = s.x / s.y.max(1.0);
+                        // Картинку увеличиваем частью той же текстуры.
+                        if zoomed {
+                            zoom_tex = Some((t.clone(), egui::Rect::from_min_max(egui::pos2(zview[0], zview[1]), egui::pos2(zview[2], zview[3]))));
+                        }
+                    }
                 }
-                let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                let uv = full_uv;
+                // Пока не прошёл фон после открытия — без увеличения тоже ничего не рисуем.
+                let page_tex = match (page_tex, zoom_tex.filter(|_| hold.is_zero())) {
+                    (Some(_), Some(z)) => Some(z),
+                    (p, _) => p.map(|t| (t, uv)),
+                };
                 match page_tex {
-                    Some(t) => {
-                        let ts = t.size_vec2();
+                    Some((t, uv)) => {
+                        // Видимая часть текстуры вписывается в экран целиком.
+                        let ts = t.size_vec2() * uv.size();
                         let k = (rect.width() / ts.x).min(rect.height() / ts.y);
                         let r = egui::Rect::from_center_size(rect.center(), ts * k);
                         ui.painter().image(t.id(), r, uv, Color32::WHITE);
@@ -2844,6 +3018,10 @@ impl App {
                 }
             });
         });
+        if (stage_px, slide_aspect) != (self.stage_px, self.slide_aspect) {
+            (self.stage_px, self.slide_aspect) = (stage_px, slide_aspect);
+            self.dirty = true; // клиентам — новая рамка видимой части
+        }
         // Часы и идущий таймер перерисовываем ровно при смене секунды.
         if let Some(d) = repaint {
             ctx.request_repaint_after(d);
@@ -2888,7 +3066,7 @@ impl App {
             // Миниатюры для превью — после страниц для экрана.
             for p in [Some(page), Some(page + 1), page.checked_sub(1)].into_iter().flatten().filter(|&p| p < pages) {
                 if !self.previews.contains_key(&(id, p)) && !self.thumb_failed.contains(&(id, p)) {
-                    wanted.push(PageKey { id, page: p, w: THUMB_W, h: THUMB_H, thumb: true });
+                    wanted.push(PageKey { id, page: p, w: THUMB_W, h: THUMB_H, thumb: true, view: FULL_VIEW });
                 }
             }
             self.renderer.want(&pdf, wanted);
@@ -2963,6 +3141,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Home / End", "Первый / последний слайд. У видео Home — в начало, стрелки — перемотка на 10 с."),
         ("Цифры, затем Enter", "Перейти к слайду с этим номером (номер виден внизу окна, на экране показа — нет). Или поле «Слайд №» и «Перейти»."),
         ("Shift+0", "Закрыть показ."),
+        ("Увеличение (PDF, картинки)", "Справа от превью: «+» / «−» — крупнее и мельче (до 400 %), стрелки — сдвинуть увеличенный слайд, «1:1» — снова весь слайд. На миниатюре «Сейчас» оранжевой рамкой — то, что видно на экране. С клавиатуры: «+» / «−», Ctrl+стрелки. Перелистнули — слайд снова целиком."),
         ("Двойной Esc", "На экране показа: закрыть показ. На часах или таймере — вернуть фон. На фоне — убрать сцену. Одиночный Esc ничего не делает."),
         ("Кнопка ⌨", "Зелёная — клавиши в окне программы управляют показом. Серая — не управляют (на самом экране показа клавиши работают всегда)."),
     ]),
@@ -3038,11 +3217,26 @@ fn nav_keys(ctx: &egui::Context, view: &StateMsg) -> Vec<Cmd> {
             if i.key_pressed(Key::Space) {
                 out.push(Cmd::Play);
             }
-            if [Key::ArrowRight, Key::ArrowDown, Key::PageDown].iter().any(|k| i.key_pressed(*k)) {
-                out.push(Cmd::Next);
+            if i.modifiers.ctrl {
+                // Ctrl+стрелки — сдвиг увеличенного слайда.
+                for (k, dx, dy) in [(Key::ArrowLeft, -1, 0), (Key::ArrowRight, 1, 0), (Key::ArrowUp, 0, -1), (Key::ArrowDown, 0, 1)] {
+                    if i.key_pressed(k) {
+                        out.push(Cmd::Pan { dx, dy });
+                    }
+                }
+            } else {
+                if [Key::ArrowRight, Key::ArrowDown, Key::PageDown].iter().any(|k| i.key_pressed(*k)) {
+                    out.push(Cmd::Next);
+                }
+                if [Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace].iter().any(|k| i.key_pressed(*k)) {
+                    out.push(Cmd::Prev);
+                }
             }
-            if [Key::ArrowLeft, Key::ArrowUp, Key::PageUp, Key::Backspace].iter().any(|k| i.key_pressed(*k)) {
-                out.push(Cmd::Prev);
+            if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) {
+                out.push(Cmd::Zoom { step: 1 });
+            }
+            if i.key_pressed(Key::Minus) {
+                out.push(Cmd::Zoom { step: -1 });
             }
             if i.key_pressed(Key::Home) {
                 out.push(Cmd::GoTo { page: 0 });
@@ -3109,6 +3303,34 @@ fn level_color(level: health::Level) -> Color32 {
         health::Level::Warn => Color32::from_rgb(0xe0, 0x9a, 0x00),
         health::Level::Bad => RED,
     }
+}
+
+/// Ширина панели увеличения справа от превью и размер клетки крестовины.
+const ZOOM_PANEL_W: f32 = 160.0;
+const ZOOM_CELL: f32 = 26.0;
+
+/// Кнопка-стрелка крестовины: треугольник рисуем сами (стрелок в шрифте egui нет).
+/// `dir`: 0 — вверх, 1 — вправо, 2 — вниз, 3 — влево.
+fn arrow_button(ui: &mut egui::Ui, dir: u8, enabled: bool) -> egui::Response {
+    let sense = if enabled { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ZOOM_CELL, ZOOM_CELL), sense);
+    let (bg, fg) = match (enabled, resp.hovered()) {
+        (false, _) => (Color32::from_gray(0xee), Color32::from_gray(0xbb)),
+        (true, true) => (Color32::from_rgb(0x46, 0xa8, 0xc6), Color32::WHITE),
+        (true, false) => (BLUE, Color32::WHITE),
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 4.0, bg);
+    let c = rect.center();
+    let (a, b) = (7.0, 5.0);
+    let pts = match dir {
+        0 => vec![c + egui::vec2(0.0, -b), c + egui::vec2(a, b), c + egui::vec2(-a, b)],
+        1 => vec![c + egui::vec2(b, 0.0), c + egui::vec2(-b, a), c + egui::vec2(-b, -a)],
+        2 => vec![c + egui::vec2(0.0, b), c + egui::vec2(-a, -b), c + egui::vec2(a, -b)],
+        _ => vec![c + egui::vec2(-b, 0.0), c + egui::vec2(b, -a), c + egui::vec2(b, a)],
+    };
+    p.add(egui::Shape::convex_polygon(pts, fg, egui::Stroke::NONE));
+    resp
 }
 
 /// Значок повтора (круговая стрелка) — рисуем сами: символов «🔁 ↻» в шрифте egui нет.

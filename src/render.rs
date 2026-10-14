@@ -19,6 +19,34 @@ pub struct PageKey {
     pub h: u32,
     /// Миниатюра для превью у оператора (готовится и в JPEG — для клиентов).
     pub thumb: bool,
+    /// Какая часть страницы: (лево, верх, право, низ) в десятитысячных долях; `FULL_VIEW` — вся.
+    /// При увеличении рендерится только видимый кусок — в разрешении экрана, поэтому чётко.
+    pub view: [u16; 4],
+}
+
+/// Вся страница.
+pub const FULL_VIEW: [u16; 4] = [0, 0, 10000, 10000];
+
+/// Ступени увеличения слайда.
+pub const ZOOMS: [f32; 7] = [1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0];
+
+/// Видимая часть страницы при увеличении `zoom` вокруг центра `center` (доли страницы):
+/// (лево, верх, право, низ) в долях страницы. `aspect` — ширина страницы к высоте, `screen` — размер
+/// экрана. При 100 % — вся страница; центр сдвигается так, чтобы за край страницы не выходить.
+pub fn viewport(aspect: f32, screen: (f32, f32), zoom: f32, center: (f32, f32)) -> [f32; 4] {
+    let (sw, sh) = (screen.0.max(1.0), screen.1.max(1.0));
+    let aspect = if aspect.is_finite() && aspect > 0.0 { aspect } else { sw / sh };
+    // Размер страницы на экране при 100 % (вписана целиком) и при увеличении.
+    let (fw, fh) = if aspect > sw / sh { (sw, sw / aspect) } else { (sh * aspect, sh) };
+    let (vw, vh) = ((sw / (fw * zoom)).min(1.0), (sh / (fh * zoom)).min(1.0));
+    let cx = center.0.clamp(vw / 2.0, 1.0 - vw / 2.0);
+    let cy = center.1.clamp(vh / 2.0, 1.0 - vh / 2.0);
+    [cx - vw / 2.0, cy - vh / 2.0, cx + vw / 2.0, cy + vh / 2.0]
+}
+
+/// Видимая часть — в ключ страницы (десятитысячные доли).
+pub fn view_key(v: [f32; 4]) -> [u16; 4] {
+    v.map(|x| (x.clamp(0.0, 1.0) * 10000.0).round() as u16)
 }
 
 /// Размер миниатюры превью: страница вписывается в эту рамку.
@@ -167,12 +195,36 @@ pub fn render_page(pdf: &Pdf, key: PageKey) -> Result<ColorImage, String> {
     if pw <= 0.0 || ph <= 0.0 {
         return Err("страница нулевого размера".into());
     }
+    if key.view != FULL_VIEW {
+        return render_region(page, pw, ph, key);
+    }
     let scale = (key.w as f32 / pw).min(key.h as f32 / ph).min(65000.0 / pw.max(ph)).max(0.01);
     let settings = PixmapSettings { x_scale: scale, y_scale: scale, bg_color: WHITE };
     let cache = RenderCache::new();
     let pix = hayro::render(page, &cache, &InterpreterSettings::default(), &RenderSettings::default(), &settings);
     let size = [pix.width() as usize, pix.height() as usize];
     Ok(ColorImage::from_rgba_premultiplied(size, pix.data_as_u8_slice()))
+}
+
+/// Кусок страницы (`key.view`), вписанный в `key.w`×`key.h`: только он и рендерится — в разрешении
+/// экрана, поэтому при любом увеличении чётко, а время и память — как у обычной страницы.
+fn render_region(page: &hayro::hayro_syntax::page::Page, pw: f32, ph: f32, key: PageKey) -> Result<ColorImage, String> {
+    use hayro::hayro_interpret::util::TransformExt;
+    use hayro::kurbo::Affine;
+    use hayro::vello_cpu::{Pixmap, RasterizerSettings, RenderContext, Resources, TargetInit};
+    let v = key.view.map(|x| x as f64 / 10000.0);
+    let (rx, ry) = (v[0] * pw as f64, v[1] * ph as f64);
+    let (rw, rh) = (((v[2] - v[0]) * pw as f64).max(1.0), ((v[3] - v[1]) * ph as f64).max(1.0));
+    let s = (key.w as f64 / rw).min(key.h as f64 / rh);
+    let (w, h) = ((rw * s).round().clamp(1.0, 16384.0) as u16, (rh * s).round().clamp(1.0, 16384.0) as u16);
+    let transform = Affine::translate((-rx * s, -ry * s)) * Affine::scale(s) * page.initial_transform(true).to_kurbo();
+    let cache = RenderCache::new();
+    let mut ctx = RenderContext::new(w, h);
+    hayro::render_into(page, &cache, &InterpreterSettings::default(), &RenderSettings::default(), &mut ctx, transform);
+    ctx.flush();
+    let mut pix = Pixmap::new(w, h);
+    ctx.render_with(&mut pix, &mut Resources::default(), RasterizerSettings { target_init: TargetInit::Clear(WHITE), ..Default::default() });
+    Ok(ColorImage::from_rgba_premultiplied([w as usize, h as usize], pix.data_as_u8_slice()))
 }
 
 /// Рендер страниц PDF в нескольких потоках. GUI каждый кадр сообщает, какие страницы нужны
@@ -287,13 +339,59 @@ mod tests {
         let r = Renderer::new(tx, || {});
         for i in 0..rounds {
             let pdf = &files[i % files.len()];
-            let keys: Vec<PageKey> = (0..5).map(|page| PageKey { id: i as u64, page, w: 1920, h: 1080, thumb: false }).collect();
+            let keys: Vec<PageKey> = (0..5).map(|page| PageKey { id: i as u64, page, w: 1920, h: 1080, thumb: false, view: FULL_VIEW }).collect();
             r.want(pdf, keys);
             for _ in 0..5 {
                 rx.recv().unwrap();
             }
             println!("ROUND {i}");
         }
+    }
+
+    #[test]
+    fn viewport_math() {
+        let eq = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4);
+        // 100 % — вся страница, центр не важен.
+        assert!(eq(viewport(16.0 / 9.0, (1920.0, 1080.0), 1.0, (0.9, 0.1)), [0.0, 0.0, 1.0, 1.0]));
+        // 16:9 на 16:9, 200 % — половина по каждой оси, в центре.
+        assert!(eq(viewport(16.0 / 9.0, (1920.0, 1080.0), 2.0, (0.5, 0.5)), [0.25, 0.25, 0.75, 0.75]));
+        // Центр у самого края — видимая часть прижимается к краю, а не выходит за него.
+        assert!(eq(viewport(16.0 / 9.0, (1920.0, 1080.0), 2.0, (0.0, 1.0)), [0.0, 0.5, 0.5, 1.0]));
+        // Страница 4:3 на экране 16:9 при 125 %: по высоте видна часть, по ширине — вся (поля по бокам).
+        let v = viewport(4.0 / 3.0, (1920.0, 1080.0), 1.25, (0.5, 0.5));
+        assert!(eq(v, [0.0, 0.1, 1.0, 0.9]), "{v:?}");
+    }
+
+    /// Увеличенный кусок совпадает с тем же местом страницы, отрендеренной целиком крупнее:
+    /// TEST_PDF="a.pdf" cargo test --release zoom_region_matches -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn zoom_region_matches() {
+        let pdf = load_pdf(Path::new(&std::env::var("TEST_PDF").unwrap())).unwrap();
+        let (w, h) = (960u32, 540u32);
+        let fit = render_page(&pdf, PageKey { id: 0, page: 0, w, h, thumb: false, view: FULL_VIEW }).unwrap();
+        let aspect = fit.size[0] as f32 / fit.size[1] as f32;
+        let v = viewport(aspect, (w as f32, h as f32), 3.0, (0.3, 0.6));
+        let region = render_page(&pdf, PageKey { id: 0, page: 0, w, h, thumb: false, view: view_key(v) }).unwrap();
+        let big = render_page(&pdf, PageKey { id: 0, page: 0, w: w * 3, h: h * 3, thumb: false, view: FULL_VIEW }).unwrap();
+        println!("страница {}×{}, кусок {:?} → {}×{}, крупная {}×{}", fit.size[0], fit.size[1], v, region.size[0], region.size[1], big.size[0], big.size[1]);
+        // Сравниваем по сетке точек: кусок против того же места крупной страницы.
+        let (mut diff, mut n, mut inked) = (0u64, 0u64, 0u32);
+        for gy in 1..40 {
+            for gx in 1..40 {
+                let (rx, ry) = (region.size[0] * gx / 40, region.size[1] * gy / 40);
+                let bx = ((v[0] + (v[2] - v[0]) * gx as f32 / 40.0) * big.size[0] as f32) as usize;
+                let by = ((v[1] + (v[3] - v[1]) * gy as f32 / 40.0) * big.size[1] as f32) as usize;
+                let a = region.pixels[ry * region.size[0] + rx];
+                let b = big.pixels[by.min(big.size[1] - 1) * big.size[0] + bx.min(big.size[0] - 1)];
+                inked += (a.r() < 240 || a.g() < 240 || a.b() < 240) as u32;
+                diff += (a.r() as i32 - b.r() as i32).unsigned_abs() as u64 + (a.g() as i32 - b.g() as i32).unsigned_abs() as u64 + (a.b() as i32 - b.b() as i32).unsigned_abs() as u64;
+                n += 3;
+            }
+        }
+        let mean = diff as f64 / n as f64;
+        println!("средняя разница цвета: {mean:.1} из 255; точек не на белом: {inked} из {}", n / 3);
+        assert!(mean < 12.0, "кусок не совпадает со страницей: {mean}");
     }
 
     /// Время рендера каждой страницы под 1920×1080 (или TEST_SIZE):
@@ -310,7 +408,13 @@ mod tests {
         let (w, h) = size.split_once('x').map(|(w, h)| (w.parse().unwrap(), h.parse().unwrap())).unwrap();
         for page in 0..pdf.pages().len() {
             let t = Instant::now();
-            render_page(&pdf, PageKey { id: 0, page, w, h, thumb: false }).unwrap();
+            render_page(&pdf, PageKey { id: 0, page, w, h, thumb: false, view: FULL_VIEW }).unwrap();
+            let full = t.elapsed().as_millis();
+            // Увеличение 300 % — кусок в центре.
+            let tz = Instant::now();
+            let view = view_key(viewport(16.0 / 9.0, (w as f32, h as f32), 3.0, (0.5, 0.5)));
+            let img = render_page(&pdf, PageKey { id: 0, page, w, h, thumb: false, view }).unwrap();
+            println!("  целиком {full} мс; 300 %: {} мс, {}×{}", tz.elapsed().as_millis(), img.size[0], img.size[1]);
             println!("страница {}: {} мс", page + 1, t.elapsed().as_millis());
         }
     }
