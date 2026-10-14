@@ -55,6 +55,7 @@ impl Video {
             let src = src.to_path_buf();
             std::thread::spawn(move || win::run(&src, windowed, rect, rx, id_tx, on_event));
             let thread = id_rx.recv().unwrap_or(0);
+            win::wake(thread);
             Video { tx, thread }
         }
         #[cfg(not(windows))]
@@ -125,7 +126,9 @@ mod win {
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
-    const TICK_MS: u32 = 100;
+    /// Такт опроса движка. Короткий — чтобы конец ролика при повторе замечать сразу (на стыке
+    /// последний кадр стоит не дольше такта); чтения свойств mpv дешёвые.
+    const TICK_MS: u32 = 25;
     /// Сколько ждать загрузки файла, прежде чем сообщить об ошибке.
     const OPEN_TIMEOUT_TICKS: u32 = 20_000 / TICK_MS;
 
@@ -150,11 +153,6 @@ mod win {
         fn seek(&mut self, secs: f64, relative: bool);
         /// После конца: пауза и в начало — снова готово к запуску.
         fn rearm(&mut self);
-        /// Повтор по кругу силами самого движка (libmpv — без паузы на стыке); `false` — не умеет,
-        /// тогда в конце перематываем и запускаем сами.
-        fn set_repeat(&mut self, _on: bool) -> bool {
-            false
-        }
     }
 
     // ------------------------------------------------------------ libmpv
@@ -167,7 +165,16 @@ mod win {
     impl MpvEngine {
         fn new(hwnd: HWND, src: &Path) -> Result<MpvEngine, String> {
             let wid = (hwnd.0 as isize).to_string();
-            let mpv = mpv::Mpv::new(&[
+            // Отладка: PRESENTATOR_MPV_LOG=<файл> — подробный журнал mpv.
+            let log = std::env::var("PRESENTATOR_MPV_LOG").ok();
+            let mut opts: Vec<(&str, &str)> = Vec::new();
+            if let Some(f) = log.as_deref() {
+                opts.extend([("log-file", f), ("msg-level", "all=v")]);
+            }
+            // Отладка: PRESENTATOR_MPV_OPTS="vo=gpu,hwdec=no" — свои опции mpv (поверх наших).
+            let extra = std::env::var("PRESENTATOR_MPV_OPTS").unwrap_or_default();
+            let extra: Vec<(&str, &str)> = extra.split(',').filter_map(|kv| kv.split_once('=')).collect();
+            let mpv = mpv::Mpv::new(&[opts.as_slice(), &[
                 ("wid", &wid),
                 ("pause", "yes"),     // загружаем и ждём команды «старт»
                 ("keep-open", "yes"), // в конце остаёмся на последнем кадре, закрываем сами
@@ -181,7 +188,7 @@ mod win {
                 ("audio-display", "no"),
                 ("force-window", "yes"),
                 ("terminal", "no"),
-            ])?;
+            ], extra.as_slice()].concat())?;
             mpv.command(&["loadfile", &src.to_string_lossy()])?;
             Ok(MpvEngine { mpv, ready: false })
         }
@@ -232,9 +239,6 @@ mod win {
             let _ = self.mpv.command(&["seek", "0", "absolute"]);
         }
 
-        fn set_repeat(&mut self, on: bool) -> bool {
-            self.mpv.set("loop-file", if on { "inf" } else { "no" }).is_ok()
-        }
     }
 
     // ------------------------------------------------------------ MFPlay (запасной)
@@ -394,6 +398,61 @@ mod win {
         CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, class, w!("Presentator — видео"), WS_POPUP, x, y, cx, cy, None, None, hinst, None)
     }
 
+    /// Окно видео со своим движком.
+    struct Player {
+        hwnd: HWND,
+        engine: Box<dyn Engine>,
+        ready: bool,
+    }
+
+    impl Drop for Player {
+        fn drop(&mut self) {
+            unsafe {
+                // Сначала движок (он рисует в окно), потом окно.
+                let e = std::mem::replace(&mut self.engine, Box::new(NoEngine));
+                drop(e);
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+    }
+
+    /// Пустышка на время разборки `Player`.
+    struct NoEngine;
+
+    impl Engine for NoEngine {
+        fn tick(&mut self) -> Tick {
+            Tick::default()
+        }
+        fn play(&mut self) {}
+        fn toggle(&mut self) {}
+        fn seek(&mut self, _: f64, _: bool) {}
+        fn rearm(&mut self) {}
+    }
+
+    /// Окно (видно, но под сценой) и движок: libmpv, если не вышло — MFPlay.
+    unsafe fn open_player(src: &Path, windowed: bool, rect: Option<(i32, i32, i32, i32)>) -> Result<Player, String> {
+        let hwnd = create_window(windowed, rect).map_err(|e| e.message().to_string())?;
+        // Окно видно, но лежит под сценой (она поверх всех окон): в него уже выводится первый кадр.
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Явно в самый низ: новое окно иначе встаёт выше обычных окон, и если сцена вдруг
+        // не «поверх всех», зритель увидел бы первый кадр до «Старт».
+        let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        let engine: Result<Box<dyn Engine>, String> = match MpvEngine::new(hwnd, src) {
+            Ok(e) => Ok(Box::new(e)),
+            // libmpv недоступен — играем движком Windows.
+            Err(mpv_err) => MfEngine::new(hwnd, src)
+                .map(|e| Box::new(e) as Box<dyn Engine>)
+                .map_err(|e| format!("{mpv_err}; Media Foundation: {}", e.message())),
+        };
+        match engine {
+            Ok(engine) => Ok(Player { hwnd, engine, ready: false }),
+            Err(e) => {
+                let _ = DestroyWindow(hwnd);
+                Err(e)
+            }
+        }
+    }
+
     pub fn run(src: &Path, windowed: bool, rect: Option<(i32, i32, i32, i32)>, rx: Receiver<VCmd>, id_tx: Sender<u32>, on_event: impl Fn(VideoEvent)) {
         unsafe {
             // Очередь сообщений потока должна существовать до того, как в неё начнут писать.
@@ -401,35 +460,24 @@ mod win {
             let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
             let _ = id_tx.send(GetCurrentThreadId());
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            match create_window(windowed, rect) {
-                Ok(hwnd) => {
-                    // Окно видно, но лежит под сценой (она поверх всех окон): в него уже выводится первый кадр.
-                    let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    // Явно в самый низ: новое окно иначе встаёт выше обычных окон, и если сцена вдруг
-                    // не «поверх всех», зритель увидел бы первый кадр до «Старт».
-                    let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                    let engine: Result<Box<dyn Engine>, String> = match MpvEngine::new(hwnd, src) {
-                        Ok(e) => Ok(Box::new(e)),
-                        // libmpv недоступен — играем движком Windows.
-                        Err(mpv_err) => MfEngine::new(hwnd, src)
-                            .map(|e| Box::new(e) as Box<dyn Engine>)
-                            .map_err(|e| format!("{mpv_err}; Media Foundation: {}", e.message())),
-                    };
-                    match engine {
-                        Ok(mut e) => event_loop(e.as_mut(), hwnd, &rx, &on_event),
-                        Err(e) => on_event(VideoEvent::Error(e)),
-                    }
-                    let _ = DestroyWindow(hwnd);
-                }
-                Err(e) => on_event(VideoEvent::Error(e.message().to_string())),
+            match open_player(src, windowed, rect) {
+                Ok(main) => event_loop(main, &|| open_player(src, windowed, rect), &rx, &on_event),
+                Err(e) => on_event(VideoEvent::Error(e)),
             }
             CoUninitialize();
         }
     }
 
-    unsafe fn event_loop(engine: &mut dyn Engine, hwnd: HWND, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
+    /// Повтор по кругу без перемотки на стыке. Перемотка в начало (как `loop-file` у mpv) на миг
+    /// оставляет окно без кадра — на экране мелькал чёрный (найдено 14.10.2026). Поэтому, пока
+    /// включён повтор, рядом держится второй проигрыватель того же файла: загружен, в начале, на
+    /// паузе, окно под сценой. Доиграл первый (его последний кадр ещё на экране) — второй выходит
+    /// наверх и сразу играет, а первый уходит вниз и перематывается: к следующему кругу роли меняются.
+    unsafe fn event_loop(mut main: Player, open_spare: &dyn Fn() -> Result<Player, String>, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         let timer = SetTimer(None, 0, TICK_MS, None);
-        let (mut ready, mut started, mut repeat) = (false, false, false);
+        let (mut started, mut repeat) = (false, false);
+        let mut spare: Option<Player> = None;
         let mut last_pos: Option<(u32, u32, bool)> = None;
         let mut ticks = 0u32;
         let mut msg = MSG::default();
@@ -440,17 +488,19 @@ mod win {
                         VCmd::Quit => break 'outer,
                         VCmd::Repeat(on) => {
                             repeat = on;
-                            engine.set_repeat(on);
+                            if !on {
+                                spare = None; // второй проигрыватель больше не нужен
+                            }
                         }
-                        VCmd::Start if ready && !started => {
+                        VCmd::Start if main.ready && !started => {
                             started = true;
                             // Наверх, не отнимая фокус, — и сразу воспроизведение (сцену под окно видео опустит GUI).
-                            let _ = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-                            engine.play();
+                            let _ = SetWindowPos(main.hwnd, HWND_TOP, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+                            main.engine.play();
                         }
-                        VCmd::Toggle if started => engine.toggle(),
-                        VCmd::Seek(d) if ready => engine.seek(d, true),
-                        VCmd::SeekTo(d) if ready => engine.seek(d, false),
+                        VCmd::Toggle if started => main.engine.toggle(),
+                        VCmd::Seek(d) if main.ready => main.engine.seek(d, true),
+                        VCmd::SeekTo(d) if main.ready => main.engine.seek(d, false),
                         _ => {}
                     }
                 }
@@ -458,16 +508,30 @@ mod win {
             }
             if msg.hwnd.is_invalid() && msg.message == WM_TIMER && msg.wParam.0 == timer {
                 ticks += 1;
-                let t = engine.tick();
+                // Второй проигрыватель — как только основной загружен (вдвоём грузиться дольше).
+                if repeat && main.ready && spare.is_none() {
+                    spare = open_spare().ok();
+                }
+                if let Some(sp) = spare.as_mut() {
+                    let st = sp.engine.tick();
+                    if st.error.is_some() {
+                        spare = None; // не вышло — повтор будет перемоткой, как раньше
+                    } else if st.ready.is_some() {
+                        sp.ready = true;
+                    }
+                }
+                let t = main.engine.tick();
                 if let Some(e) = t.error {
                     on_event(VideoEvent::Error(e));
                     break;
                 }
                 if let Some(dur) = t.ready {
-                    ready = true;
-                    on_event(VideoEvent::Ready(dur));
+                    if !main.ready {
+                        main.ready = true;
+                        on_event(VideoEvent::Ready(dur));
+                    }
                 }
-                if !ready {
+                if !main.ready {
                     if ticks > OPEN_TIMEOUT_TICKS {
                         on_event(VideoEvent::Error("не удалось открыть видео".into()));
                         break;
@@ -476,22 +540,39 @@ mod win {
                 }
 
                 // Сообщаем только об изменениях: иначе GUI 10 раз в секунду перерисовывал бы окна впустую.
+                // На стыке повтора «остановилось в конце» оператору не показываем.
                 let now = (t.pos as u32, t.dur as u32, t.playing);
-                if last_pos != Some(now) {
+                if last_pos != Some(now) && !(started && t.eof && repeat) {
                     last_pos = Some(now);
                     on_event(VideoEvent::Pos { pos: t.pos, dur: t.dur, playing: t.playing });
                 }
-                // Доиграло: окно — под сцену (зритель видит фон), видео — в начало на паузу.
-                // Следующий «старт» запускает его сразу, без повторной загрузки.
-                if started && t.eof && repeat {
-                    // Повтор, а движок сам не умеет (MFPlay): в начало и сразу дальше, окно остаётся наверху.
-                    engine.rearm();
-                    engine.play();
+                if !(started && t.eof) {
+                    continue;
+                }
+                if repeat {
+                    match spare.take().filter(|sp| sp.ready) {
+                        // Второй — наверх и играть; первый — вниз, в начало, на паузу: он следующий.
+                        Some(mut next) => {
+                            let _ = SetWindowPos(next.hwnd, HWND_TOP, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+                            next.engine.play();
+                            let _ = SetWindowPos(main.hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
+                            main.engine.rearm();
+                            std::mem::swap(&mut main, &mut next);
+                            spare = Some(next);
+                        }
+                        // Второй ещё не готов — перемотка в том же окне.
+                        None => {
+                            main.engine.rearm();
+                            main.engine.play();
+                        }
+                    }
                     last_pos = None;
-                } else if started && t.eof {
+                } else {
+                    // Доиграло: окно — под сцену (зритель видит фон), видео — в начало на паузу.
+                    // Следующий «старт» запускает его сразу, без повторной загрузки.
                     started = false;
-                    let _ = SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                    engine.rearm();
+                    let _ = SetWindowPos(main.hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
+                    main.engine.rearm();
                     last_pos = None;
                     on_event(VideoEvent::Ended);
                 }
@@ -501,5 +582,44 @@ mod win {
             DispatchMessageW(&msg);
         }
         let _ = KillTimer(None, timer);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Повтор по кругу без экрана: окно за пределами монитора, события и журнал mpv.
+    /// TEST_VIDEO=ролик.mp4 PRESENTATOR_MPV_LOG=mpv.log cargo test --release video::tests::loop_offscreen -- --exact --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn loop_offscreen() {
+        let src = std::path::PathBuf::from(std::env::var("TEST_VIDEO").unwrap());
+        let secs: u64 = std::env::var("TEST_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(12);
+        let (tx, rx) = channel();
+        let t0 = Instant::now();
+        // TEST_ONSCREEN=1 — окно на экране (снимающий скрипт делает его прозрачным для глаза и мыши).
+        let rect = if std::env::var("TEST_ONSCREEN").is_ok() { (200, 200, 960, 540) } else { (-4000, 0, 960, 540) };
+        let repeat = std::env::var("TEST_NO_REPEAT").is_err();
+        let v = Video::start(&src, false, Some(rect), repeat, move |ev| {
+            let _ = tx.send(ev);
+        });
+        let mut started = false;
+        while t0.elapsed() < Duration::from_secs(secs) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(VideoEvent::Ready(d)) => {
+                    println!("{:>6} ms ready dur={d:.2}", t0.elapsed().as_millis());
+                    if !started {
+                        v.play();
+                        started = true;
+                    }
+                }
+                Ok(VideoEvent::Pos { pos, dur, playing }) => println!("{:>6} ms pos={pos:.2}/{dur:.2} playing={playing}", t0.elapsed().as_millis()),
+                Ok(VideoEvent::Ended) => println!("{:>6} ms ENDED", t0.elapsed().as_millis()),
+                Ok(VideoEvent::Error(e)) => panic!("{e}"),
+                Err(_) => {}
+            }
+        }
     }
 }
