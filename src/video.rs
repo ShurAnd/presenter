@@ -129,6 +129,10 @@ mod win {
     /// Такт опроса движка. Короткий — чтобы конец ролика при повторе замечать сразу (на стыке
     /// последний кадр стоит не дольше такта); чтения свойств mpv дешёвые.
     const TICK_MS: u32 = 25;
+    /// С какого места начинается каждый следующий круг повтора. Многие ролики (в том числе
+    /// сохранённые из PowerPoint) начинаются с чёрных кадров — на стыке повтора они мелькали
+    /// (пользователь, 14.10.2026); их пропускаем. Первый запуск — по-прежнему с самого начала.
+    const LOOP_START: f64 = 0.25;
     /// Сколько ждать загрузки файла, прежде чем сообщить об ошибке.
     const OPEN_TIMEOUT_TICKS: u32 = 20_000 / TICK_MS;
 
@@ -151,8 +155,8 @@ mod win {
         fn play(&mut self);
         fn toggle(&mut self);
         fn seek(&mut self, secs: f64, relative: bool);
-        /// После конца: пауза и в начало — снова готово к запуску.
-        fn rearm(&mut self);
+        /// После конца: пауза и на `at` секунд от начала — снова готово к запуску.
+        fn rearm(&mut self, at: f64);
     }
 
     // ------------------------------------------------------------ libmpv
@@ -233,10 +237,11 @@ mod win {
             let _ = self.mpv.command(&["seek", &format!("{secs:.3}"), if relative { "relative" } else { "absolute" }]);
         }
 
-        fn rearm(&mut self) {
+        fn rearm(&mut self, at: f64) {
             // keep-open: mpv стоит на последнем кадре; перемотка в начало сбрасывает «конец файла».
+            // `exact` — точно на этот момент, а не на ближайший опорный кадр.
             let _ = self.mpv.set("pause", "yes");
-            let _ = self.mpv.command(&["seek", "0", "absolute"]);
+            let _ = self.mpv.command(&["seek", &format!("{at:.3}"), "absolute+exact"]);
         }
 
     }
@@ -331,13 +336,13 @@ mod win {
             }
         }
 
-        fn rearm(&mut self) {
+        fn rearm(&mut self, at: f64) {
             // В конце MFPlay «остановлен»: в начало и пауза (выводит первый кадр). Конец снова
             // засчитаем, только когда видео опять поиграет.
             self.played = false;
             self.started = None;
             unsafe {
-                let _ = self.player.SetPosition(&MFP_POSITIONTYPE_100NS, &PROPVARIANT::from(0i64));
+                let _ = self.player.SetPosition(&MFP_POSITIONTYPE_100NS, &PROPVARIANT::from((at * 1e7) as i64));
                 let _ = self.player.Pause();
             }
         }
@@ -426,7 +431,7 @@ mod win {
         fn play(&mut self) {}
         fn toggle(&mut self) {}
         fn seek(&mut self, _: f64, _: bool) {}
-        fn rearm(&mut self) {}
+        fn rearm(&mut self, _: f64) {}
     }
 
     /// Окно (видно, но под сценой) и движок: libmpv, если не вышло — MFPlay.
@@ -518,6 +523,7 @@ mod win {
                         spare = None; // не вышло — повтор будет перемоткой, как раньше
                     } else if st.ready.is_some() {
                         sp.ready = true;
+                        sp.engine.rearm(LOOP_START);
                     }
                 }
                 let t = main.engine.tick();
@@ -556,13 +562,13 @@ mod win {
                             let _ = SetWindowPos(next.hwnd, HWND_TOP, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
                             next.engine.play();
                             let _ = SetWindowPos(main.hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
-                            main.engine.rearm();
+                            main.engine.rearm(LOOP_START);
                             std::mem::swap(&mut main, &mut next);
                             spare = Some(next);
                         }
                         // Второй ещё не готов — перемотка в том же окне.
                         None => {
-                            main.engine.rearm();
+                            main.engine.rearm(LOOP_START);
                             main.engine.play();
                         }
                     }
@@ -572,7 +578,7 @@ mod win {
                     // Следующий «старт» запускает его сразу, без повторной загрузки.
                     started = false;
                     let _ = SetWindowPos(main.hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
-                    main.engine.rearm();
+                    main.engine.rearm(0.0);
                     last_pos = None;
                     on_event(VideoEvent::Ended);
                 }
