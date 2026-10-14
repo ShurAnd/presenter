@@ -71,6 +71,8 @@ pub enum Out {
     PageErr { key: PageKey, msg: String },
     /// Миниатюра слайда для превью: картинка и она же в JPEG (для клиентов).
     Thumb { id: u64, page: usize, image: ColorImage, jpg: Vec<u8> },
+    /// Слайд PowerPoint крупной картинкой (для увеличения) прочитан с диска.
+    PptZoom { gen: u64, page: usize, image: Result<ColorImage, String> },
     ThumbErr { id: u64, page: usize },
 }
 
@@ -225,6 +227,18 @@ fn render_region(page: &hayro::hayro_syntax::page::Page, pw: f32, ph: f32, key: 
     let mut pix = Pixmap::new(w, h);
     ctx.render_with(&mut pix, &mut Resources::default(), RasterizerSettings { target_init: TargetInit::Clear(WHITE), ..Default::default() });
     Ok(ColorImage::from_rgba_premultiplied([w as usize, h as usize], pix.data_as_u8_slice()))
+}
+
+/// Прочитать крупную картинку слайда PowerPoint (для увеличения) в отдельном потоке.
+pub fn load_ppt_zoom(gen: u64, page: usize, path: PathBuf, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
+    std::thread::spawn(move || {
+        let image = image::open(&path).map_err(|e| e.to_string()).map(|img| {
+            let rgba = img.to_rgba8();
+            ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw())
+        });
+        let _ = out.send(Out::PptZoom { gen, page, image });
+        wake();
+    });
 }
 
 /// Рендер страниц PDF в нескольких потоках. GUI каждый кадр сообщает, какие страницы нужны

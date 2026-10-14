@@ -18,6 +18,9 @@ pub enum PptEvent {
     Ended,
     /// Слайд (с единицы) сохранён картинкой для превью.
     Slide(usize),
+    /// Слайд (с единицы) сохранён крупной картинкой для увеличения (`Host::export_zoom`).
+    Zoom(usize),
+    ZoomFailed(String),
     Error(String),
 }
 
@@ -27,8 +30,10 @@ pub enum PptEvent {
 /// поэтому нет гонки, когда новый показ подключался к ещё закрывающемуся PowerPoint.
 ///
 /// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или -> <папка слайдов
-/// в base64 или -> <ширина картинки>`, `next`, `prev`, `goto N`, `poll`, `show`, `close`, `quit`.
-/// Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`, `slide <sid> N`, `ended <sid>`, `error <sid> текст`.
+/// в base64 или -> <ширина картинки>`, `next`, `prev`, `goto N`, `poll`, `show`, `zoom N <ширина> <файл base64>`,
+/// `close`, `quit`.
+/// Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`, `slide <sid> N`, `zoom <sid> N`, `zoomerr <sid> текст`,
+/// `ended <sid>`, `error <sid> текст`.
 ///
 /// Слайды для превью мост сохраняет сам, по одному в паузах между командами: команды ждут не дольше
 /// одного слайда. Отдельный процесс для этого не годится — второй клиент того же PowerPoint
@@ -155,6 +160,20 @@ while ($true) {
         continue
     }
     if ($cmd -eq 'close') { CloseShow; continue }
+    if ($cmd -eq 'zoom') {
+        # Слайд крупной картинкой — для увеличения: сцена покажет её поверх слайд-шоу.
+        try {
+            $n = [int]$parts[1]; $w = [int]$parts[2]
+            $f = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
+            $h = [int][math]::Round($w * $script:pres.PageSetup.SlideHeight / $script:pres.PageSetup.SlideWidth)
+            $tmp = $f + '.part.jpg'
+            $script:pres.Slides.Item($n).Export($tmp, 'JPG', $w, $h)
+            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f }
+            Move-Item -LiteralPath $tmp -Destination $f
+            Say ('zoom ' + $script:sid + ' ' + $n)
+        } catch { Say ('zoomerr ' + $script:sid + ' ' + (Msg $_)) }
+        continue
+    }
     if (-not $script:win) { continue }
     try {
         $view = $script:win.View
@@ -440,6 +459,12 @@ impl Host {
                             on_event(sid, PptEvent::Slide(n));
                         }
                     }
+                    "zoom" => {
+                        if let Some(n) = num(0) {
+                            on_event(sid, PptEvent::Zoom(n));
+                        }
+                    }
+                    "zoomerr" => on_event(sid, PptEvent::ZoomFailed(rest.join(" "))),
                     "ended" => on_event(sid, PptEvent::Ended),
                     "error" => on_event(sid, PptEvent::Error(rest.join(" "))),
                     _ => {}
@@ -472,6 +497,12 @@ impl Host {
         let _ = self.waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
         self.send(&format!("open {sid} {} {path} {mon} {dir} {width}", if windowed { 1 } else { 0 }));
         Ok(())
+    }
+
+    /// Сохранить слайд `slide` (с единицы) картинкой шириной `width` в файл `path` — для увеличения.
+    /// Готово — событие `Zoom(slide)`.
+    pub fn export_zoom(&self, slide: usize, width: u32, path: &Path) {
+        self.send(&format!("zoom {slide} {width} {}", base64(path.to_string_lossy().as_bytes())));
     }
 
     /// Для показателей сервера: сколько мс PowerPoint не отвечает на запросы моста
