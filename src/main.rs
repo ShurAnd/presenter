@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use net::{AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
+use net::{AudioInfo, AudioState, CliEvent, MediaAction, MediaInfo, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
 use render::{Out, PageKey, Renderer, AUDIO_EXTS, FULL_VIEW, THUMB_H, THUMB_W, VIDEO_EXTS, ZOOMS};
 use serde::{Deserialize, Serialize};
 
@@ -322,6 +322,8 @@ struct PptShow {
     zoom_img: Option<(usize, egui::TextureHandle)>,
     zoom_busy: Option<usize>,
     zoom_up: bool,
+    /// Видео и звук на слайде (номер слайда с единицы) — по сообщению моста.
+    media: (usize, Vec<ppt::Media>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -698,6 +700,17 @@ impl App {
             background: self.cfg.background.clone(),
             zoom: self.show.as_ref().map_or(1.0, |s| s.zoom),
             view: self.slide_view(),
+            media: self.slide_media(),
+        }
+    }
+
+    /// Видео и звук на текущем слайде PowerPoint (список от моста — только если он про этот слайд).
+    fn slide_media(&self) -> Vec<MediaInfo> {
+        match self.show.as_ref().map(|s| (s.page, &s.kind)) {
+            Some((page, ShowKind::Ppt(p))) if p.media.0 == page + 1 => {
+                p.media.1.iter().map(|m| MediaInfo { id: m.id, name: m.name.clone(), video: m.video, state: m.state }).collect()
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -790,7 +803,7 @@ impl App {
                             return;
                         }
                         self.status = format!("Открытие в PowerPoint: «{name}»…");
-                        ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0, zoom_img: None, zoom_busy: None, zoom_up: false })
+                        ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0, zoom_img: None, zoom_busy: None, zoom_up: false, media: (0, Vec::new()) })
                     }
                 };
                 self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5) });
@@ -911,6 +924,16 @@ impl App {
                 self.clamp_center();
             }
             Cmd::Zoom { .. } | Cmd::Pan { .. } => {}
+            Cmd::PptMedia { id, action } => {
+                if self.show.as_ref().is_some_and(Show::is_ppt) {
+                    let a = match action {
+                        MediaAction::Play => "play",
+                        MediaAction::Pause => "pause",
+                        MediaAction::Stop => "stop",
+                    };
+                    self.ppt_host.media(a, id);
+                }
+            }
             Cmd::VideoRepeat { id, on } => {
                 if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
                     it.repeat = on;
@@ -1374,6 +1397,12 @@ impl App {
                                     let c = ctx.clone();
                                     render::load_ppt_zoom(gen, n.saturating_sub(1), path, self.out_tx.clone(), move || c.request_repaint());
                                 }
+                            }
+                            ppt::PptEvent::Media(slide, list) => {
+                                if let Some(ShowKind::Ppt(p)) = self.show.as_mut().map(|s| &mut s.kind) {
+                                    p.media = (slide, list);
+                                }
+                                self.dirty = true;
                             }
                             ppt::PptEvent::ZoomFailed(e) => {
                                 if let Some(ShowKind::Ppt(p)) = self.show.as_mut().map(|s| &mut s.kind) {
@@ -2246,6 +2275,10 @@ impl App {
         // Три миниатюры 16:9 по ширине окна, но не выше 112 точек.
         let h = ((ui.available_width() - 2.0 * GAP - panel) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
         let zview = (view.zoom > 1.0).then_some(view.view);
+        if !view.media.is_empty() {
+            self.media_row(ui, &view.media);
+            ui.add_space(4.0);
+        }
         let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| {
             ui.vertical(|ui| {
                 let color = if current { Color32::from_gray(0x22) } else { Color32::from_gray(0x77) };
@@ -2296,6 +2329,44 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| self.zoom_panel(ui, view));
             }
         });
+    }
+
+    /// Видео и звук на слайде PowerPoint: запуск, пауза, стоп — мыши на экране показа нет.
+    fn media_row(&mut self, ui: &mut egui::Ui, media: &[MediaInfo]) {
+        let mut cmd = None;
+        ui.horizontal(|ui| {
+            for (n, m) in media.iter().enumerate() {
+                if n > 0 {
+                    ui.add_space(14.0);
+                }
+                let what = if m.video { "Видео на слайде" } else { "Звук на слайде" };
+                let what = if media.len() > 1 { format!("{what} {}", n + 1) } else { what.to_string() };
+                let (state, color) = match m.state {
+                    0 => ("играет", GREEN),
+                    1 => ("пауза", BLUE),
+                    // До первого запуска PowerPoint сообщает «не готово» (3) — запускать при этом можно.
+                    _ => ("не запущено", GRAY),
+                };
+                ui.label(RichText::new(format!("{what}:")).strong()).on_hover_text(&m.name);
+                ui.label(RichText::new(state).color(color));
+                if m.state == 0 {
+                    if btn(ui, "Пауза", BLUE).clicked() {
+                        cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Pause });
+                    }
+                } else {
+                    let label = if m.state == 1 { "▶ Продолжить" } else { "▶ Старт" };
+                    if btn(ui, label, GREEN).on_hover_text("Запустить на экране показа (как щелчок по видео)").clicked() {
+                        cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Play });
+                    }
+                }
+                if ui.add_enabled(m.state <= 1, cbutton("■ Стоп", RED)).clicked() {
+                    cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Stop });
+                }
+            }
+        });
+        if let Some(c) = cmd {
+            self.act(c);
+        }
     }
 
     /// Увеличение слайда: «+», масштаб, «−» и крестовина стрелок с «весь слайд» в центре.
@@ -3291,6 +3362,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("PowerPoint и видео", &[
         ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
+        ("Видео внутри слайда", "Если на слайде есть видео или звук, над превью появляется строка «Видео на слайде» с кнопками «Старт», «Пауза», «Стоп» — так запускается и видео, которое в PowerPoint включается щелчком мыши (курсора на экране показа нет). Работает и у клиента."),
         ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон, а видео остаётся готовым: пробел — показать ещё раз с начала, без загрузки. Убрать видео — «Закрыть показ»."),
         ("Повтор видео", "Значок круговой стрелки справа в строке видео: синий — видео идёт по кругу, после конца сразу начинается заново (фон не появляется). По умолчанию выключен; переключать можно и во время показа. Запоминается в списке сервера."),
         ("Закрыть показ", "Кнопка «Закрыть показ», Shift+0 или двойной Esc на экране показа. На экране показа остаётся фон."),
