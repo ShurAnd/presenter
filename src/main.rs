@@ -50,6 +50,8 @@ const PREFETCH_AHEAD: usize = 3;
 /// Набранный с клавиатуры номер слайда забывается, если Enter не нажали за это время.
 const GOTO_TIMEOUT: Duration = Duration::from_secs(4);
 /// Два нажатия Esc с интервалом не больше этого скрывают сцену.
+/// С «Показать курсор» курсор на сцене виден столько после последнего движения мыши.
+const CURSOR_IDLE: Duration = Duration::from_secs(3);
 const DOUBLE_ESC: Duration = Duration::from_millis(600);
 
 fn main() -> eframe::Result {
@@ -455,6 +457,10 @@ struct App {
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
     help_open: bool,
+    /// «Показать курсор» на экране показа (после перезапуска — снова выключено) и когда мышь
+    /// последний раз двигали над сценой (курсор виден 3 с после движения).
+    show_cursor: bool,
+    cursor_moved: Option<Instant>,
     /// Размер сцены в пикселях и пропорции (ширина / высота) текущего слайда — для увеличения.
     stage_px: (f32, f32),
     slide_aspect: f32,
@@ -601,6 +607,8 @@ impl App {
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             help_open: false,
+            show_cursor: false,
+            cursor_moved: None,
             stage_px: (1920.0, 1080.0),
             slide_aspect: 16.0 / 9.0,
             reserve_form: None,
@@ -698,6 +706,7 @@ impl App {
             background: self.cfg.background.clone(),
             zoom: self.show.as_ref().map_or(1.0, |s| s.zoom),
             view: self.slide_view(),
+            cursor: self.show_cursor,
         }
     }
 
@@ -911,6 +920,11 @@ impl App {
                 self.clamp_center();
             }
             Cmd::Zoom { .. } | Cmd::Pan { .. } => {}
+            Cmd::Cursor { on } => {
+                self.show_cursor = on;
+                self.ppt_host.set_cursor(on);
+                video::set_cursor(on);
+            }
             Cmd::VideoRepeat { id, on } => {
                 if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
                     it.repeat = on;
@@ -2150,6 +2164,14 @@ impl App {
                 if btn(ui, "Справка", GRAY).on_hover_text("Что где нажимать: клавиши, экраны сервера, превью, сеть").clicked() {
                     self.help_open = !self.help_open;
                 }
+                let mut cursor = view.cursor;
+                if ui
+                    .checkbox(&mut cursor, "Показать курсор")
+                    .on_hover_text("Курсор мыши на экране показа виден, пока мышь двигают (через 3 с покоя прячется). Например, чтобы щёлкнуть по видео в слайде PowerPoint. После перезапуска программы — снова выключено")
+                    .changed()
+                {
+                    self.act(Cmd::Cursor { on: cursor });
+                }
                 ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(Color32::from_gray(0x66))).truncate());
             });
         }));
@@ -3007,6 +3029,8 @@ impl App {
             Some(ShowKind::Ppt(p)) => p.zoom_img.clone(),
             _ => None,
         };
+        let show_cursor = self.show_cursor;
+        let mut cursor_moved = self.cursor_moved;
         let (textures, last_tex, error, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.failed);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
@@ -3036,8 +3060,19 @@ impl App {
             cmds.extend(nav_keys(ctx, &view));
             esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
             typed = typed_digits(ctx);
-            // Пока на экране сцена (фон или презентация), курсора не видно.
-            ctx.set_cursor_icon(egui::CursorIcon::None);
+            // Пока на экране сцена (фон или презентация), курсора не видно. С «Показать курсор» —
+            // виден, пока мышь двигают, и ещё CURSOR_IDLE после (как в PowerPoint и проигрывателях).
+            let mut cursor_on = false;
+            if show_cursor {
+                if ctx.input(|i| i.pointer.delta() != egui::Vec2::ZERO || i.pointer.any_down()) {
+                    cursor_moved = Some(Instant::now());
+                }
+                if let Some(left) = cursor_moved.and_then(|t| CURSOR_IDLE.checked_sub(t.elapsed())) {
+                    cursor_on = true;
+                    ctx.request_repaint_after(left);
+                }
+            }
+            ctx.set_cursor_icon(if cursor_on { egui::CursorIcon::Default } else { egui::CursorIcon::None });
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::BLACK)).show(ctx, |ui| {
                 let rect = ui.max_rect();
                 stage_px = (rect.width() * ctx.pixels_per_point(), rect.height() * ctx.pixels_per_point());
@@ -3138,6 +3173,7 @@ impl App {
                 }
             });
         });
+        self.cursor_moved = cursor_moved;
         if (stage_px, slide_aspect) != (self.stage_px, self.slide_aspect) {
             (self.stage_px, self.slide_aspect) = (stage_px, slide_aspect);
             self.dirty = true; // клиентам — новая рамка видимой части
@@ -3261,6 +3297,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Home / End", "Первый / последний слайд. У видео Home — в начало, стрелки — перемотка на 10 с."),
         ("Цифры, затем Enter", "Перейти к слайду с этим номером (номер виден внизу окна, на экране показа — нет). Или поле «Слайд №» и «Перейти»."),
         ("Shift+0", "Закрыть показ."),
+        ("Показать курсор", "Галочка внизу, рядом со «Справкой»: курсор мыши на экране показа виден, пока мышь двигают, и сам прячется через 3 с. В PowerPoint так можно щёлкнуть по видео в слайде. Работает и у клиента; после перезапуска — снова выключено."),
         ("Увеличение слайда", "Справа от превью: «+» / «−» — крупнее и мельче (до 400 %), стрелки — сдвинуть увеличенный слайд, кнопка в центре — снова весь слайд. На миниатюре «Сейчас» оранжевой рамкой — то, что видно на экране. С клавиатуры: «+» / «−», Ctrl+стрелки. Перелистнули — слайд снова целиком. PDF, картинки и PowerPoint; у PowerPoint увеличенный слайд — неподвижная картинка (анимация и видео в слайде не идут), первое увеличение слайда — через долю секунды."),
         ("Двойной Esc", "На экране показа: закрыть показ. На часах или таймере — вернуть фон. На фоне — убрать сцену. Одиночный Esc ничего не делает."),
         ("Кнопка ⌨", "Зелёная — клавиши в окне программы управляют показом. Серая — не управляют (на самом экране показа клавиши работают всегда)."),

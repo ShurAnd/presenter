@@ -31,6 +31,7 @@ pub enum PptEvent {
 ///
 /// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или -> <папка слайдов
 /// в base64 или -> <ширина картинки>`, `next`, `prev`, `goto N`, `poll`, `show`, `zoom N <ширина> <файл base64>`,
+/// `cursor 3|4` (указатель в слайд-шоу: 3 — всегда скрыт, 4 — стрелка при движении, сама прячется),
 /// `close`, `quit`.
 /// Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`, `slide <sid> N`, `zoom <sid> N`, `zoomerr <sid> текст`,
 /// `ended <sid>`, `error <sid> текст`.
@@ -44,6 +45,8 @@ $ErrorActionPreference = 'Stop'
 function Say($s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
 function Msg($e) { $e.Exception.Message -replace '\s+', ' ' }
 $script:app = $null; $script:pres = $null; $script:win = $null; $script:total = 0; $script:sid = '0'
+# Указатель мыши в показе: 3 — всегда скрыт, 4 — стрелка при движении (галочка «Показать курсор»).
+$script:cursor = 3
 # Сохранение слайдов картинками: папка, размер и какие слайды ещё не сохранены.
 $script:exp = $null
 
@@ -119,8 +122,8 @@ function OpenShow($path, $windowed, $monitor) {
     # Настройки показа выше меняют презентацию. Помечаем её сохранённой: иначе при закрытии
     # PowerPoint спросит о сохранении файла, открытого только для чтения.
     $script:pres.Saved = -1
-    # Указатель мыши в показе всегда скрыт.
-    try { $script:win.View.PointerType = 3 } catch {}
+    # Указатель мыши: скрыт или стрелка при движении — как выбрано в программе.
+    try { $script:win.View.PointerType = $script:cursor } catch {}
 }
 
 # PowerPoint запускаем сразу (скрыто) — к первому показу он уже готов.
@@ -160,6 +163,11 @@ while ($true) {
         continue
     }
     if ($cmd -eq 'close') { CloseShow; continue }
+    if ($cmd -eq 'cursor') {
+        $script:cursor = [int]$parts[1]
+        if ($script:win) { try { $script:win.View.PointerType = $script:cursor } catch {} }
+        continue
+    }
     if ($cmd -eq 'zoom') {
         # Слайд крупной картинкой — для увеличения: сцена покажет её поверх слайд-шоу.
         try {
@@ -369,6 +377,8 @@ pub struct Host {
     current: Arc<AtomicU64>,
     epoch: AtomicU64,
     on_event: Callback,
+    /// Курсор в слайд-шоу виден при движении («Показать курсор»).
+    cursor: std::sync::atomic::AtomicBool,
 }
 
 impl Host {
@@ -379,6 +389,7 @@ impl Host {
             current: Arc::new(AtomicU64::new(0)),
             epoch: AtomicU64::new(0),
             on_event: Arc::new(on_event),
+            cursor: std::sync::atomic::AtomicBool::new(false),
         };
         // Регулярный опрос позиции, пока идёт показ: слайды могут листать и на самом сервере.
         let (proc, current, waiting) = (Arc::downgrade(&host.proc), host.current.clone(), host.waiting.clone());
@@ -495,8 +506,17 @@ impl Host {
         let mon = if monitor.is_empty() { "-".to_string() } else { base64(monitor.as_bytes()) };
         let dir = slides.map_or("-".to_string(), |d| base64(d.to_string_lossy().as_bytes()));
         let _ = self.waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
+        // Мост мог перезапуститься — режим указателя напоминаем перед каждым показом.
+        self.send(&format!("cursor {}", if self.cursor.load(Ordering::SeqCst) { 4 } else { 3 }));
         self.send(&format!("open {sid} {} {path} {mon} {dir} {width}", if windowed { 1 } else { 0 }));
         Ok(())
+    }
+
+    /// Курсор в слайд-шоу: `true` — стрелка при движении мыши (PowerPoint прячет её сам),
+    /// `false` — всегда скрыт. Действует сразу и на следующие показы.
+    pub fn set_cursor(&self, on: bool) {
+        self.cursor.store(on, Ordering::SeqCst);
+        self.send(&format!("cursor {}", if on { 4 } else { 3 }));
     }
 
     /// Сохранить слайд `slide` (с единицы) картинкой шириной `width` в файл `path` — для увеличения.

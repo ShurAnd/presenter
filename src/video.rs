@@ -14,7 +14,15 @@
 //! версии 1.0.4), хотя обычное окно с теми же стилями туда пускает. Обычный HWND_TOP работает везде.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
+
+/// Курсор над видео виден при движении мыши (галочка «Показать курсор»); иначе скрыт.
+static SHOW_CURSOR: AtomicBool = AtomicBool::new(false);
+
+pub fn set_cursor(on: bool) {
+    SHOW_CURSOR.store(on, Ordering::SeqCst);
+}
 
 pub enum VideoEvent {
     /// Видео загружено и готово к запуску; длительность в секундах.
@@ -113,7 +121,8 @@ impl Drop for Video {
 
 #[cfg(windows)]
 mod win {
-    use super::{VCmd, VideoEvent};
+    use super::{VCmd, VideoEvent, SHOW_CURSOR};
+    use std::sync::atomic::Ordering;
     use crate::mpv;
     use std::path::Path;
     use std::sync::mpsc::{Receiver, Sender};
@@ -157,6 +166,8 @@ mod win {
         fn seek(&mut self, secs: f64, relative: bool);
         /// После конца: пауза и на `at` секунд от начала — снова готово к запуску.
         fn rearm(&mut self, at: f64);
+        /// Курсор над видео: виден при движении (сам прячется) или всегда скрыт.
+        fn set_cursor(&mut self, _on: bool) {}
     }
 
     // ------------------------------------------------------------ libmpv
@@ -235,6 +246,11 @@ mod win {
 
         fn seek(&mut self, secs: f64, relative: bool) {
             let _ = self.mpv.command(&["seek", &format!("{secs:.3}"), if relative { "relative" } else { "absolute" }]);
+        }
+
+        fn set_cursor(&mut self, on: bool) {
+            // mpv сам показывает курсор при движении и прячет через 3 с покоя.
+            let _ = self.mpv.set("cursor-autohide", if on { "3000" } else { "always" });
         }
 
         fn rearm(&mut self, at: f64) {
@@ -375,7 +391,12 @@ mod win {
         match msg {
             // Курсор над видео не показываем.
             WM_SETCURSOR => {
-                SetCursor(None);
+                // Курсор над видео скрыт; с «Показать курсор» — обычная стрелка (у libmpv он сам прячет его в покое).
+                if super::SHOW_CURSOR.load(std::sync::atomic::Ordering::SeqCst) {
+                    SetCursor(LoadCursorW(None, IDC_ARROW).unwrap_or_default());
+                } else {
+                    SetCursor(None);
+                }
                 LRESULT(1)
             }
             // Окно не забирает фокус у сцены даже по щелчку.
@@ -482,6 +503,9 @@ mod win {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         let timer = SetTimer(None, 0, TICK_MS, None);
         let (mut started, mut repeat) = (false, false);
+        // Режим курсора — как выбран сейчас; меняется на лету (проверяем на каждом такте).
+        let mut cursor = SHOW_CURSOR.load(Ordering::SeqCst);
+        main.engine.set_cursor(cursor);
         let mut spare: Option<Player> = None;
         let mut last_pos: Option<(u32, u32, bool)> = None;
         let mut ticks = 0u32;
@@ -513,9 +537,20 @@ mod win {
             }
             if msg.hwnd.is_invalid() && msg.message == WM_TIMER && msg.wParam.0 == timer {
                 ticks += 1;
+                let c = SHOW_CURSOR.load(Ordering::SeqCst);
+                if c != cursor {
+                    cursor = c;
+                    main.engine.set_cursor(c);
+                    if let Some(sp) = spare.as_mut() {
+                        sp.engine.set_cursor(c);
+                    }
+                }
                 // Второй проигрыватель — как только основной загружен (вдвоём грузиться дольше).
                 if repeat && main.ready && spare.is_none() {
                     spare = open_spare().ok();
+                    if let Some(sp) = spare.as_mut() {
+                        sp.engine.set_cursor(cursor);
+                    }
                 }
                 if let Some(sp) = spare.as_mut() {
                     let st = sp.engine.tick();

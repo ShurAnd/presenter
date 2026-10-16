@@ -73,6 +73,8 @@ pub enum Cmd {
     Zoom { step: i32 },
     /// Сдвиг увеличенного слайда: −1 / 0 / 1 по горизонтали и вертикали (на треть видимой части).
     Pan { dx: i32, dy: i32 },
+    /// Курсор мыши на экране показа: виден при движении (иначе всегда скрыт).
+    Cursor { on: bool },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -210,6 +212,9 @@ pub struct StateMsg {
     pub zoom: f32,
     #[serde(default)]
     pub view: [f32; 4],
+    /// Курсор на экране показа виден при движении мыши (галочка «Показать курсор»).
+    #[serde(default)]
+    pub cursor: bool,
 }
 
 /// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).
