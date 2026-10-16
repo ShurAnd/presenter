@@ -457,6 +457,8 @@ struct App {
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
     help_open: bool,
+    /// Видео на слайде PowerPoint, выбранное в строке «Видео N из M»: (показ, слайд) и номер.
+    media_sel: ((u64, usize), usize),
     /// Размер сцены в пикселях и пропорции (ширина / высота) текущего слайда — для увеличения.
     stage_px: (f32, f32),
     slide_aspect: f32,
@@ -603,6 +605,7 @@ impl App {
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             help_open: false,
+            media_sel: ((0, 0), 0),
             stage_px: (1920.0, 1080.0),
             slide_aspect: 16.0 / 9.0,
             reserve_form: None,
@@ -2276,7 +2279,7 @@ impl App {
         let h = ((ui.available_width() - 2.0 * GAP - panel) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
         let zview = (view.zoom > 1.0).then_some(view.view);
         if !view.media.is_empty() {
-            self.media_row(ui, &view.media);
+            self.media_row(ui, &view.media, (id, view.page));
             ui.add_space(4.0);
         }
         let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| {
@@ -2332,40 +2335,53 @@ impl App {
     }
 
     /// Видео и звук на слайде PowerPoint: запуск, пауза, стоп — мыши на экране показа нет.
-    fn media_row(&mut self, ui: &mut egui::Ui, media: &[MediaInfo]) {
+    fn media_row(&mut self, ui: &mut egui::Ui, media: &[MediaInfo], key: (u64, usize)) {
+        // Выбранное видео — своё у каждого слайда; новый слайд — снова первое.
+        if self.media_sel.0 != key {
+            self.media_sel = (key, 0);
+        }
+        let n = self.media_sel.1.min(media.len() - 1);
+        let m = &media[n];
         let mut cmd = None;
-        // Каждое видео — своей строкой, кнопки друг под другом: в одну строку несколько видео
-        // не помещались по ширине, и кнопки второго и третьего уезжали за край окна.
-        egui::Grid::new("slide_media").num_columns(5).spacing([10.0, 4.0]).show(ui, |ui| {
-            for (n, m) in media.iter().enumerate() {
-                let what = if m.video { "Видео на слайде" } else { "Звук на слайде" };
-                let what = if media.len() > 1 { format!("{what} {}", n + 1) } else { what.to_string() };
-                ui.label(RichText::new(format!("{what}:")).strong());
-                // Имя фигуры из PowerPoint — чтобы понять, какое из видео какое.
-                let name: String = if m.name.chars().count() > 32 { m.name.chars().take(32).chain("…".chars()).collect() } else { m.name.clone() };
-                ui.label(RichText::new(name).color(Color32::from_gray(0x55))).on_hover_text(&m.name);
-                let (state, color) = match m.state {
-                    0 => ("играет", GREEN),
-                    1 => ("пауза", BLUE),
-                    // До первого запуска PowerPoint сообщает «не готово» (3) — запускать при этом можно.
-                    _ => ("не запущено", GRAY),
-                };
-                ui.label(RichText::new(state).color(color));
-                let size = egui::vec2(120.0, 0.0);
-                if m.state == 0 {
-                    if ui.add(cbutton("Пауза", BLUE).min_size(size)).clicked() {
-                        cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Pause });
-                    }
-                } else {
-                    let label = if m.state == 1 { "▶ Продолжить" } else { "▶ Старт" };
-                    if ui.add(cbutton(label, GREEN).min_size(size)).on_hover_text("Запустить на экране показа (как щелчок по видео)").clicked() {
-                        cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Play });
-                    }
+        ui.horizontal(|ui| {
+            let what = if m.video { "Видео" } else { "Звук" };
+            let title = if media.len() > 1 { format!("{what} {} из {}", n + 1, media.len()) } else { format!("{what} на слайде") };
+            ui.label(RichText::new(title).strong().size(15.0)).on_hover_text(&m.name);
+            let (state, color) = match m.state {
+                0 => ("играет", GREEN),
+                1 => ("пауза", BLUE),
+                // До первого запуска PowerPoint сообщает «не готово» (3) — запускать при этом можно.
+                _ => ("не запущено", GRAY),
+            };
+            ui.add_sized([96.0, 20.0], egui::Label::new(RichText::new(state).color(color)));
+            let size = egui::vec2(130.0, 0.0);
+            if m.state == 0 {
+                if ui.add(cbutton("Пауза", BLUE).min_size(size)).clicked() {
+                    cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Pause });
                 }
-                if ui.add_enabled(m.state <= 1, cbutton("■ Стоп", RED)).clicked() {
-                    cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Stop });
+            } else {
+                let label = if m.state == 1 { "▶ Продолжить" } else { "▶ Старт" };
+                if ui.add(cbutton(label, GREEN).min_size(size)).on_hover_text("Запустить на экране показа (как щелчок по видео)").clicked() {
+                    cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Play });
                 }
-                ui.end_row();
+            }
+            if ui.add_enabled(m.state <= 1, cbutton("■ Стоп", RED)).clicked() {
+                cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Stop });
+            }
+            // Несколько видео — переключение между ними (порядок — как читается слайд).
+            if media.len() > 1 {
+                ui.add_space(12.0);
+                if ui.add_enabled(n > 0, cbutton("◀ Пред. видео", GRAY)).clicked() {
+                    self.media_sel.1 = n - 1;
+                }
+                if ui.add_enabled(n + 1 < media.len(), cbutton("След. видео ▶", GRAY)).clicked() {
+                    self.media_sel.1 = n + 1;
+                }
+                // Что ещё играет на слайде, кроме выбранного.
+                let others: Vec<String> = media.iter().enumerate().filter(|(i, o)| *i != n && o.state == 0).map(|(i, _)| (i + 1).to_string()).collect();
+                if !others.is_empty() {
+                    ui.label(RichText::new(format!("играет также: {}", others.join(", "))).color(GREEN));
+                }
             }
         });
         if let Some(c) = cmd {
@@ -3366,7 +3382,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("PowerPoint и видео", &[
         ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
-        ("Видео внутри слайда", "Если на слайде есть видео или звук, над превью появляется строка «Видео на слайде» с кнопками «Старт», «Пауза», «Стоп» — так запускается и видео, которое в PowerPoint включается щелчком мыши (курсора на экране показа нет). Работает и у клиента."),
+        ("Видео внутри слайда", "Если на слайде есть видео или звук, над превью появляется строка «Видео на слайде» с кнопками «Старт» / «Пауза» и «Стоп» — так запускается и видео, которое в PowerPoint включается щелчком мыши (курсора на экране показа нет). Несколько видео — «Видео 1 из 3» и кнопки «Пред. видео» / «След. видео» (по порядку на слайде: слева направо, сверху вниз). Работает и у клиента."),
         ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон, а видео остаётся готовым: пробел — показать ещё раз с начала, без загрузки. Убрать видео — «Закрыть показ»."),
         ("Повтор видео", "Значок круговой стрелки справа в строке видео: синий — видео идёт по кругу, после конца сразу начинается заново (фон не появляется). По умолчанию выключен; переключать можно и во время показа. Запоминается в списке сервера."),
         ("Закрыть показ", "Кнопка «Закрыть показ», Shift+0 или двойной Esc на экране показа. На экране показа остаётся фон."),

@@ -66,6 +66,23 @@ $script:exp = $null
 # Видео и звук на текущем слайде: для какого слайда собран список, сам список, что последним сообщили.
 $script:mslide = -1; $script:mlist = @(); $script:mlast = $null
 
+# Видео и звук среди фигур — и внутри групп на любой глубине. Медиа — любая фигура, у которой
+# есть параметры медиа (MediaFormat): так находятся и видео в заполнителях макета, и вставленные
+# любым способом (по одному типу фигуры «медиа» находилось не всё — замечание пользователя 16.10.2026).
+function MediaShapes($shapes, $list) {
+    foreach ($sh in $shapes) {
+        $t = 0; try { $t = [int]$sh.Type } catch {}
+        if ($t -eq 6) { try { MediaShapes $sh.GroupItems $list } catch {}; continue }
+        $m = ($t -eq 16)
+        # У обычных фигур MediaFormat пустой (без ошибки) — медиа только там, где он есть.
+        if (-not $m) { try { $m = ($sh.MediaFormat -ne $null) } catch {} }
+        if (-not $m) { continue }
+        $kind = 3; try { $kind = [int]$sh.MediaType } catch {}
+        $hex = ([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes([string]$sh.Name)) -replace '-', '')
+        $list.Add(@{ id = $sh.Id; name = $hex; kind = $kind; top = [double]$sh.Top; left = [double]$sh.Left })
+    }
+}
+
 # Видео и звук на текущем слайде и их состояние — программе, только если что-то изменилось.
 # Фигуры перебираем только при смене слайда, на опросе — лишь состояние проигрывателей.
 function MediaReport($view) {
@@ -75,21 +92,9 @@ function MediaReport($view) {
         if ($idx -ne $script:mslide) {
             $script:mslide = $idx
             $list = New-Object 'Collections.Generic.List[object]'
-            # Фигуры слайда и то, что внутри групп (видео бывает сгруппировано с подписью или рамкой).
-            $shapes = New-Object 'Collections.Generic.List[object]'
-            foreach ($sh in $slide.Shapes) {
-                $shapes.Add($sh)
-                if ($sh.Type -eq 6) { try { foreach ($g in $sh.GroupItems) { $shapes.Add($g) } } catch {} }
-            }
-            foreach ($sh in $shapes) {
-                $m = $false
-                try { $m = ($sh.Type -eq 16) -or ($sh.Type -eq 14 -and $sh.PlaceholderFormat.ContainedType -eq 16) } catch {}
-                if (-not $m) { continue }
-                $kind = 3; try { $kind = [int]$sh.MediaType } catch {}
-                $hex = ([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes([string]$sh.Name)) -replace '-', '')
-                $list.Add(@{ id = $sh.Id; name = $hex; kind = $kind })
-            }
-            $script:mlist = $list
+            MediaShapes $slide.Shapes $list
+            # «Видео 1, 2, 3» — в порядке чтения слайда: по строкам сверху вниз, в строке слева направо.
+            $script:mlist = @($list | Sort-Object { [math]::Round($_.top / 60) }, { $_.left })
         }
         $parts = New-Object 'Collections.Generic.List[string]'
         foreach ($m in $script:mlist) {
