@@ -2334,34 +2334,38 @@ impl App {
     /// Видео и звук на слайде PowerPoint: запуск, пауза, стоп — мыши на экране показа нет.
     fn media_row(&mut self, ui: &mut egui::Ui, media: &[MediaInfo]) {
         let mut cmd = None;
-        ui.horizontal(|ui| {
+        // Каждое видео — своей строкой, кнопки друг под другом: в одну строку несколько видео
+        // не помещались по ширине, и кнопки второго и третьего уезжали за край окна.
+        egui::Grid::new("slide_media").num_columns(5).spacing([10.0, 4.0]).show(ui, |ui| {
             for (n, m) in media.iter().enumerate() {
-                if n > 0 {
-                    ui.add_space(14.0);
-                }
                 let what = if m.video { "Видео на слайде" } else { "Звук на слайде" };
                 let what = if media.len() > 1 { format!("{what} {}", n + 1) } else { what.to_string() };
+                ui.label(RichText::new(format!("{what}:")).strong());
+                // Имя фигуры из PowerPoint — чтобы понять, какое из видео какое.
+                let name: String = if m.name.chars().count() > 32 { m.name.chars().take(32).chain("…".chars()).collect() } else { m.name.clone() };
+                ui.label(RichText::new(name).color(Color32::from_gray(0x55))).on_hover_text(&m.name);
                 let (state, color) = match m.state {
                     0 => ("играет", GREEN),
                     1 => ("пауза", BLUE),
                     // До первого запуска PowerPoint сообщает «не готово» (3) — запускать при этом можно.
                     _ => ("не запущено", GRAY),
                 };
-                ui.label(RichText::new(format!("{what}:")).strong()).on_hover_text(&m.name);
                 ui.label(RichText::new(state).color(color));
+                let size = egui::vec2(120.0, 0.0);
                 if m.state == 0 {
-                    if btn(ui, "Пауза", BLUE).clicked() {
+                    if ui.add(cbutton("Пауза", BLUE).min_size(size)).clicked() {
                         cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Pause });
                     }
                 } else {
                     let label = if m.state == 1 { "▶ Продолжить" } else { "▶ Старт" };
-                    if btn(ui, label, GREEN).on_hover_text("Запустить на экране показа (как щелчок по видео)").clicked() {
+                    if ui.add(cbutton(label, GREEN).min_size(size)).on_hover_text("Запустить на экране показа (как щелчок по видео)").clicked() {
                         cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Play });
                     }
                 }
                 if ui.add_enabled(m.state <= 1, cbutton("■ Стоп", RED)).clicked() {
                     cmd = Some(Cmd::PptMedia { id: m.id, action: MediaAction::Stop });
                 }
+                ui.end_row();
             }
         });
         if let Some(c) = cmd {

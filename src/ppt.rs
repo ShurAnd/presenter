@@ -75,7 +75,13 @@ function MediaReport($view) {
         if ($idx -ne $script:mslide) {
             $script:mslide = $idx
             $list = New-Object 'Collections.Generic.List[object]'
+            # Фигуры слайда и то, что внутри групп (видео бывает сгруппировано с подписью или рамкой).
+            $shapes = New-Object 'Collections.Generic.List[object]'
             foreach ($sh in $slide.Shapes) {
+                $shapes.Add($sh)
+                if ($sh.Type -eq 6) { try { foreach ($g in $sh.GroupItems) { $shapes.Add($g) } } catch {} }
+            }
+            foreach ($sh in $shapes) {
                 $m = $false
                 try { $m = ($sh.Type -eq 16) -or ($sh.Type -eq 14 -and $sh.PlaceholderFormat.ContainedType -eq 16) } catch {}
                 if (-not $m) { continue }
