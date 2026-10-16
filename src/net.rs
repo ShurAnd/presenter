@@ -73,25 +73,6 @@ pub enum Cmd {
     Zoom { step: i32 },
     /// Сдвиг увеличенного слайда: −1 / 0 / 1 по горизонтали и вертикали (на треть видимой части).
     Pan { dx: i32, dy: i32 },
-    /// Видео или звук на слайде PowerPoint (`MediaInfo::id`): запустить / пауза / стоп.
-    PptMedia { id: i32, action: MediaAction },
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-pub enum MediaAction {
-    Play,
-    Pause,
-    Stop,
-}
-
-/// Видео или звук на текущем слайде PowerPoint.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
-pub struct MediaInfo {
-    pub id: i32,
-    pub name: String,
-    pub video: bool,
-    /// 0 — играет, 1 — пауза, 2 — остановлено, 3 — не готово.
-    pub state: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -229,9 +210,6 @@ pub struct StateMsg {
     pub zoom: f32,
     #[serde(default)]
     pub view: [f32; 4],
-    /// Видео и звук на текущем слайде PowerPoint (их запускают кнопками — мыши на экране показа нет).
-    #[serde(default)]
-    pub media: Vec<MediaInfo>,
 }
 
 /// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).
