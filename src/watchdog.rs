@@ -12,7 +12,7 @@ const HANG_LIMIT: Duration = Duration::from_secs(20);
 /// Падений подряд, после которых делаем длинную паузу (чтобы не крутиться в цикле).
 const FAST_CRASHES: u32 = 5;
 
-const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Presentator";
 
 fn log_path() -> PathBuf {
@@ -102,34 +102,19 @@ pub fn run(args: Vec<String>) {
 
 // ---------------------------------------------------------------- автозапуск
 
-fn reg() -> Command {
-    let mut c = Command::new("reg");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    c
-}
-
 /// Включён ли автозапуск сервера при входе в Windows.
 pub fn autostart_enabled() -> bool {
-    reg().args(["query", RUN_KEY, "/v", RUN_VALUE]).output().is_ok_and(|o| o.status.success())
+    crate::registry::get(RUN_KEY, RUN_VALUE).is_some()
 }
 
 /// Включить / выключить автозапуск: сторож с сервером при входе текущего пользователя.
+/// Пишем через Windows API, а не запуском `reg.exe` — так делают обычные программы.
 pub fn set_autostart(on: bool) -> Result<(), String> {
-    let out = if on {
+    if on {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let cmd = format!("\"{}\" --watchdog --server", exe.display());
-        reg().args(["add", RUN_KEY, "/v", RUN_VALUE, "/t", "REG_SZ", "/d", &cmd, "/f"]).output()
+        crate::registry::set(RUN_KEY, RUN_VALUE, &format!("\"{}\" --watchdog --server", exe.display()))
     } else {
-        reg().args(["delete", RUN_KEY, "/v", RUN_VALUE, "/f"]).output()
-    };
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => Err(e.to_string()),
+        crate::registry::delete(RUN_KEY, RUN_VALUE)
     }
 }
 
@@ -184,8 +169,7 @@ mod tests {
         let was = super::autostart_enabled();
         super::set_autostart(true).unwrap();
         assert!(super::autostart_enabled());
-        let out = super::reg().args(["query", super::RUN_KEY, "/v", super::RUN_VALUE]).output().unwrap();
-        println!("{}", String::from_utf8_lossy(&out.stdout).lines().find(|l| l.contains(super::RUN_VALUE)).unwrap_or("").trim());
+        println!("{}", crate::registry::get(super::RUN_KEY, super::RUN_VALUE).unwrap_or_default());
         super::set_autostart(false).unwrap();
         assert!(!super::autostart_enabled());
         if was {

@@ -13,6 +13,7 @@ mod net;
 mod network;
 mod player;
 mod ppt;
+mod registry;
 mod render;
 mod screen;
 mod stage;
@@ -710,6 +711,8 @@ impl eframe::App for App {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         jlog!("Выход из программы");
         keep_awake(false);
+        // Показ PowerPoint закрываем сами, пока процесс жив: иначе скрытый PowerPoint останется с файлом.
+        self.ppt_host.shutdown();
         self.save_cfg();
         // Список и присланные файлы остаются — при следующем запуске список восстановится.
         self.save_list();

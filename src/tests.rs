@@ -3,6 +3,11 @@ use std::time::{Duration, Instant};
 
 /// Сквозной тест против запущенного экземпляра `presentator --server`:
 /// TEST_FILES="a.pdf;b.pptx" cargo test e2e -- --ignored --nocapture
+/// Порт сервера для сквозных тестов: TEST_PORT, по умолчанию 14999.
+fn test_port() -> u16 {
+    std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999)
+}
+
 #[test]
 #[ignore]
 fn e2e() {
@@ -20,13 +25,13 @@ fn e2e() {
     };
     // Неверный пароль должен давать понятный отказ.
     let (btx, brx) = channel();
-    let _bad = net::start_client("127.0.0.1".into(), 14999, "wrong".into(), btx, || {});
+    let _bad = net::start_client("127.0.0.1".into(), test_port(), "wrong".into(), btx, || {});
     match brx.recv_timeout(Duration::from_secs(10)).unwrap() {
         CliEvent::Closed(r) => assert_eq!(r, "Неверный пароль"),
         _ => panic!("ожидался отказ"),
     }
 
-    let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+    let c = net::start_client("127.0.0.1".into(), test_port(), "default_password".into(), tx, || {});
     wait("connect", &|e| matches!(e, CliEvent::Connected));
     // Список на сервере переживает перезапуск — начинаем с чистого.
     c.send(CliReq::Cmd(Cmd::Clear));
@@ -211,7 +216,7 @@ fn e2e_list() {
 fn e2e_cmd() {
     let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let (tx, rx) = channel();
-    let c = net::start_client("127.0.0.1".into(), env("TEST_PORT", 14999) as u16, "default_password".into(), tx, || {});
+    let c = net::start_client("127.0.0.1".into(), test_port(), "default_password".into(), tx, || {});
     let (pos, page) = (env("TEST_OPEN", 1), env("TEST_PAGE", 1));
     let t = Instant::now();
     let mut sent = (false, false);
@@ -453,7 +458,7 @@ fn e2e_upload_cmd() {
     let pdf = PathBuf::from(std::env::var("TEST_PDF").unwrap());
     let big = PathBuf::from(std::env::var("TEST_BIG").unwrap());
     let (tx, rx) = channel();
-    let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+    let c = net::start_client("127.0.0.1".into(), test_port(), "default_password".into(), tx, || {});
     let next_state = |timeout: Duration| -> Option<StateMsg> {
         let t = Instant::now();
         while let Ok(ev) = rx.recv_timeout(timeout.saturating_sub(t.elapsed())) {
@@ -536,7 +541,7 @@ fn e2e_preview() {
             }
         }
     };
-    let c = net::start_client("127.0.0.1".into(), 14999, "default_password".into(), tx, || {});
+    let c = net::start_client("127.0.0.1".into(), test_port(), "default_password".into(), tx, || {});
     c.send(CliReq::Cmd(Cmd::Clear));
     wait("cleared", &|s, _| s.items.is_empty());
     for f in &files {

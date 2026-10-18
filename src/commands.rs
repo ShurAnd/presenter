@@ -191,7 +191,11 @@ impl App {
                 if let Some(s) = self.show.as_mut().filter(|s| s.zoom > 1.0) {
                     (s.zoom, s.center) = (1.0, (0.5, 0.5));
                 }
-                self.ppt_host.send(if matches!(cmd, Cmd::Next) { "next" } else { "prev" });
+                if matches!(cmd, Cmd::Next) {
+                    self.ppt_host.next();
+                } else {
+                    self.ppt_host.prev();
+                }
             }
             Cmd::Next => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
             Cmd::Prev => self.go(|s| s.page.saturating_sub(1)),
@@ -326,11 +330,11 @@ impl App {
                 // Позицию PowerPoint сообщит сам — в нём шаг может быть анимацией, а не слайдом.
                 ShowKind::Ppt(_) => {
                     if p == s.page + 1 {
-                        self.ppt_host.send("next");
+                        self.ppt_host.next();
                     } else if p + 1 == s.page {
-                        self.ppt_host.send("prev");
+                        self.ppt_host.prev();
                     } else if p != s.page {
-                        self.ppt_host.send(&format!("goto {}", p + 1));
+                        self.ppt_host.goto(p + 1);
                     }
                 }
                 ShowKind::Pdf(_) => {
@@ -367,7 +371,7 @@ impl App {
                 if show.opened.elapsed() >= PPT_TIMEOUT {
                     // PowerPoint не отвечает (завис, висит его диалог) — перезапускаем мост.
                     self.ppt_host.restart();
-                    self.status = "PowerPoint не отвечает — мост перезапущен, откройте презентацию ещё раз".into();
+                    self.status = "PowerPoint не отвечает — он перезапущен, откройте презентацию ещё раз".into();
                     self.close_show();
                     self.dirty = true;
                 } else {

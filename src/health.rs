@@ -217,6 +217,14 @@ pub fn start(
     Collector { stop }
 }
 
+/// Номер процесса PowerPoint, если он запущен.
+pub fn powerpoint_pid() -> Option<u32> {
+    #[cfg(windows)]
+    return win::powerpoint_pid();
+    #[cfg(not(windows))]
+    None
+}
+
 #[cfg(not(windows))]
 mod win {
     use super::HealthInfo;
@@ -358,6 +366,11 @@ mod win {
 
     #[cfg(test)]
     pub fn cost_probe_ppt() -> Option<u32> {
+        unsafe { find_process("POWERPNT.EXE") }
+    }
+
+    /// Номер процесса PowerPoint (он запускается в одном экземпляре на пользователя).
+    pub fn powerpoint_pid() -> Option<u32> {
         unsafe { find_process("POWERPNT.EXE") }
     }
 

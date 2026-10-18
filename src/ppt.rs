@@ -1,12 +1,13 @@
 //! Показ PPTX через установленный PowerPoint: запускается настоящее слайд-шоу,
 //! которым мы управляем (вперёд, назад, переход к слайду) и за которым следим.
-//! Мост к PowerPoint — скрытый постоянный процесс PowerShell, работающий с ним по COM.
+//! Мост к PowerPoint — свой поток программы, работающий с ним по COM (`IDispatch`) напрямую.
+//! До 18.10.2026 мостом был скрытый процесс PowerShell со скриптом — его отвергли: скрытый
+//! `powershell -ExecutionPolicy Bypass` антивирусы считают подозрительным.
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 pub enum PptEvent {
@@ -45,283 +46,24 @@ pub struct Media {
     pub rect: [f32; 4],
 }
 
-/// Постоянный мост: один процесс PowerShell и один PowerPoint на всё время работы программы.
-/// Открыть показ = открыть файл в уже запущенном PowerPoint (~0,2 с вместо ~1,5 с).
-/// Переключение — закрыть файл и открыть другой в том же PowerPoint: без перезапуска,
-/// поэтому нет гонки, когда новый показ подключался к ещё закрывающемуся PowerPoint.
-///
-/// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или -> <папка слайдов
-/// в base64 или -> <ширина картинки>`, `next`, `prev`, `goto N`, `poll`, `show`, `zoom N <ширина> <файл base64>`,
-/// `cursor 3|4` (указатель в слайд-шоу: 3 — всегда скрыт, 4 — стрелка при движении, сама прячется),
-/// `media play|pause|stop <id фигуры>`, `close`, `quit`.
-/// Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`, `slide <sid> N`, `zoom <sid> N`, `zoomerr <sid> текст`,
-/// `media <sid> <слайд> id:имя-hex:вид:состояние:позиция:длительность:лево:верх:ширина:высота;…` (видео и звук на
-/// текущем слайде; координаты — в десятитысячных долях слайда; шлётся только при изменении),
-/// `ended <sid>`, `error <sid> текст`.
-///
-/// Слайды для превью мост сохраняет сам, по одному в паузах между командами: команды ждут не дольше
-/// одного слайда. Отдельный процесс для этого не годится — второй клиент того же PowerPoint
-/// получает отказ «занят», пока первый с ним работает, и наоборот.
-const SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [Text.Encoding]::UTF8
-function Say($s) { [Console]::Out.WriteLine($s); [Console]::Out.Flush() }
-function Msg($e) { $e.Exception.Message -replace '\s+', ' ' }
-$script:app = $null; $script:pres = $null; $script:win = $null; $script:total = 0; $script:sid = '0'
-# Указатель мыши в показе: 3 — всегда скрыт, 4 — стрелка при движении (галочка «Показать курсор»).
-$script:cursor = 3
-# Сохранение слайдов картинками: папка, размер и какие слайды ещё не сохранены.
-$script:exp = $null
-# Видео и звук на текущем слайде: для какого слайда собран список, сам список, что последним сообщили.
-$script:mslide = -1; $script:mlist = @(); $script:mlast = $null
-# Папка слайдов презентации — туда же перечень фигур слайда (для разбора, если видео не нашлось).
-$script:sdir = $null
-
-# Видео и звук среди фигур — и внутри групп на любой глубине. Медиа — фигура с типом «медиа» (16),
-# заполнитель с медиа внутри или любая фигура с параметрами медиа (MediaFormat): по одному типу
-# находилось не всё (замечание пользователя 16.10.2026).
-function MediaShapes($shapes, $list) {
-    foreach ($sh in $shapes) {
-        $t = 0; try { $t = [int]$sh.Type } catch {}
-        if ($t -eq 6) { try { MediaShapes $sh.GroupItems $list } catch {}; continue }
-        $m = ($t -eq 16)
-        if (-not $m -and $t -eq 14) { try { $m = ([int]$sh.PlaceholderFormat.ContainedType -eq 16) } catch {} }
-        # У обычных фигур MediaFormat пустой (без ошибки) — медиа только там, где он есть.
-        if (-not $m) { try { $m = ($sh.MediaFormat -ne $null) } catch {} }
-        if (-not $m) { continue }
-        $kind = 3; try { $kind = [int]$sh.MediaType } catch {}
-        # Длительность — у самой фигуры: Player.Duration у PowerPoint пустой (проверено 18.10.2026).
-        $len = 0; try { $len = [int]($sh.MediaFormat.Length / 1000) } catch {}
-        $hex = ([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes([string]$sh.Name)) -replace '-', '')
-        $list.Add(@{ id = $sh.Id; name = $hex; kind = $kind; len = $len; top = [double]$sh.Top; left = [double]$sh.Left; w = [double]$sh.Width; h = [double]$sh.Height })
-    }
+/// Запросы к потоку моста.
+enum Req {
+    Open { sid: u64, path: PathBuf, windowed: bool, monitor: String, slides: Option<PathBuf>, width: u32 },
+    Next,
+    Prev,
+    /// Перейти к слайду (с единицы).
+    Goto(usize),
+    /// Вывести слайд-шоу на передний план.
+    Show,
+    /// Сохранить слайд крупной картинкой: слайд, ширина, файл.
+    Zoom(usize, u32, PathBuf),
+    /// Указатель мыши в слайд-шоу: 3 — всегда скрыт, 4 — стрелка при движении.
+    Cursor(i32),
+    /// Видео на слайде: `Play` / `Pause` / `Stop` и номер фигуры.
+    Media(String, i32),
+    Close,
+    Quit,
 }
-
-# Перечень всех фигур слайда (с группами) — в файл shapes_N.txt папки слайдов: если видео не
-# нашлось, по нему видно, как оно вставлено.
-function ShapeInventory($shapes, $lines, $depth) {
-    foreach ($sh in $shapes) {
-        $t = ''; $ct = ''; $mt = ''; $mf = ''; $link = ''
-        try { $t = [int]$sh.Type } catch {}
-        try { $ct = [int]$sh.PlaceholderFormat.ContainedType } catch {}
-        try { $mt = [int]$sh.MediaType } catch {}
-        try { $mf = [string]($sh.MediaFormat -ne $null) } catch { $mf = 'ошибка' }
-        try { $link = [string]$sh.LinkFormat.SourceFullName } catch {}
-        $lines.Add(('  ' * $depth) + ('{0} | id {1} | тип {2} | в заполнителе {3} | медиа {4} | MediaFormat {5} | {6:N0},{7:N0} {8:N0}x{9:N0} | {10}' -f $sh.Name, $sh.Id, $t, $ct, $mt, $mf, $sh.Left, $sh.Top, $sh.Width, $sh.Height, $link))
-        if ($t -eq 6) { try { ShapeInventory $sh.GroupItems $lines ($depth + 1) } catch {} }
-    }
-}
-
-# Видео и звук на текущем слайде, их состояние и позиция — программе, только если что-то изменилось.
-# Фигуры перебираем только при смене слайда, на опросе — лишь проигрыватели.
-function MediaReport($view) {
-    try {
-        $slide = $view.Slide
-        $idx = $slide.SlideIndex
-        if ($idx -ne $script:mslide) {
-            $script:mslide = $idx
-            $list = New-Object 'Collections.Generic.List[object]'
-            MediaShapes $slide.Shapes $list
-            # «Видео 1, 2, 3» — в порядке чтения слайда: по строкам сверху вниз, в строке слева направо.
-            $script:mlist = @($list | Sort-Object { [math]::Round($_.top / 60) }, { $_.left })
-            if ($script:sdir) {
-                try {
-                    $lines = New-Object 'Collections.Generic.List[string]'
-                    $lines.Add('Слайд ' + $idx + ', найдено медиа: ' + $script:mlist.Count)
-                    ShapeInventory $slide.Shapes $lines 0
-                    [IO.File]::WriteAllLines((Join-Path $script:sdir ('shapes_' + $idx + '.txt')), $lines, [Text.Encoding]::UTF8)
-                } catch {}
-            }
-        }
-        $sw = [double]$script:pres.PageSetup.SlideWidth; $shh = [double]$script:pres.PageSetup.SlideHeight
-        $parts = New-Object 'Collections.Generic.List[string]'
-        foreach ($m in $script:mlist) {
-            $st = 3; $pos = 0; $dur = $m.len
-            # Проигрыватель берём один раз на слайд — на опросе только читаем его состояние.
-            try {
-                if (-not $m.pl) { $m.pl = $view.Player($m.id) }
-                $st = [int]$m.pl.State; $pos = [int][math]::Floor($m.pl.CurrentPosition / 1000)
-            } catch { $m.pl = $null }
-            $r = ('{0}:{1}:{2}:{3}' -f [int](10000 * $m.left / $sw), [int](10000 * $m.top / $shh), [int](10000 * $m.w / $sw), [int](10000 * $m.h / $shh))
-            $parts.Add([string]$m.id + ':' + $m.name + ':' + $m.kind + ':' + $st + ':' + $pos + ':' + $dur + ':' + $r)
-        }
-        $s = [string]$idx + ' ' + ($parts -join ';')
-    } catch { $s = '0' }
-    if ($s -ne $script:mlast) { $script:mlast = $s; Say ('media ' + $script:sid + ' ' + $s) }
-}
-
-# Живой PowerPoint; если его закрыли или он упал — запускаем заново.
-function App {
-    if ($script:app) { try { $null = $script:app.Version; return $script:app } catch { $script:app = $null } }
-    $script:app = New-Object -ComObject PowerPoint.Application
-    return $script:app
-}
-
-function CloseShow {
-    # Exit у показа файла, открытого без окна, закрывает и сам файл; Close — на всякий случай.
-    if ($script:win) { try { $script:win.View.Exit() } catch {} }
-    if ($script:pres) { try { $script:pres.Saved = -1; $script:pres.Close() } catch {} }
-    $script:win = $null; $script:pres = $null; $script:exp = $null
-    $script:mslide = -1; $script:mlist = @(); $script:mlast = $null
-}
-
-# Какие слайды сохранить картинками (уже сохранённые — пропускаем; все готовы — отметка done).
-function PlanSlides($dir, $width) {
-    if (-not $dir -or (Test-Path -LiteralPath (Join-Path $dir 'done'))) { return }
-    New-Item -ItemType Directory -Force -Path $dir | Out-Null
-    $w = [int]$width
-    $h = [int][math]::Round($w * $script:pres.PageSetup.SlideHeight / $script:pres.PageSetup.SlideWidth)
-    $todo = New-Object 'Collections.Generic.List[int]'
-    for ($i = 1; $i -le $script:total; $i++) {
-        if (-not (Test-Path -LiteralPath (Join-Path $dir ([string]$i + '.jpg')))) { $todo.Add($i) }
-    }
-    $script:exp = @{ dir = $dir; w = $w; h = $h; todo = $todo }
-}
-
-# Сохранить один слайд — сначала текущий и следующие за ним: они нужны превью раньше остальных.
-# Пишем во временный файл и переименовываем: программа не прочитает недописанную картинку.
-function SlideStep {
-    $e = $script:exp
-    try {
-        if ($e.todo.Count -eq 0) {
-            [IO.File]::WriteAllText((Join-Path $e.dir 'done'), '')
-            $script:exp = $null
-            return
-        }
-        $cur = 1; try { $cur = $script:win.View.CurrentShowPosition } catch {}
-        $n = $e.todo | Where-Object { $_ -ge $cur } | Select-Object -First 1
-        if ($n -eq $null) { $n = $e.todo[0] }
-        $null = $e.todo.Remove($n)
-        $f = Join-Path $e.dir ([string]$n + '.jpg')
-        $tmp = Join-Path $e.dir ([string]$n + '.part.jpg')
-        $script:pres.Slides.Item($n).Export($tmp, 'JPG', $e.w, $e.h)
-        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f }
-        Move-Item -LiteralPath $tmp -Destination $f
-        Say ('slide ' + $script:sid + ' ' + $n)
-    } catch { $script:exp = $null }
-}
-
-# Монитор для показа (\\.\DISPLAY2) — в собственную настройку PowerPoint «Показ на мониторе».
-function SetMonitor($dev) {
-    if (-not $dev) { return }
-    try {
-        $k = 'HKCU:\Software\Microsoft\Office\' + $script:app.Version + '\PowerPoint\Options'
-        if (-not (Test-Path $k)) { New-Item $k -Force | Out-Null }
-        Set-ItemProperty -Path $k -Name DisplayMonitor -Value $dev
-    } catch {}
-}
-
-function OpenShow($path, $windowed, $monitor) {
-    $a = App
-    SetMonitor $monitor
-    $script:pres = $a.Presentations.Open($path, -1, 0, 0)
-    $script:total = $script:pres.Slides.Count
-    $ss = $script:pres.SlideShowSettings
-    if ($windowed -eq '1') { $ss.ShowType = 2 } else { $ss.ShowType = 1 }
-    try { $ss.ShowPresenterView = 0 } catch {}
-    $script:win = $ss.Run()
-    # Настройки показа выше меняют презентацию. Помечаем её сохранённой: иначе при закрытии
-    # PowerPoint спросит о сохранении файла, открытого только для чтения.
-    $script:pres.Saved = -1
-    # Указатель мыши: скрыт или стрелка при движении — как выбрано в программе.
-    try { $script:win.View.PointerType = $script:cursor } catch {}
-}
-
-# PowerPoint запускаем сразу (скрыто) — к первому показу он уже готов.
-try { $null = App } catch {}
-Say 'host'
-
-# Ввод читаем асинхронно: пока команд нет, сохраняем слайды для превью.
-$stdin = New-Object IO.StreamReader([Console]::OpenStandardInput())
-$pending = $null
-while ($true) {
-    if (-not $pending) { $pending = $stdin.ReadLineAsync() }
-    $wait = -1; if ($script:exp) { $wait = 0 }
-    if (-not $pending.Wait($wait)) { SlideStep; continue }
-    $line = $pending.Result; $pending = $null
-    if ($line -eq $null -or $line -eq 'quit') { break }
-    $parts = $line.Split(' ')
-    $cmd = $parts[0]
-    if ($cmd -eq 'open') {
-        CloseShow
-        $script:sid = $parts[1]
-        try {
-            $path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
-            $mon = ''
-            if ($parts.Count -gt 4 -and $parts[4] -ne '-') { $mon = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[4])) }
-            try { OpenShow $path $parts[2] $mon } catch {
-                # Одна повторная попытка с заново запущенным PowerPoint.
-                CloseShow; $script:app = $null; OpenShow $path $parts[2] $mon
-            }
-            $hwnd = 0; try { $hwnd = $script:win.HWND } catch {}
-            Say ('ready ' + $script:sid + ' ' + $script:total + ' ' + $hwnd)
-            $script:sdir = $null
-            if ($parts.Count -gt 6 -and $parts[5] -ne '-') {
-                try { $script:sdir = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[5])) } catch {}
-                try { PlanSlides $script:sdir $parts[6] } catch {}
-            }
-        } catch {
-            Say ('error ' + $script:sid + ' ' + (Msg $_)); CloseShow
-        }
-        continue
-    }
-    if ($cmd -eq 'close') { CloseShow; continue }
-    if ($cmd -eq 'cursor') {
-        $script:cursor = [int]$parts[1]
-        if ($script:win) { try { $script:win.View.PointerType = $script:cursor } catch {} }
-        continue
-    }
-    if ($cmd -eq 'zoom') {
-        # Слайд крупной картинкой — для увеличения: сцена покажет её поверх слайд-шоу.
-        try {
-            $n = [int]$parts[1]; $w = [int]$parts[2]
-            $f = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[3]))
-            $h = [int][math]::Round($w * $script:pres.PageSetup.SlideHeight / $script:pres.PageSetup.SlideWidth)
-            $tmp = $f + '.part.jpg'
-            $script:pres.Slides.Item($n).Export($tmp, 'JPG', $w, $h)
-            if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f }
-            Move-Item -LiteralPath $tmp -Destination $f
-            Say ('zoom ' + $script:sid + ' ' + $n)
-        } catch { Say ('zoomerr ' + $script:sid + ' ' + (Msg $_)) }
-        continue
-    }
-    if (-not $script:win) { continue }
-    try {
-        $view = $script:win.View
-        $cur = $view.CurrentShowPosition
-        if ($cmd -eq 'next') {
-            # На последнем шаге последнего слайда не идём дальше, иначе показ закроется.
-            $last = $false
-            if ($cur -ge $script:total) {
-                try { $last = ($view.GetClickIndex() -ge $view.GetClickCount()) } catch { $last = $true }
-            }
-            if (-not $last) { $view.Next() }
-        } elseif ($cmd -eq 'prev') {
-            $view.Previous()
-        } elseif ($cmd -eq 'goto') {
-            $view.GotoSlide([int]$parts[1])
-        } elseif ($cmd -eq 'show') {
-            # Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
-            try { $script:win.Activate() } catch {}
-        } elseif ($cmd -eq 'media') {
-            # Видео на слайде — без мыши: через проигрыватель слайд-шоу.
-            $p = $view.Player([int]$parts[2])
-            if ($parts[1] -eq 'play') { $p.Play() } elseif ($parts[1] -eq 'pause') { $p.Pause() } elseif ($parts[1] -eq 'stop') { $p.Stop() }
-        }
-        # Опрос (poll) PowerPoint лишний раз не трогаем — он может как раз менять слайд.
-        if ($cmd -ne 'poll') { try { $script:pres.Saved = -1 } catch {} }
-        Say ('pos ' + $script:sid + ' ' + $view.CurrentShowPosition + ' ' + $script:total)
-        MediaReport $view
-    } catch {
-        # PowerPoint мог быть просто занят; показ окончен, только если его окна больше нет.
-        $alive = $false
-        try { $alive = ($script:app.SlideShowWindows.Count -gt 0) } catch {}
-        if (-not $alive) { Say ('ended ' + $script:sid); $script:win = $null; CloseShow }
-    }
-}
-CloseShow
-try { if ($script:app -and $script:app.Presentations.Count -eq 0) { $script:app.Quit() } } catch {}
-"#;
 
 #[cfg(windows)]
 #[link(name = "user32")]
@@ -358,6 +100,11 @@ pub fn stage_topmost(on: bool) {
 /// а у нас показ закрывается только кнопкой или двойным Esc. Поэтому, пока идёт наш показ
 /// (`grab_esc(true)`) и на переднем плане окно слайд-шоу, Esc до PowerPoint не доходит,
 /// а каждое нажатие передаётся в приложение.
+///
+/// Сделано «горячей клавишей» Windows (`RegisterHotKey`): она занята только пока слайд-шоу на
+/// переднем плане (проверка раз в 50 мс), в остальное время Esc работает как обычно. До 18.10.2026
+/// здесь был низкоуровневый перехват всей клавиатуры (`WH_KEYBOARD_LL`) — так делают и кейлоггеры,
+/// антивирусы такое не любят.
 #[cfg(windows)]
 mod esc_hook {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -366,22 +113,13 @@ mod esc_hook {
     type Callback = Box<dyn Fn() + Send + Sync>;
     static CALLBACK: OnceLock<Callback> = OnceLock::new();
     pub static GRAB: AtomicBool = AtomicBool::new(false);
-    /// Esc зажат: автоповтор не должен считаться повторным нажатием.
-    static DOWN: AtomicBool = AtomicBool::new(false);
 
-    const WH_KEYBOARD_LL: i32 = 13;
     const VK_ESCAPE: u32 = 0x1B;
-    const WM_KEYDOWN: usize = 0x100;
-    const WM_SYSKEYDOWN: usize = 0x104;
-
-    #[repr(C)]
-    struct KbdLlHookStruct {
-        vk_code: u32,
-        scan_code: u32,
-        flags: u32,
-        time: u32,
-        extra_info: usize,
-    }
+    const MOD_NOREPEAT: u32 = 0x4000; // автоповтор зажатой клавиши — не новое нажатие
+    const WM_HOTKEY: u32 = 0x0312;
+    const PM_REMOVE: u32 = 1;
+    const QS_ALLINPUT: u32 = 0x04FF;
+    const HOTKEY_ID: i32 = 1;
 
     #[repr(C)]
     struct Msg {
@@ -394,19 +132,14 @@ mod esc_hook {
         reserved: [u32; 4],
     }
 
-    type HookProc = unsafe extern "system" fn(i32, usize, isize) -> isize;
-
     #[link(name = "user32")]
     extern "system" {
-        fn SetWindowsHookExW(id: i32, f: HookProc, hmod: isize, thread: u32) -> isize;
-        fn CallNextHookEx(hook: isize, code: i32, w: usize, l: isize) -> isize;
-        fn GetMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32) -> i32;
+        fn RegisterHotKey(hwnd: isize, id: i32, mods: u32, vk: u32) -> i32;
+        fn UnregisterHotKey(hwnd: isize, id: i32) -> i32;
+        fn PeekMessageW(msg: *mut Msg, hwnd: isize, min: u32, max: u32, remove: u32) -> i32;
+        fn MsgWaitForMultipleObjects(count: u32, handles: *const isize, wait_all: i32, ms: u32, mask: u32) -> u32;
         fn GetForegroundWindow() -> isize;
         fn GetClassNameW(hwnd: isize, buf: *mut u16, len: i32) -> i32;
-    }
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetModuleHandleW(name: *const u16) -> isize;
     }
 
     /// Окно слайд-шоу PowerPoint имеет класс screenClass.
@@ -416,36 +149,34 @@ mod esc_hook {
         n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "screenClass"
     }
 
-    unsafe extern "system" fn hook(code: i32, w: usize, l: isize) -> isize {
-        if code == 0 && GRAB.load(Ordering::SeqCst) {
-            let k = &*(l as *const KbdLlHookStruct);
-            if k.vk_code == VK_ESCAPE && slideshow_in_front() {
-                if w == WM_KEYDOWN || w == WM_SYSKEYDOWN {
-                    if !DOWN.swap(true, Ordering::SeqCst) {
-                        if let Some(cb) = CALLBACK.get() {
-                            cb();
-                        }
-                    }
-                } else {
-                    DOWN.store(false, Ordering::SeqCst);
-                }
-                return 1; // клавиша не доходит до PowerPoint
-            }
-        }
-        CallNextHookEx(0, code, w, l)
-    }
-
     pub fn install(cb: Callback) {
         if CALLBACK.set(cb).is_err() {
             return; // уже установлен
         }
-        // Низкоуровневому хуку нужен поток с циклом сообщений.
+        // Горячая клавиша приходит сообщением в очередь потока, который её занял.
         std::thread::spawn(|| unsafe {
-            if SetWindowsHookExW(WH_KEYBOARD_LL, hook, GetModuleHandleW(std::ptr::null()), 0) == 0 {
-                return;
-            }
+            let mut registered = false;
             let mut msg: Msg = std::mem::zeroed();
-            while GetMessageW(&mut msg, 0, 0, 0) > 0 {}
+            loop {
+                while PeekMessageW(&mut msg, 0, 0, 0, PM_REMOVE) != 0 {
+                    if msg.message == WM_HOTKEY && msg.wparam == HOTKEY_ID as usize {
+                        if let Some(cb) = CALLBACK.get() {
+                            cb();
+                        }
+                    }
+                }
+                let grab = GRAB.load(Ordering::SeqCst);
+                let want = grab && slideshow_in_front();
+                if want && !registered {
+                    // Не удалось (Esc занят другой программой) — попробуем на следующем круге.
+                    registered = RegisterHotKey(0, HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE) != 0;
+                } else if !want && registered {
+                    UnregisterHotKey(0, HOTKEY_ID);
+                    registered = false;
+                }
+                // Ждём сообщения или следующей проверки: пока показа нет — реже.
+                MsgWaitForMultipleObjects(0, std::ptr::null(), 0, if grab { 50 } else { 250 }, QS_ALLINPUT);
+            }
         });
     }
 }
@@ -468,50 +199,54 @@ pub fn grab_esc(on: bool) {
 
 type Callback = Arc<dyn Fn(u64, PptEvent) + Send + Sync>;
 
-struct Proc {
-    stdin: ChildStdin,
-    child: Arc<Mutex<Child>>,
-    /// Номер запуска процесса — чтобы события умершего моста не путать с новым.
-    epoch: u64,
+/// Общее у `Host` и потока моста.
+struct Ctx {
+    on_event: Callback,
+    /// С какого момента (мс от старта программы) ждём ответа PowerPoint; 0 — не ждём.
+    waiting: Arc<AtomicU64>,
+    /// Процесс PowerPoint — чтобы завершить его, если он завис.
+    pid: Arc<AtomicU32>,
 }
 
-/// Мост к PowerPoint. Процесс запускается при первой надобности и живёт до выхода из программы;
-/// если он упал или его пришлось убить — запускается заново.
+struct Worker {
+    tx: Sender<Req>,
+    /// Номер запуска потока — чтобы конец старого потока не путать с новым.
+    epoch: u64,
+    /// Закрывается, когда поток моста завершился (закрыл показ и, если можно, PowerPoint).
+    done: Receiver<()>,
+}
+
+/// Мост к PowerPoint: один поток и один PowerPoint на всё время работы программы.
+/// Открыть показ = открыть файл в уже запущенном PowerPoint (~0,2 с вместо ~1,5 с).
+/// Переключение — закрыть файл и открыть другой в том же PowerPoint, без перезапуска.
+///
+/// Поток выполняет запросы по очереди, раз в 400 мс (пока идёт показ) спрашивает у PowerPoint
+/// позицию и состояние видео на слайде, а в паузах сохраняет слайды картинками для превью — по
+/// одному, поэтому запрос ждёт не дольше одного слайда. Отдельный поток или процесс для превью не
+/// годится: PowerPoint отказывает второму клиенту («занят»), пока первый с ним работает.
 pub struct Host {
-    proc: Arc<Mutex<Option<Proc>>>,
-    /// С какого момента (мс от старта программы) ждём ответа PowerPoint; 0 — не ждём.
+    worker: Arc<Mutex<Option<Worker>>>,
     waiting: Arc<AtomicU64>,
     /// Номер текущего показа (0 — показа нет). События чужих показов отбрасываются в `App`.
     current: Arc<AtomicU64>,
     epoch: AtomicU64,
     on_event: Callback,
     /// Курсор в слайд-шоу виден при движении («Показать курсор»).
-    cursor: std::sync::atomic::AtomicBool,
+    cursor: AtomicBool,
+    pid: Arc<AtomicU32>,
 }
 
 impl Host {
     pub fn new(on_event: impl Fn(u64, PptEvent) + Send + Sync + 'static) -> Host {
-        let host = Host {
-            proc: Arc::new(Mutex::new(None)),
+        Host {
+            worker: Arc::new(Mutex::new(None)),
             waiting: Arc::new(AtomicU64::new(0)),
             current: Arc::new(AtomicU64::new(0)),
             epoch: AtomicU64::new(0),
             on_event: Arc::new(on_event),
-            cursor: std::sync::atomic::AtomicBool::new(false),
-        };
-        // Регулярный опрос позиции, пока идёт показ: слайды могут листать и на самом сервере.
-        let (proc, current, waiting) = (Arc::downgrade(&host.proc), host.current.clone(), host.waiting.clone());
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(400));
-            let Some(proc) = proc.upgrade() else { break };
-            // Новый опрос — только когда мост ответил на прошлое: иначе, пока PowerPoint занят (видео на
-            // слайде), опросы копились в очереди, и команды («пауза» видео) ждали за ними по 5–10 с
-            // (замер 18.10.2026).
-            if current.load(Ordering::SeqCst) != 0 && waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                write_line(&proc, "poll");
-            }
-        });
-        host
+            cursor: AtomicBool::new(false),
+            pid: Arc::new(AtomicU32::new(0)),
+        }
     }
 
     /// Запустить мост (и с ним PowerPoint) заранее, чтобы первый показ открылся быстро.
@@ -520,91 +255,30 @@ impl Host {
     }
 
     fn ensure(&self) -> Result<(), String> {
-        let mut g = self.proc.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = self.worker.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_some() {
             return Ok(());
         }
-        // PRESENTATOR_PPT_CMD — подмена моста для отладки без PowerPoint (тот же протокол).
-        let mut cmd = match std::env::var_os("PRESENTATOR_PPT_CMD") {
-            Some(c) => Command::new(c),
-            None => {
-                let mut c = Command::new("powershell");
-                c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", SCRIPT]);
-                c
-            }
-        };
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("не удалось запустить PowerShell: {e}"))?;
-        let stdin = child.stdin.take().ok_or("нет ввода процесса")?;
-        let stdout = child.stdout.take().ok_or("нет вывода процесса")?;
+        let (tx, rx) = mpsc::channel();
+        let (done_tx, done) = mpsc::channel::<()>();
         let epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let child = Arc::new(Mutex::new(child));
-        *g = Some(Proc { stdin, child: child.clone(), epoch });
-
-        // Чтение ответов. Конец вывода — мост умер: показ (если был) считаем оборвавшимся.
-        let (on_event, current, proc, waiting) = (self.on_event.clone(), self.current.clone(), Arc::downgrade(&self.proc), self.waiting.clone());
-        std::thread::spawn(move || {
-            let mut last_pos: Option<(u64, usize, usize)> = None;
-            for line in BufReader::new(stdout).lines() {
-                let Ok(line) = line else { break };
-                waiting.store(0, Ordering::SeqCst); // PowerPoint ответил
-                let mut it = line.split_whitespace();
-                let (head, sid) = (it.next().unwrap_or(""), it.next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0));
-                let rest: Vec<&str> = it.collect();
-                let num = |i: usize| rest.get(i).and_then(|x| x.parse::<usize>().ok());
-                match head {
-                    "ready" => {
-                        let hwnd = rest.get(1).and_then(|x| x.parse::<isize>().ok()).unwrap_or(0);
-                        on_event(sid, PptEvent::Ready(num(0).unwrap_or(0), hwnd));
-                    }
-                    "pos" => {
-                        // Ответ на опрос раз в 400 мс обычно тот же — без изменений GUI не будим.
-                        if let (Some(cur), Some(total)) = (num(0), num(1)) {
-                            if last_pos != Some((sid, cur, total)) {
-                                last_pos = Some((sid, cur, total));
-                                on_event(sid, PptEvent::Pos(cur, total));
-                            }
-                        }
-                    }
-                    "slide" => {
-                        if let Some(n) = num(0) {
-                            on_event(sid, PptEvent::Slide(n));
-                        }
-                    }
-                    "zoom" => {
-                        if let Some(n) = num(0) {
-                            on_event(sid, PptEvent::Zoom(n));
-                        }
-                    }
-                    "zoomerr" => on_event(sid, PptEvent::ZoomFailed(rest.join(" "))),
-                    "media" => on_event(sid, PptEvent::Media(num(0).unwrap_or(0), rest.get(1).map_or(Vec::new(), |s| parse_media(s)))),
-                    "ended" => on_event(sid, PptEvent::Ended),
-                    "error" => on_event(sid, PptEvent::Error(rest.join(" "))),
-                    _ => {}
-                }
-            }
-            let _ = child.lock().unwrap_or_else(|e| e.into_inner()).wait();
-            if let Some(proc) = proc.upgrade() {
-                let mut g = proc.lock().unwrap_or_else(|e| e.into_inner());
-                if g.as_ref().is_some_and(|p| p.epoch == epoch) {
-                    *g = None;
-                }
-            }
-            let sid = current.load(Ordering::SeqCst);
-            if sid != 0 {
-                on_event(sid, PptEvent::Error("мост к PowerPoint завершился".into()));
-            }
-        });
+        let ctx = Ctx { on_event: self.on_event.clone(), waiting: self.waiting.clone(), pid: self.pid.clone() };
+        let guard = EndGuard { _done: done_tx, epoch, worker: Arc::downgrade(&self.worker), current: self.current.clone(), on_event: self.on_event.clone() };
+        std::thread::Builder::new()
+            .name("powerpoint".into())
+            .spawn(move || {
+                let _guard = guard;
+                bridge::run(rx, ctx);
+            })
+            .map_err(|e| format!("не удалось запустить мост к PowerPoint: {e}"))?;
+        *g = Some(Worker { tx, epoch, done });
         Ok(())
+    }
+
+    fn post(&self, req: Req) {
+        if let Some(w) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let _ = w.tx.send(req);
+        }
     }
 
     /// Открыть презентацию и запустить показ. Прежний показ (если был) мост закроет сам.
@@ -613,32 +287,41 @@ impl Host {
     pub fn open(&self, sid: u64, src: &Path, windowed: bool, monitor: &str, slides: Option<&Path>, width: u32) -> Result<(), String> {
         self.ensure()?;
         self.current.store(sid, Ordering::SeqCst);
-        let path = base64(src.to_string_lossy().as_bytes());
-        let mon = if monitor.is_empty() { "-".to_string() } else { base64(monitor.as_bytes()) };
-        let dir = slides.map_or("-".to_string(), |d| base64(d.to_string_lossy().as_bytes()));
-        let _ = self.waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
         // Мост мог перезапуститься — режим указателя напоминаем перед каждым показом.
-        self.send(&format!("cursor {}", if self.cursor.load(Ordering::SeqCst) { 4 } else { 3 }));
-        self.send(&format!("open {sid} {} {path} {mon} {dir} {width}", if windowed { 1 } else { 0 }));
+        self.post(Req::Cursor(if self.cursor.load(Ordering::SeqCst) { 4 } else { 3 }));
+        self.post(Req::Open { sid, path: src.to_path_buf(), windowed, monitor: monitor.to_string(), slides: slides.map(Path::to_path_buf), width });
         Ok(())
+    }
+
+    pub fn next(&self) {
+        self.post(Req::Next);
+    }
+
+    pub fn prev(&self) {
+        self.post(Req::Prev);
+    }
+
+    /// Перейти к слайду `n` (с единицы).
+    pub fn goto(&self, n: usize) {
+        self.post(Req::Goto(n));
     }
 
     /// Курсор в слайд-шоу: `true` — стрелка при движении мыши (PowerPoint прячет её сам),
     /// `false` — всегда скрыт. Действует сразу и на следующие показы.
     pub fn set_cursor(&self, on: bool) {
         self.cursor.store(on, Ordering::SeqCst);
-        self.send(&format!("cursor {}", if on { 4 } else { 3 }));
+        self.post(Req::Cursor(if on { 4 } else { 3 }));
+    }
+
+    /// Видео на слайде: `action` — `play`, `pause` или `stop`; `id` — номер фигуры (`Media::id`).
+    pub fn media(&self, action: &str, id: i32) {
+        self.post(Req::Media(action.to_string(), id));
     }
 
     /// Сохранить слайд `slide` (с единицы) картинкой шириной `width` в файл `path` — для увеличения.
     /// Готово — событие `Zoom(slide)`.
-    /// Видео на слайде: `action` — `play`, `pause` или `stop`; `id` — номер фигуры (`Media::id`).
-    pub fn media(&self, action: &str, id: i32) {
-        self.send(&format!("media {action} {id}"));
-    }
-
     pub fn export_zoom(&self, slide: usize, width: u32, path: &Path) {
-        self.send(&format!("zoom {slide} {width} {}", base64(path.to_string_lossy().as_bytes())));
+        self.post(Req::Zoom(slide, width, path.to_path_buf()));
     }
 
     /// Для показателей сервера: сколько мс PowerPoint не отвечает на запросы моста
@@ -656,17 +339,22 @@ impl Host {
 
     /// Закрыть текущий показ; PowerPoint остаётся запущенным для следующего.
     pub fn close(&self) {
-        self.waiting.store(0, Ordering::SeqCst);
         if self.current.swap(0, Ordering::SeqCst) != 0 {
-            self.send("close");
+            self.post(Req::Close);
         }
     }
 
-    /// PowerPoint завис: убиваем мост, следующий показ запустит его заново.
+    /// PowerPoint завис: бросаем поток моста и завершаем процесс PowerPoint (иначе и новый мост
+    /// подключился бы к тому же зависшему PowerPoint). Следующий показ запустит всё заново.
     pub fn restart(&self) {
         self.current.store(0, Ordering::SeqCst);
-        if let Some(p) = self.proc.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = p.child.lock().unwrap_or_else(|e| e.into_inner()).kill();
+        self.waiting.store(0, Ordering::SeqCst);
+        // Без канала поток моста завершится сам, как только PowerPoint ответит или умрёт.
+        self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let pid = self.pid.swap(0, Ordering::SeqCst);
+        if pid != 0 {
+            crate::jlog!("PowerPoint не отвечает — процесс {pid} завершён");
+            kill(pid);
         }
     }
 
@@ -698,20 +386,68 @@ impl Host {
         }
         #[cfg(not(windows))]
         let _ = (slideshow, target);
-        self.send("show");
+        self.post(Req::Show);
     }
 
-    pub fn send(&self, line: &str) {
-        write_line(&self.proc, line);
+    /// Выход из программы: мост закрывает показ и PowerPoint (если в нём нет чужих файлов).
+    /// Ждём его не дольше 4 с — иначе процесс завершится раньше, и скрытый PowerPoint
+    /// останется висеть с открытым файлом.
+    pub fn shutdown(&self) {
+        let w = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(w) = w {
+            let _ = w.tx.send(Req::Quit);
+            let _ = w.done.recv_timeout(Duration::from_secs(4));
+        }
     }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
-        // Мост закроет показ и PowerPoint (если в нём нет чужих файлов) уже после нашего выхода.
-        self.send("quit");
-        self.proc.lock().unwrap_or_else(|e| e.into_inner()).take();
+        self.shutdown();
     }
+}
+
+/// Конец потока моста (в том числе при панике): если поток не убирали сами (`restart`,
+/// `shutdown`), а показ шёл — сообщаем об обрыве.
+struct EndGuard {
+    _done: Sender<()>,
+    epoch: u64,
+    worker: Weak<Mutex<Option<Worker>>>,
+    current: Arc<AtomicU64>,
+    on_event: Callback,
+}
+
+impl Drop for EndGuard {
+    fn drop(&mut self) {
+        let Some(worker) = self.worker.upgrade() else { return };
+        let mine = {
+            let mut g = worker.lock().unwrap_or_else(|e| e.into_inner());
+            let mine = g.as_ref().is_some_and(|w| w.epoch == self.epoch);
+            if mine {
+                *g = None;
+            }
+            mine
+        };
+        let sid = self.current.load(Ordering::SeqCst);
+        if mine && sid != 0 {
+            (self.on_event)(sid, PptEvent::Error("мост к PowerPoint завершился".into()));
+        }
+    }
+}
+
+/// Завершить зависший процесс PowerPoint.
+fn kill(pid: u32) {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+        if let Ok(h) = OpenProcess(PROCESS_TERMINATE, false, pid) {
+            let _ = TerminateProcess(h, 1);
+            let _ = CloseHandle(h);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = pid;
 }
 
 /// Миллисекунды от первого вызова (монотонно; 0 зарезервирован под «не ждём»).
@@ -720,70 +456,691 @@ fn now_ms() -> u64 {
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
-fn write_line(proc: &Mutex<Option<Proc>>, line: &str) {
-    let mut g = proc.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = g.as_mut() {
-        let _ = p.stdin.write_all(format!("{line}\n").as_bytes()).and_then(|_| p.stdin.flush());
-    }
-}
+/// Вызовы объектов COM по имени (позднее связывание через `IDispatch`) — как в VBA и PowerShell:
+/// у PowerPoint нет удобной библиотеки типов для Rust, а имена свойств и методов — документированные.
+#[cfg(windows)]
+mod com {
+    use std::mem::ManuallyDrop;
+    use std::time::{Duration, Instant};
+    use windows::core::{Error, Interface, BSTR, GUID, HRESULT, IUnknown, PCWSTR, VARIANT};
+    use windows::Win32::System::Com::{CLSIDFromProgID, CoCreateInstance, IDispatch, CLSCTX_LOCAL_SERVER, DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, DISPPARAMS, EXCEPINFO};
 
-/// Путь передаём в base64: так в одной строке протокола не мешают пробелы, кириллица и кавычки.
-fn base64(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            out.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+    pub type R<T> = windows::core::Result<T>;
+
+    const RPC_E_CALL_REJECTED: HRESULT = HRESULT(0x8001_0001u32 as i32);
+    const RPC_E_SERVERCALL_RETRYLATER: HRESULT = HRESULT(0x8001_010Au32 as i32);
+    const DISP_E_EXCEPTION: HRESULT = HRESULT(0x8002_0009u32 as i32);
+    const E_POINTER: HRESULT = HRESULT(0x8000_4003u32 as i32);
+    const E_FAIL: HRESULT = HRESULT(0x8000_4005u32 as i32);
+    const DISPID_PROPERTYPUT: i32 = -3;
+    const LCID: u32 = 0x0400; // LOCALE_USER_DEFAULT
+    const VT_DISPATCH: u16 = 9;
+    const VT_UNKNOWN: u16 = 13;
+
+    /// PowerPoint занят (открывает файл, меняет слайд) и просит повторить позже.
+    pub fn is_busy(e: &Error) -> bool {
+        e.code() == RPC_E_CALL_REJECTED || e.code() == RPC_E_SERVERCALL_RETRYLATER
+    }
+
+    /// Ошибка файловой операции — в тот же тип, что ошибки COM.
+    pub fn io(e: std::io::Error) -> Error {
+        Error::new(E_FAIL, e.to_string())
+    }
+
+    /// Повторяем вызов, пока PowerPoint «занят», но не дольше 5 с.
+    fn retry<T>(mut f: impl FnMut() -> R<T>) -> R<T> {
+        let start = Instant::now();
+        loop {
+            match f() {
+                Err(e) if is_busy(&e) && start.elapsed() < Duration::from_secs(5) => std::thread::sleep(Duration::from_millis(30)),
+                r => return r,
+            }
         }
     }
-    out
-}
 
-/// `id:имя-hex:вид:состояние:позиция:длительность:лево:верх:ширина:высота;…` из ответа `media` моста.
-fn parse_media(s: &str) -> Vec<Media> {
-    s.split(';')
-        .filter_map(|e| {
-            let f: Vec<&str> = e.split(':').collect();
-            let n = |i: usize| f.get(i).and_then(|x| x.parse::<i64>().ok());
-            let hex = f.get(1)?;
-            let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()).collect();
-            let k = |i: usize| n(i).unwrap_or(0) as f32 / 10000.0;
-            let (x, y, w, h) = (k(6), k(7), k(8), k(9));
-            Some(Media {
-                id: n(0)? as i32,
-                name: String::from_utf8_lossy(&bytes).into_owned(),
-                // MediaType: 2 — звук, 3 — видео.
-                video: n(2)? != 2,
-                state: n(3)?.clamp(0, 3) as u8,
-                pos: n(4).unwrap_or(0).max(0) as u32,
-                dur: n(5).unwrap_or(0).max(0) as u32,
-                rect: [x, y, x + w, y + h],
-            })
-        })
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parses_media_line() {
-        // «Видео 3» в UTF-8 hex, видео играет, 12 с из 90, справа вверху; «a b» — звук, остановлен.
-        let hex: String = "Видео 3".bytes().map(|b| format!("{b:02X}")).collect();
-        let v = super::parse_media(&format!("5:{hex}:3:0:12:90:5000:1000:2500:3000;12:612062:2:2:0:0:0:0:0:0"));
-        assert_eq!(v.len(), 2);
-        assert_eq!((v[0].id, v[0].name.as_str(), v[0].video, v[0].state, v[0].pos, v[0].dur), (5, "Видео 3", true, 0, 12, 90));
-        assert_eq!(v[0].rect, [0.5, 0.1, 0.75, 0.4]);
-        assert_eq!((v[1].id, v[1].name.as_str(), v[1].video, v[1].state), (12, "a b", false, 2));
-        assert!(super::parse_media("").is_empty());
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(Some(0)).collect()
     }
 
-    #[test]
-    fn base64() {
-        assert_eq!(super::base64(b""), "");
-        assert_eq!(super::base64(b"f"), "Zg==");
-        assert_eq!(super::base64(b"fo"), "Zm8=");
-        assert_eq!(super::base64(b"foo"), "Zm9v");
-        assert_eq!(super::base64("тест".as_bytes()), "0YLQtdGB0YI=");
+    pub fn i(n: i32) -> VARIANT {
+        VARIANT::from(n)
+    }
+
+    pub fn s(t: &str) -> VARIANT {
+        VARIANT::from(t)
+    }
+
+    #[derive(Clone)]
+    pub struct Disp(IDispatch);
+
+    impl Disp {
+        /// Запустить сервер COM (или подключиться к уже запущенному — PowerPoint один на всех).
+        pub fn create(progid: &str) -> R<Disp> {
+            let w = wide(progid);
+            unsafe {
+                let clsid = CLSIDFromProgID(PCWSTR(w.as_ptr()))?;
+                Ok(Disp(CoCreateInstance(&clsid, None, CLSCTX_LOCAL_SERVER)?))
+            }
+        }
+
+        fn invoke(&self, name: &str, flags: DISPATCH_FLAGS, args: &[VARIANT]) -> R<VARIANT> {
+            let w = wide(name);
+            let names = [PCWSTR(w.as_ptr())];
+            let mut id = 0i32;
+            retry(|| unsafe { self.0.GetIDsOfNames(&GUID::zeroed(), names.as_ptr(), 1, LCID, &mut id) }).map_err(|e| Error::new(e.code(), format!("{name}: {}", e.message())))?;
+            // Аргументы в DISPPARAMS — в обратном порядке; у записи свойства — именованный аргумент.
+            let mut rev: Vec<VARIANT> = args.iter().rev().cloned().collect();
+            let mut named = DISPID_PROPERTYPUT;
+            let put = flags == DISPATCH_PROPERTYPUT;
+            let params = DISPPARAMS {
+                rgvarg: if rev.is_empty() { std::ptr::null_mut() } else { rev.as_mut_ptr() },
+                rgdispidNamedArgs: if put { &mut named } else { std::ptr::null_mut() },
+                cArgs: rev.len() as u32,
+                cNamedArgs: put as u32,
+            };
+            retry(|| unsafe {
+                let mut res = VARIANT::new();
+                let mut exc = EXCEPINFO::default();
+                let r = self.0.Invoke(id, &GUID::zeroed(), LCID, flags, &params, Some(&mut res), Some(&mut exc), None);
+                match r {
+                    Ok(()) => Ok(res),
+                    Err(e) => {
+                        let mut code = e.code();
+                        let mut text = e.message();
+                        if code == DISP_E_EXCEPTION {
+                            // Ошибка самого PowerPoint — её текст в EXCEPINFO.
+                            if let Some(fill) = exc.pfnDeferredFillIn {
+                                let _ = fill(&mut exc);
+                            }
+                            if exc.scode != 0 {
+                                code = HRESULT(exc.scode);
+                            }
+                            let d = exc.bstrDescription.to_string();
+                            if !d.is_empty() {
+                                text = d;
+                            }
+                        }
+                        ManuallyDrop::drop(&mut exc.bstrSource);
+                        ManuallyDrop::drop(&mut exc.bstrDescription);
+                        ManuallyDrop::drop(&mut exc.bstrHelpFile);
+                        Err(Error::new(code, format!("{name}: {}", text.split_whitespace().collect::<Vec<_>>().join(" "))))
+                    }
+                }
+            })
+        }
+
+        /// Свойство или метод без аргументов.
+        pub fn get(&self, name: &str) -> R<VARIANT> {
+            self.call(name, &[])
+        }
+
+        /// Метод (или свойство с аргументами, например `Item(3)`).
+        pub fn call(&self, name: &str, args: &[VARIANT]) -> R<VARIANT> {
+            self.invoke(name, DISPATCH_FLAGS(DISPATCH_METHOD.0 | DISPATCH_PROPERTYGET.0), args)
+        }
+
+        pub fn put(&self, name: &str, v: VARIANT) -> R<()> {
+            self.invoke(name, DISPATCH_PROPERTYPUT, &[v]).map(|_| ())
+        }
+
+        pub fn obj(&self, name: &str) -> R<Disp> {
+            to_disp(&self.get(name)?)
+        }
+
+        pub fn obj_at(&self, name: &str, args: &[VARIANT]) -> R<Disp> {
+            to_disp(&self.call(name, args)?)
+        }
+
+        pub fn int(&self, name: &str) -> R<i64> {
+            i64::try_from(&self.get(name)?)
+        }
+
+        pub fn num(&self, name: &str) -> R<f64> {
+            f64::try_from(&self.get(name)?)
+        }
+
+        pub fn text(&self, name: &str) -> R<String> {
+            Ok(BSTR::try_from(&self.get(name)?)?.to_string())
+        }
+    }
+
+    /// Объект из результата; пустой (`Nothing`) — ошибка.
+    pub fn to_disp(v: &VARIANT) -> R<Disp> {
+        unsafe {
+            let raw = v.as_raw();
+            let vt = raw.Anonymous.Anonymous.vt;
+            let p = raw.Anonymous.Anonymous.Anonymous.pdispVal;
+            if (vt == VT_DISPATCH || vt == VT_UNKNOWN) && !p.is_null() {
+                if let Some(unk) = IUnknown::from_raw_borrowed(&p) {
+                    return Ok(Disp(unk.cast::<IDispatch>()?));
+                }
+            }
+        }
+        Err(Error::new(E_POINTER, "пустой объект"))
+    }
+}
+
+/// Поток моста: владеет объектами PowerPoint, выполняет запросы, опрашивает показ.
+#[cfg(windows)]
+mod bridge {
+    use super::com::{self, i, s, Disp, R};
+    use super::{now_ms, Ctx, Media, PptEvent, Req};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc::{Receiver, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+
+    /// Как часто спрашивать у PowerPoint позицию и состояние видео, пока идёт показ.
+    const POLL: Duration = Duration::from_millis(400);
+
+    /// Видео или звук на текущем слайде; проигрыватель берём один раз на слайд.
+    struct MShape {
+        id: i32,
+        name: String,
+        video: bool,
+        len: u32,
+        left: f64,
+        top: f64,
+        w: f64,
+        h: f64,
+        player: Option<Disp>,
+    }
+
+    /// Сохранение слайдов картинками для превью: папка, размер и какие слайды ещё не сохранены.
+    struct Export {
+        dir: PathBuf,
+        w: i32,
+        h: i32,
+        todo: Vec<usize>,
+    }
+
+    struct Bridge<'a> {
+        ctx: &'a Ctx,
+        sid: u64,
+        app: Option<Disp>,
+        pres: Option<Disp>,
+        win: Option<Disp>,
+        total: usize,
+        /// Размер слайда в пунктах.
+        size: (f64, f64),
+        /// Указатель мыши в показе: 3 — всегда скрыт, 4 — стрелка при движении.
+        cursor: i32,
+        exp: Option<Export>,
+        /// Видео и звук: для какого слайда собран список, сам список, что последним сообщили.
+        mslide: i64,
+        mlist: Vec<MShape>,
+        mlast: Option<(usize, Vec<Media>)>,
+        /// Папка слайдов презентации — туда же перечень фигур слайда (для разбора, если видео не нашлось).
+        sdir: Option<PathBuf>,
+        last_pos: Option<(usize, usize)>,
+    }
+
+    pub fn run(rx: Receiver<Req>, ctx: Ctx) {
+        // Многопоточный «апартамент»: этому потоку не нужен цикл сообщений Windows.
+        let inited = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+        {
+            let mut b = Bridge {
+                ctx: &ctx,
+                sid: 0,
+                app: None,
+                pres: None,
+                win: None,
+                total: 0,
+                size: (4.0, 3.0),
+                cursor: 3,
+                exp: None,
+                mslide: -1,
+                mlist: Vec::new(),
+                mlast: None,
+                sdir: None,
+                last_pos: None,
+            };
+            // PowerPoint запускаем сразу (скрыто) — к первому показу он уже готов.
+            b.busy(|b| {
+                let _ = b.app();
+            });
+            let mut next_poll = Instant::now();
+            loop {
+                // Ждём запрос; пока идёт показ — не дольше, чем до следующего опроса; пока есть
+                // несохранённые слайды — не ждём совсем.
+                let wait = if b.exp.is_some() {
+                    Some(Duration::ZERO)
+                } else if b.win.is_some() {
+                    Some(next_poll.saturating_duration_since(Instant::now()))
+                } else {
+                    None
+                };
+                let got = match wait {
+                    None => rx.recv().map_err(|_| true),
+                    Some(d) => rx.recv_timeout(d).map_err(|e| e == RecvTimeoutError::Disconnected),
+                };
+                match got {
+                    Ok(Req::Quit) | Err(true) => break,
+                    Ok(req) => b.busy(|b| b.handle(req)),
+                    Err(false) => {
+                        if b.win.is_some() && Instant::now() >= next_poll {
+                            b.busy(|b| b.command(None));
+                            next_poll = Instant::now() + POLL;
+                        } else if b.exp.is_some() {
+                            b.busy(Bridge::slide_step);
+                        }
+                    }
+                }
+            }
+            b.busy(|b| {
+                b.close_show();
+                // PowerPoint закрываем, только если в нём не открыто ничего чужого.
+                if let Some(a) = &b.app {
+                    if a.obj("Presentations").and_then(|p| p.int("Count")).is_ok_and(|n| n == 0) {
+                        let _ = a.call("Quit", &[]);
+                    }
+                }
+            });
+        }
+        if inited {
+            unsafe { CoUninitialize() };
+        }
+    }
+
+    impl Bridge<'_> {
+        fn emit(&self, ev: PptEvent) {
+            (self.ctx.on_event)(self.sid, ev);
+        }
+
+        /// Пока PowerPoint выполняет запрос — для показателя «PowerPoint не отвечает».
+        fn busy(&mut self, f: impl FnOnce(&mut Self)) {
+            self.ctx.waiting.store(now_ms(), Ordering::SeqCst);
+            f(self);
+            self.ctx.waiting.store(0, Ordering::SeqCst);
+        }
+
+        /// Живой PowerPoint; если его закрыли или он упал — запускаем заново.
+        fn app(&mut self) -> R<Disp> {
+            if let Some(a) = &self.app {
+                if a.get("Version").is_ok() {
+                    return Ok(a.clone());
+                }
+                self.app = None;
+            }
+            let a = Disp::create("PowerPoint.Application")?;
+            // Номер процесса — чтобы завершить PowerPoint, если он зависнет. PowerPoint один на
+            // пользователя, поэтому ищем его по имени: Application.HWND через IDispatch недоступен.
+            let pid = crate::health::powerpoint_pid().unwrap_or(0);
+            crate::jlog!("PowerPoint запущен (процесс {pid})");
+            self.ctx.pid.store(pid, Ordering::SeqCst);
+            self.app = Some(a.clone());
+            Ok(a)
+        }
+
+        fn handle(&mut self, req: Req) {
+            match req {
+                Req::Open { sid, path, windowed, monitor, slides, width } => {
+                    self.close_show();
+                    self.sid = sid;
+                    self.last_pos = None;
+                    if let Err(e) = self.open(&path, windowed, &monitor, slides, width) {
+                        self.emit(PptEvent::Error(e.message()));
+                        self.close_show();
+                    }
+                }
+                Req::Close => self.close_show(),
+                Req::Cursor(c) => {
+                    self.cursor = c;
+                    if let Some(v) = self.win.as_ref().and_then(|w| w.obj("View").ok()) {
+                        let _ = v.put("PointerType", i(c));
+                    }
+                }
+                Req::Zoom(n, width, file) => match self.zoom(n, width, &file) {
+                    Ok(()) => self.emit(PptEvent::Zoom(n)),
+                    Err(e) => self.emit(PptEvent::ZoomFailed(e.message())),
+                },
+                Req::Quit => {}
+                other => self.command(Some(other)),
+            }
+        }
+
+        fn open(&mut self, path: &Path, windowed: bool, monitor: &str, slides: Option<PathBuf>, width: u32) -> R<()> {
+            if self.open_show(path, windowed, monitor).is_err() {
+                // Одна повторная попытка с заново запущенным PowerPoint.
+                self.close_show();
+                self.app = None;
+                self.open_show(path, windowed, monitor)?;
+            }
+            let hwnd = self.win.as_ref().and_then(|w| w.int("HWND").ok()).unwrap_or(0);
+            self.emit(PptEvent::Ready(self.total, hwnd as isize));
+            self.sdir = slides;
+            if let Some(dir) = self.sdir.clone() {
+                let _ = self.plan_slides(&dir, width);
+            }
+            Ok(())
+        }
+
+        fn open_show(&mut self, path: &Path, windowed: bool, monitor: &str) -> R<()> {
+            let app = self.app()?;
+            set_monitor(&app, monitor);
+            // Только для чтения, без заголовка «Без имени», без окна.
+            let pres = app.obj("Presentations")?.obj_at("Open", &[s(&path.to_string_lossy()), i(-1), i(0), i(0)])?;
+            self.pres = Some(pres.clone());
+            self.total = pres.obj("Slides")?.int("Count")?.max(0) as usize;
+            let ps = pres.obj("PageSetup")?;
+            self.size = (ps.num("SlideWidth")?.max(1.0), ps.num("SlideHeight")?.max(1.0));
+            let ss = pres.obj("SlideShowSettings")?;
+            // 1 — докладчиком (на весь экран), 2 — в окне.
+            ss.put("ShowType", i(if windowed { 2 } else { 1 }))?;
+            let _ = ss.put("ShowPresenterView", i(0));
+            let win = ss.obj("Run")?;
+            self.win = Some(win.clone());
+            // Настройки показа выше меняют презентацию. Помечаем её сохранённой: иначе при закрытии
+            // PowerPoint спросит о сохранении файла, открытого только для чтения.
+            let _ = pres.put("Saved", i(-1));
+            // Указатель мыши: скрыт или стрелка при движении — как выбрано в программе.
+            if let Ok(v) = win.obj("View") {
+                let _ = v.put("PointerType", i(self.cursor));
+            }
+            Ok(())
+        }
+
+        fn close_show(&mut self) {
+            // Exit у показа файла, открытого без окна, закрывает и сам файл; Close — на всякий случай.
+            if let Some(w) = self.win.take() {
+                if let Ok(v) = w.obj("View") {
+                    let _ = v.call("Exit", &[]);
+                }
+            }
+            if let Some(p) = self.pres.take() {
+                let _ = p.put("Saved", i(-1));
+                let _ = p.call("Close", &[]);
+            }
+            self.exp = None;
+            self.mslide = -1;
+            self.mlist.clear();
+            self.mlast = None;
+        }
+
+        /// Команда показу (`None` — опрос). После неё — позиция и видео на слайде.
+        fn command(&mut self, req: Option<Req>) {
+            let Some(win) = self.win.clone() else { return };
+            if let Err(_e) = self.command_inner(&win, req) {
+                // PowerPoint мог быть просто занят; показ окончен, только если его окна больше нет.
+                let alive = match self.app.as_ref().map(|a| a.obj("SlideShowWindows").and_then(|w| w.int("Count"))) {
+                    Some(Ok(n)) => n > 0,
+                    Some(Err(e)) => com::is_busy(&e),
+                    None => false,
+                };
+                if !alive {
+                    self.emit(PptEvent::Ended);
+                    self.win = None;
+                    self.close_show();
+                }
+            }
+        }
+
+        fn command_inner(&mut self, win: &Disp, req: Option<Req>) -> R<()> {
+            let view = win.obj("View")?;
+            match &req {
+                Some(Req::Next) => {
+                    // На последнем шаге последнего слайда не идём дальше, иначе показ закроется.
+                    let cur = view.int("CurrentShowPosition")?.max(0) as usize;
+                    let last = cur >= self.total
+                        && match (view.int("GetClickIndex"), view.int("GetClickCount")) {
+                            (Ok(a), Ok(b)) => a >= b,
+                            _ => true,
+                        };
+                    if !last {
+                        view.call("Next", &[])?;
+                    }
+                }
+                Some(Req::Prev) => {
+                    view.call("Previous", &[])?;
+                }
+                Some(Req::Goto(n)) => {
+                    view.call("GotoSlide", &[i(*n as i32)])?;
+                }
+                Some(Req::Show) => {
+                    // Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
+                    let _ = win.call("Activate", &[]);
+                }
+                Some(Req::Media(action, id)) => {
+                    // Видео на слайде — без мыши: через проигрыватель слайд-шоу.
+                    let name = match action.as_str() {
+                        "play" => "Play",
+                        "pause" => "Pause",
+                        _ => "Stop",
+                    };
+                    view.obj_at("Player", &[i(*id)])?.call(name, &[])?;
+                }
+                _ => {}
+            }
+            // Опрос PowerPoint лишний раз не трогаем — он может как раз менять слайд.
+            if req.is_some() {
+                if let Some(p) = &self.pres {
+                    let _ = p.put("Saved", i(-1));
+                }
+            }
+            let cur = view.int("CurrentShowPosition")?.max(0) as usize;
+            // Ответ на опрос обычно тот же — без изменений GUI не будим.
+            if self.last_pos != Some((cur, self.total)) {
+                self.last_pos = Some((cur, self.total));
+                self.emit(PptEvent::Pos(cur, self.total));
+            }
+            self.media_report(&view);
+            Ok(())
+        }
+
+        /// Видео и звук на текущем слайде, их состояние и позиция — программе, только если что-то
+        /// изменилось. Фигуры перебираем только при смене слайда, на опросе — лишь проигрыватели.
+        fn media_report(&mut self, view: &Disp) {
+            let report = self.media_list(view).unwrap_or((0, Vec::new()));
+            if self.mlast.as_ref() != Some(&report) {
+                self.mlast = Some(report.clone());
+                self.emit(PptEvent::Media(report.0, report.1));
+            }
+        }
+
+        fn media_list(&mut self, view: &Disp) -> R<(usize, Vec<Media>)> {
+            let slide = view.obj("Slide")?;
+            let idx = slide.int("SlideIndex")?;
+            if idx != self.mslide {
+                self.mslide = idx;
+                let shapes = slide.obj("Shapes")?;
+                let mut list = Vec::new();
+                media_shapes(&shapes, &mut list);
+                // «Видео 1, 2, 3» — в порядке чтения слайда: по строкам сверху вниз, в строке слева направо.
+                list.sort_by(|a, b| ((a.top / 60.0).round_ties_even(), a.left).partial_cmp(&((b.top / 60.0).round_ties_even(), b.left)).unwrap_or(std::cmp::Ordering::Equal));
+                self.mlist = list;
+                if let Some(dir) = &self.sdir {
+                    let mut lines = vec![format!("Слайд {idx}, найдено медиа: {}", self.mlist.len())];
+                    inventory(&shapes, &mut lines, 0);
+                    let _ = std::fs::write(dir.join(format!("shapes_{idx}.txt")), format!("\u{feff}{}\r\n", lines.join("\r\n")));
+                }
+            }
+            let (sw, sh) = self.size;
+            let mut out = Vec::with_capacity(self.mlist.len());
+            for m in &mut self.mlist {
+                let (mut state, mut pos) = (3u8, 0u32);
+                if m.player.is_none() {
+                    m.player = view.obj_at("Player", &[i(m.id)]).ok();
+                }
+                if let Some(p) = &m.player {
+                    match (p.int("State"), p.num("CurrentPosition")) {
+                        (Ok(st), Ok(c)) => {
+                            state = st.clamp(0, 3) as u8;
+                            pos = (c / 1000.0).floor().max(0.0) as u32;
+                        }
+                        _ => m.player = None,
+                    }
+                }
+                out.push(Media {
+                    id: m.id,
+                    name: m.name.clone(),
+                    video: m.video,
+                    state,
+                    pos,
+                    dur: m.len,
+                    rect: [(m.left / sw) as f32, (m.top / sh) as f32, ((m.left + m.w) / sw) as f32, ((m.top + m.h) / sh) as f32],
+                });
+            }
+            Ok((idx.max(0) as usize, out))
+        }
+
+        /// Какие слайды сохранить картинками (уже сохранённые — пропускаем; все готовы — отметка done).
+        fn plan_slides(&mut self, dir: &Path, width: u32) -> R<()> {
+            if dir.join("done").exists() {
+                return Ok(());
+            }
+            std::fs::create_dir_all(dir).map_err(com::io)?;
+            let w = width as i32;
+            let h = (w as f64 * self.size.1 / self.size.0).round() as i32;
+            let todo = (1..=self.total).filter(|n| !dir.join(format!("{n}.jpg")).exists()).collect();
+            self.exp = Some(Export { dir: dir.to_path_buf(), w, h, todo });
+            Ok(())
+        }
+
+        /// Сохранить один слайд — сначала текущий и следующие за ним: они нужны превью раньше остальных.
+        /// Пишем во временный файл и переименовываем: программа не прочитает недописанную картинку.
+        fn slide_step(&mut self) {
+            let cur = self.win.as_ref().and_then(|w| w.obj("View").ok()).and_then(|v| v.int("CurrentShowPosition").ok()).unwrap_or(1).max(1) as usize;
+            let Some(e) = self.exp.as_mut() else { return };
+            if e.todo.is_empty() {
+                let _ = std::fs::write(e.dir.join("done"), "");
+                self.exp = None;
+                return;
+            }
+            let k = e.todo.iter().position(|&n| n >= cur).unwrap_or(0);
+            let n = e.todo.remove(k);
+            let (f, tmp, w, h) = (e.dir.join(format!("{n}.jpg")), e.dir.join(format!("{n}.part.jpg")), e.w, e.h);
+            match self.export(n, &tmp, w, h).and_then(|_| replace(&tmp, &f)) {
+                Ok(()) => self.emit(PptEvent::Slide(n)),
+                Err(_) => self.exp = None,
+            }
+        }
+
+        /// Слайд крупной картинкой — для увеличения: сцена покажет её поверх слайд-шоу.
+        fn zoom(&mut self, n: usize, width: u32, file: &Path) -> R<()> {
+            let w = width as i32;
+            let h = (w as f64 * self.size.1 / self.size.0).round() as i32;
+            let mut tmp = file.as_os_str().to_owned();
+            tmp.push(".part.jpg");
+            let tmp = PathBuf::from(tmp);
+            self.export(n, &tmp, w, h)?;
+            replace(&tmp, file)
+        }
+
+        fn export(&self, n: usize, file: &Path, w: i32, h: i32) -> R<()> {
+            let pres = self.pres.as_ref().ok_or_else(|| com::io(std::io::Error::other("показ закрыт")))?;
+            pres.obj("Slides")?.obj_at("Item", &[i(n as i32)])?.call("Export", &[s(&file.to_string_lossy()), s("JPG"), i(w), i(h)])?;
+            Ok(())
+        }
+    }
+
+    fn replace(tmp: &Path, file: &Path) -> R<()> {
+        let _ = std::fs::remove_file(file);
+        std::fs::rename(tmp, file).map_err(com::io)
+    }
+
+    /// Монитор для показа (\\.\DISPLAY2) — в собственную настройку PowerPoint «Показ на мониторе».
+    fn set_monitor(app: &Disp, dev: &str) {
+        if dev.is_empty() {
+            return;
+        }
+        if let Ok(ver) = app.text("Version") {
+            let _ = crate::registry::set(&format!(r"Software\Microsoft\Office\{ver}\PowerPoint\Options"), "DisplayMonitor", dev);
+        }
+    }
+
+    /// Видео и звук среди фигур — и внутри групп на любой глубине. Медиа — фигура с типом «медиа» (16),
+    /// заполнитель с медиа внутри или любая фигура с параметрами медиа (MediaFormat): по одному типу
+    /// находилось не всё (замечание пользователя 16.10.2026).
+    fn media_shapes(shapes: &Disp, list: &mut Vec<MShape>) {
+        let count = shapes.int("Count").unwrap_or(0);
+        for k in 1..=count {
+            let Ok(sh) = shapes.obj_at("Item", &[i(k as i32)]) else { continue };
+            let t = sh.int("Type").unwrap_or(0);
+            if t == 6 {
+                if let Ok(g) = sh.obj("GroupItems") {
+                    media_shapes(&g, list);
+                }
+                continue;
+            }
+            let mut media = t == 16;
+            if !media && t == 14 {
+                media = sh.obj("PlaceholderFormat").and_then(|p| p.int("ContainedType")).is_ok_and(|c| c == 16);
+            }
+            // У обычных фигур MediaFormat пустой (без ошибки) — медиа только там, где он есть.
+            let format = sh.obj("MediaFormat").ok();
+            media |= format.is_some();
+            if !media {
+                continue;
+            }
+            // MediaType: 2 — звук, 3 — видео.
+            let kind = sh.int("MediaType").unwrap_or(3);
+            // Длительность — у самой фигуры: Player.Duration у PowerPoint пустой (проверено 18.10.2026).
+            let len = format.and_then(|f| f.num("Length").ok()).map_or(0, |l| (l / 1000.0).round().max(0.0) as u32);
+            list.push(MShape {
+                id: sh.int("Id").unwrap_or(0) as i32,
+                name: sh.text("Name").unwrap_or_default(),
+                video: kind != 2,
+                len,
+                left: sh.num("Left").unwrap_or(0.0),
+                top: sh.num("Top").unwrap_or(0.0),
+                w: sh.num("Width").unwrap_or(0.0),
+                h: sh.num("Height").unwrap_or(0.0),
+                player: None,
+            });
+        }
+    }
+
+    /// Перечень всех фигур слайда (с группами) — в файл shapes_N.txt папки слайдов: если видео не
+    /// нашлось, по нему видно, как оно вставлено.
+    fn inventory(shapes: &Disp, lines: &mut Vec<String>, depth: usize) {
+        let opt = |r: R<i64>| r.map(|x| x.to_string()).unwrap_or_default();
+        let count = shapes.int("Count").unwrap_or(0);
+        for k in 1..=count {
+            let Ok(sh) = shapes.obj_at("Item", &[i(k as i32)]) else { continue };
+            let t = sh.int("Type");
+            let mf = match sh.get("MediaFormat") {
+                Ok(v) => com::to_disp(&v).is_ok().to_string(),
+                Err(_) => "ошибка".into(),
+            };
+            let link = sh.obj("LinkFormat").and_then(|l| l.text("SourceFullName")).unwrap_or_default();
+            lines.push(format!(
+                "{}{} | id {} | тип {} | в заполнителе {} | медиа {} | MediaFormat {} | {:.0},{:.0} {:.0}x{:.0} | {}",
+                "  ".repeat(depth),
+                sh.text("Name").unwrap_or_default(),
+                opt(sh.int("Id")),
+                t.as_ref().map(|x| x.to_string()).unwrap_or_default(),
+                opt(sh.obj("PlaceholderFormat").and_then(|p| p.int("ContainedType"))),
+                opt(sh.int("MediaType")),
+                mf,
+                sh.num("Left").unwrap_or(0.0),
+                sh.num("Top").unwrap_or(0.0),
+                sh.num("Width").unwrap_or(0.0),
+                sh.num("Height").unwrap_or(0.0),
+                link
+            ));
+            if t.is_ok_and(|t| t == 6) {
+                if let Ok(g) = sh.obj("GroupItems") {
+                    inventory(&g, lines, depth + 1);
+                }
+            }
+        }
+    }
+}
+
+/// Без Windows PowerPoint нет: на каждое открытие — ошибка.
+#[cfg(not(windows))]
+mod bridge {
+    use super::{Ctx, PptEvent, Req};
+    use std::sync::mpsc::Receiver;
+
+    pub fn run(rx: Receiver<Req>, ctx: Ctx) {
+        while let Ok(req) = rx.recv() {
+            match req {
+                Req::Open { sid, .. } => (ctx.on_event)(sid, PptEvent::Error("PowerPoint есть только в Windows".into())),
+                Req::Quit => break,
+                _ => {}
+            }
+        }
     }
 }
