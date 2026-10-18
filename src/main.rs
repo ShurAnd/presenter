@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use net::{AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
+use net::{MediaAction, MediaInfo, AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
 use render::{Out, PageKey, Renderer, AUDIO_EXTS, FULL_VIEW, THUMB_H, THUMB_W, VIDEO_EXTS, ZOOMS};
 use serde::{Deserialize, Serialize};
 
@@ -324,6 +324,8 @@ struct PptShow {
     zoom_img: Option<(usize, egui::TextureHandle)>,
     zoom_busy: Option<usize>,
     zoom_up: bool,
+    /// Видео и звук на слайде (номер слайда с единицы) — по сообщению моста.
+    media: (usize, Vec<ppt::Media>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -457,6 +459,8 @@ struct App {
     reconnect: Option<(u32, Instant)>,
     health_open: bool,
     help_open: bool,
+    /// Видео на слайде, над строкой которого мышь в списке, — его рамка на миниатюре ярче.
+    media_hover: Option<usize>,
     /// «Показать курсор» на экране показа (после перезапуска — снова выключено) и когда мышь
     /// последний раз двигали над сценой (курсор виден 3 с после движения).
     show_cursor: bool,
@@ -607,6 +611,7 @@ impl App {
             autostart: watchdog::autostart_enabled(),
             health_open: false,
             help_open: false,
+            media_hover: None,
             show_cursor: false,
             cursor_moved: None,
             stage_px: (1920.0, 1080.0),
@@ -706,6 +711,7 @@ impl App {
             background: self.cfg.background.clone(),
             zoom: self.show.as_ref().map_or(1.0, |s| s.zoom),
             view: self.slide_view(),
+            media: self.slide_media(),
             cursor: self.show_cursor,
         }
     }
@@ -725,6 +731,19 @@ impl App {
             ShowKind::Ppt(p) => p.phase == PptPhase::Shown,
             ShowKind::Video(_) => false,
         })
+    }
+
+    /// Видео и звук на текущем слайде PowerPoint (список от моста — только если он про этот слайд).
+    fn slide_media(&self) -> Vec<MediaInfo> {
+        match self.show.as_ref().map(|s| (s.page, &s.kind)) {
+            Some((page, ShowKind::Ppt(p))) if p.media.0 == page + 1 => p
+                .media
+                .1
+                .iter()
+                .map(|m| MediaInfo { id: m.id, name: m.name.clone(), video: m.video, state: m.state, pos: m.pos, dur: m.dur, rect: m.rect })
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// То, что показывает интерфейс: список сервера, если мы подключены клиентом, иначе свой.
@@ -799,7 +818,7 @@ impl App {
                             return;
                         }
                         self.status = format!("Открытие в PowerPoint: «{name}»…");
-                        ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0, zoom_img: None, zoom_busy: None, zoom_up: false })
+                        ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0, zoom_img: None, zoom_busy: None, zoom_up: false, media: (0, Vec::new()) })
                     }
                 };
                 self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5) });
@@ -924,6 +943,16 @@ impl App {
                 self.show_cursor = on;
                 self.ppt_host.set_cursor(on);
                 video::set_cursor(on);
+            }
+            Cmd::PptMedia { id, action } => {
+                if self.show.as_ref().is_some_and(Show::is_ppt) {
+                    let a = match action {
+                        MediaAction::Play => "play",
+                        MediaAction::Pause => "pause",
+                        MediaAction::Stop => "stop",
+                    };
+                    self.ppt_host.media(a, id);
+                }
             }
             Cmd::VideoRepeat { id, on } => {
                 if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
@@ -1388,6 +1417,12 @@ impl App {
                                     let c = ctx.clone();
                                     render::load_ppt_zoom(gen, n.saturating_sub(1), path, self.out_tx.clone(), move || c.request_repaint());
                                 }
+                            }
+                            ppt::PptEvent::Media(slide, list) => {
+                                if let Some(ShowKind::Ppt(p)) = self.show.as_mut().map(|s| &mut s.kind) {
+                                    p.media = (slide, list);
+                                }
+                                self.dirty = true;
                             }
                             ppt::PptEvent::ZoomFailed(e) => {
                                 if let Some(ShowKind::Ppt(p)) = self.show.as_mut().map(|s| &mut s.kind) {
@@ -2266,9 +2301,16 @@ impl App {
         let zoomable = kind == "PDF" || kind == KIND_IMAGE || kind == "PPTX";
         let panel = if zoomable { ZOOM_PANEL_W + GAP } else { 0.0 };
         // Три миниатюры 16:9 по ширине окна, но не выше 112 точек.
-        let h = ((ui.available_width() - 2.0 * GAP - panel) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
+        // Учитываем и промежутки между элементами строки — иначе панель увеличения уезжала за край.
+        let spacing = 4.0 * ui.spacing().item_spacing.x;
+        let h = ((ui.available_width() - 2.0 * GAP - panel - spacing) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
         let zview = (view.zoom > 1.0).then_some(view.view);
-        let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| {
+        // Видео и звук на слайде PowerPoint — списком над миниатюрами, номера — как рамки на «Сейчас».
+        if !view.media.is_empty() {
+            self.media_list(ui, &view.media);
+            ui.add_space(4.0);
+        }
+        let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| -> egui::Rect {
             ui.vertical(|ui| {
                 let color = if current { Color32::from_gray(0x22) } else { Color32::from_gray(0x77) };
                 ui.label(RichText::new(title).size(12.0).color(color).strong());
@@ -2298,16 +2340,19 @@ impl App {
                     let r = egui::Rect::from_min_max(rect.lerp_inside(egui::vec2(v[0], v[1])), rect.lerp_inside(egui::vec2(v[2], v[3])));
                     p.rect_stroke(r, 0.0, egui::Stroke::new(2.0_f32, ZOOM_FRAME), egui::StrokeKind::Inside);
                 }
-            });
+                rect
+            })
+            .inner
         };
         ui.horizontal(|ui| {
             let page = view.page;
             match page.checked_sub(1) {
                 Some(prev) => slot(ui, format!("Предыдущий — слайд {}", prev + 1), self.previews.get(&(id, prev)), "готовится…", false),
                 None => slot(ui, "Предыдущий".into(), None, "начало презентации", false),
-            }
+            };
             ui.add_space(GAP);
-            slot(ui, format!("Сейчас — слайд {}", page + 1), self.previews.get(&(id, page)), "готовится…", true);
+            let cur = slot(ui, format!("Сейчас — слайд {}", page + 1), self.previews.get(&(id, page)), "готовится…", true);
+            self.media_marks(ui, cur, &view.media);
             ui.add_space(GAP);
             if page + 1 < view.pages {
                 slot(ui, format!("Далее — слайд {}", page + 2), self.previews.get(&(id, page + 1)), "готовится…", false);
@@ -2318,6 +2363,109 @@ impl App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| self.zoom_panel(ui, view));
             }
         });
+    }
+
+    /// Видео и звук на слайде PowerPoint — все сразу, каждое своей строкой: номер (как рамка на
+    /// миниатюре «Сейчас»), имя, состояние, время, «Старт / Пауза», «Стоп». Мыши на экране показа нет.
+    fn media_list(&mut self, ui: &mut egui::Ui, media: &[MediaInfo]) {
+        let mut cmds: Vec<Cmd> = Vec::new();
+        let mut hover = None;
+        let playing: Vec<i32> = media.iter().filter(|m| m.state == 0).map(|m| m.id).collect();
+        ui.horizontal(|ui| {
+            let videos = media.iter().filter(|m| m.video).count();
+            let title = match (videos, media.len() - videos) {
+                (v, 0) => format!("Видео на слайде: {v}"),
+                (0, a) => format!("Звук на слайде: {a}"),
+                (v, a) => format!("На слайде: видео {v}, звук {a}"),
+            };
+            ui.label(RichText::new(title).strong().size(14.0));
+            ui.label(RichText::new("номера — как рамки на миниатюре «Сейчас»; щелчок по рамке — старт или пауза").size(11.5).color(GRAY));
+            if playing.len() > 1 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if btn(ui, "■ Стоп всех", RED).clicked() {
+                        cmds.extend(playing.iter().map(|&id| Cmd::PptMedia { id, action: MediaAction::Stop }));
+                    }
+                });
+            }
+        });
+        // Больше четырёх — прокрутка, чтобы список не съедал окно.
+        egui::ScrollArea::vertical().max_height(4.0 * (28.0 + ui.spacing().item_spacing.y) + 2.0).auto_shrink([false, true]).show(ui, |ui| {
+            for (i, m) in media.iter().enumerate() {
+                let row = ui.horizontal(|ui| {
+                    ui.set_min_height(28.0);
+                    media_badge(ui, i + 1, m.state);
+                    let what = if m.video { "" } else { "звук · " };
+                    let name = if m.name.trim().is_empty() { format!("Видео {}", i + 1) } else { m.name.clone() };
+                    ui.allocate_ui_with_layout(egui::vec2(190.0, 20.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.set_width(190.0);
+                        ui.add(egui::Label::new(RichText::new(format!("{what}{name}")).size(13.0)).truncate()).on_hover_text(&m.name);
+                    });
+                    let (state, color) = match m.state {
+                        0 => ("играет", GREEN),
+                        1 => ("пауза", BLUE),
+                        // Остановлено кнопкой или доиграло до конца.
+                        2 => ("остановлено", GRAY),
+                        // До первого запуска PowerPoint сообщает «не готово» (3) — запускать при этом можно.
+                        _ => ("не запущено", GRAY),
+                    };
+                    ui.add_sized([86.0, 20.0], egui::Label::new(RichText::new(state).color(color).strong()));
+                    let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
+                    let time = if m.dur > 0 { format!("{} / {}", t(m.pos), t(m.dur)) } else { String::new() };
+                    ui.add_sized([96.0, 20.0], egui::Label::new(RichText::new(time).size(12.0).color(Color32::from_gray(0x55))));
+                    let size = egui::vec2(112.0, 0.0);
+                    if m.state == 0 {
+                        if ui.add(cbutton("⏸ Пауза", BLUE).min_size(size)).clicked() {
+                            cmds.push(Cmd::PptMedia { id: m.id, action: MediaAction::Pause });
+                        }
+                    } else {
+                        let label = if m.state == 1 { "▶ Продолжить" } else { "▶ Старт" };
+                        if ui.add(cbutton(label, GREEN).min_size(size)).on_hover_text("Запустить на экране показа — как щелчок по видео").clicked() {
+                            cmds.push(Cmd::PptMedia { id: m.id, action: MediaAction::Play });
+                        }
+                    }
+                    if ui.add_enabled(m.state <= 1, cbutton("■ Стоп", RED)).on_hover_text("Остановить и вернуть в начало").clicked() {
+                        cmds.push(Cmd::PptMedia { id: m.id, action: MediaAction::Stop });
+                    }
+                });
+                if row.response.hovered() || ui.rect_contains_pointer(row.response.rect) {
+                    hover = Some(i);
+                }
+            }
+        });
+        self.media_hover = hover;
+        for c in cmds {
+            self.act(c);
+        }
+    }
+
+    /// Рамки видео на миниатюре «Сейчас»: номер как в списке; синяя — стоит, зелёная — играет.
+    /// Щелчок по рамке — старт или пауза этого видео, как щелчок по нему на слайде.
+    fn media_marks(&mut self, ui: &mut egui::Ui, rect: egui::Rect, media: &[MediaInfo]) {
+        let mut cmd = None;
+        for (i, m) in media.iter().enumerate() {
+            let r = egui::Rect::from_min_max(rect.lerp_inside(egui::vec2(m.rect[0], m.rect[1])), rect.lerp_inside(egui::vec2(m.rect[2], m.rect[3]))).intersect(rect);
+            // Совсем мелкое (иконка звука) — хотя бы 14 точек, чтобы попасть мышью.
+            let r = egui::Rect::from_center_size(r.center(), r.size().max(egui::vec2(14.0, 14.0)));
+            let resp = ui.interact(r, ui.id().with(("media_mark", i)), egui::Sense::click());
+            let color = if m.state == 0 { GREEN } else { BLUE };
+            let hot = resp.hovered() || self.media_hover == Some(i);
+            let p = ui.painter();
+            if hot {
+                p.rect_filled(r, 2.0, color.gamma_multiply(0.25));
+            }
+            p.rect_stroke(r, 2.0, egui::Stroke::new(if hot { 3.0_f32 } else { 2.0 }, color), egui::StrokeKind::Inside);
+            let c = r.left_top() + egui::vec2(9.0, 9.0);
+            p.circle_filled(c, 8.0, color);
+            p.text(c, egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(11.0), Color32::WHITE);
+            let action = if m.state == 0 { MediaAction::Pause } else { MediaAction::Play };
+            let tip = format!("{} {} — {}", if m.video { "Видео" } else { "Звук" }, i + 1, if m.state == 0 { "щелчок — пауза" } else { "щелчок — старт" });
+            if resp.on_hover_text(tip).clicked() {
+                cmd = Some(Cmd::PptMedia { id: m.id, action });
+            }
+        }
+        if let Some(c) = cmd {
+            self.act(c);
+        }
     }
 
     /// Увеличение слайда: «+», масштаб, «−» и крестовина стрелок с «весь слайд» в центре.
@@ -3281,6 +3429,14 @@ impl App {
     }
 }
 
+/// Кружок с номером видео на слайде (как рамка на миниатюре): зелёный — играет, синий — стоит.
+fn media_badge(ui: &mut egui::Ui, n: usize, state: u8) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    let color = if state == 0 { GREEN } else { BLUE };
+    ui.painter().circle_filled(r.center(), 10.0, color);
+    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, n.to_string(), egui::FontId::proportional(12.0), Color32::WHITE);
+}
+
 /// Справка: разделы и строки «что — как».
 const HELP: &[(&str, &[(&str, &str)])] = &[
     ("С чего начать", &[
@@ -3328,6 +3484,7 @@ const HELP: &[(&str, &[(&str, &str)])] = &[
     ]),
     ("PowerPoint и видео", &[
         ("PowerPoint", "Показывает сам PowerPoint, с анимацией и переходами. Пока он запускается, на экране показа фон. На последнем шаге «Вперёд» показ не закрывает."),
+        ("Видео внутри слайда", "Если на слайде есть видео или звук, над превью появляется список «Видео на слайде»: у каждого свой номер, состояние, время и кнопки «Старт» / «Пауза» и «Стоп» — так запускается и видео, которое в PowerPoint включается щелчком мыши. На миниатюре «Сейчас» каждое видео обведено рамкой с тем же номером (зелёная — играет): видно, какое где; щелчок по рамке — старт или пауза. Играет несколько — «Стоп всех». Работает и у клиента."),
         ("Видео", "Готовится за фоном: «готово к запуску». «Старт» или пробел — сразу на экран показа. Доиграло — снова фон, а видео остаётся готовым: пробел — показать ещё раз с начала, без загрузки. Убрать видео — «Закрыть показ»."),
         ("Повтор видео", "Значок круговой стрелки справа в строке видео: синий — видео идёт по кругу, после конца сразу начинается заново (фон не появляется). По умолчанию выключен; переключать можно и во время показа. Запоминается в списке сервера."),
         ("Закрыть показ", "Кнопка «Закрыть показ», Shift+0 или двойной Esc на экране показа. На экране показа остаётся фон."),
@@ -3976,6 +4133,65 @@ mod tests {
                 wait("background reset", &|s| s.background.is_empty());
             }
         }
+    }
+
+    /// Видео на слайде PowerPoint против запущенного сервера: TEST_PPTX — презентация, где на слайде 2
+    /// не меньше трёх медиа. TEST_PORT — порт. cargo test --release e2e_media -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_media() {
+        let port = std::env::var("TEST_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(14999);
+        let (tx, rx) = channel();
+        let c = net::start_client("127.0.0.1".into(), port, "default_password".into(), tx, || {});
+        let t0 = Instant::now();
+        let show = |m: &[MediaInfo]| m.iter().map(|x| format!("[{} «{}» {} {}/{} с]", x.id, x.name, x.state, x.pos, x.dur)).collect::<Vec<_>>().join(" ");
+        let wait = |what: &str, f: &dyn Fn(&StateMsg) -> bool| -> StateMsg {
+            let t = Instant::now();
+            loop {
+                match rx.recv_timeout(Duration::from_secs(40).saturating_sub(t.elapsed())).unwrap_or_else(|_| panic!("timeout: {what}")) {
+                    CliEvent::Closed(r) => panic!("closed: {r}"),
+                    CliEvent::State(s) if f(&s) => {
+                        println!("{:>6} ms OK {what}: слайд {} {}", t0.elapsed().as_millis(), s.page + 1, show(&s.media));
+                        return s;
+                    }
+                    CliEvent::State(s) if std::env::var_os("TEST_VERBOSE").is_some() => {
+                        println!("{:>6} ms    ({what}) слайд {} {}", t0.elapsed().as_millis(), s.page + 1, show(&s.media));
+                    }
+                    _ => {}
+                }
+            }
+        };
+        c.send(CliReq::Cmd(Cmd::Clear));
+        wait("cleared", &|s| s.items.is_empty());
+        c.send(CliReq::Upload(PathBuf::from(std::env::var("TEST_PPTX").unwrap())));
+        let id = wait("ready", &|s| s.items.len() == 1 && s.items[0].ready).items[0].id;
+        c.send(CliReq::Cmd(Cmd::Open { id }));
+        wait("open", &|s| s.active == Some(id) && s.pages >= 2);
+        let s = wait("slide 1: no media", &|s| s.active == Some(id) && s.page == 0);
+        assert!(s.media.is_empty());
+        c.send(CliReq::Cmd(Cmd::GoTo { page: 1 }));
+        let s = wait("slide 2: media found", &|s| s.page == 1 && s.media.len() >= 3);
+        for (i, m) in s.media.iter().enumerate() {
+            println!("   {} — id {} «{}» {} рамка {:.2},{:.2}–{:.2},{:.2}", i + 1, m.id, m.name, if m.video { "видео" } else { "звук" }, m.rect[0], m.rect[1], m.rect[2], m.rect[3]);
+        }
+        let ids: Vec<i32> = s.media.iter().map(|m| m.id).collect();
+        let state = |s: &StateMsg, id: i32| s.media.iter().find(|m| m.id == id).map_or(9, |m| m.state);
+        let pos = |s: &StateMsg, id: i32| s.media.iter().find(|m| m.id == id).map_or(0, |m| m.pos);
+        let play = |id: i32| c.send(CliReq::Cmd(Cmd::PptMedia { id, action: MediaAction::Play }));
+        play(ids[1]);
+        wait("video 2 plays", &|s| state(s, ids[1]) == 0 && pos(s, ids[1]) >= 1);
+        c.send(CliReq::Cmd(Cmd::PptMedia { id: ids[1], action: MediaAction::Pause }));
+        let p = pos(&wait("video 2 paused", &|s| state(s, ids[1]) == 1), ids[1]);
+        play(ids[2]);
+        wait("video 3 plays (video 2 still paused)", &|s| state(s, ids[2]) == 0 && pos(s, ids[2]) >= 1 && state(s, ids[1]) == 1 && pos(s, ids[1]) == p);
+        play(ids[0]);
+        wait("videos 1 and 3 play", &|s| state(s, ids[0]) == 0 && state(s, ids[2]) == 0);
+        for &m in &ids {
+            c.send(CliReq::Cmd(Cmd::PptMedia { id: m, action: MediaAction::Stop }));
+        }
+        wait("all stopped", &|s| s.media.iter().all(|m| m.state >= 2));
+        c.send(CliReq::Cmd(Cmd::GoTo { page: 0 }));
+        wait("back to slide 1: list empty", &|s| s.page == 0 && s.media.is_empty());
     }
 
     /// Отправить одну команду (JSON) на сервер TEST_PORT: TEST_CMD='{"c":"Clock"}'

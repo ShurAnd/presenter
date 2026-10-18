@@ -75,6 +75,31 @@ pub enum Cmd {
     Pan { dx: i32, dy: i32 },
     /// Курсор мыши на экране показа: виден при движении (иначе всегда скрыт).
     Cursor { on: bool },
+    /// Видео или звук на слайде PowerPoint (`MediaInfo::id`): запустить / пауза / стоп.
+    PptMedia { id: i32, action: MediaAction },
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum MediaAction {
+    Play,
+    Pause,
+    Stop,
+}
+
+/// Видео или звук на текущем слайде PowerPoint.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct MediaInfo {
+    pub id: i32,
+    pub name: String,
+    pub video: bool,
+    /// 0 — играет, 1 — пауза, 2 — остановлено, 3 — не запускалось.
+    pub state: u8,
+    /// Позиция и длительность, с.
+    pub pos: u32,
+    pub dur: u32,
+    /// Где на слайде: лево, верх, право, низ в долях — для рамок на миниатюре у оператора.
+    pub rect: [f32; 4],
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
@@ -215,6 +240,9 @@ pub struct StateMsg {
     /// Курсор на экране показа виден при движении мыши (галочка «Показать курсор»).
     #[serde(default)]
     pub cursor: bool,
+    /// Видео и звук на текущем слайде PowerPoint (их запускают кнопками — мыши на экране показа нет).
+    #[serde(default)]
+    pub media: Vec<MediaInfo>,
 }
 
 /// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).

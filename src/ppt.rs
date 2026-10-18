@@ -21,7 +21,28 @@ pub enum PptEvent {
     /// Слайд (с единицы) сохранён крупной картинкой для увеличения (`Host::export_zoom`).
     Zoom(usize),
     ZoomFailed(String),
+    /// Видео и звук на текущем слайде (номер слайда с единицы) — их можно запускать без мыши.
+    Media(usize, Vec<Media>),
     Error(String),
+}
+
+/// Видео или звук, вставленные в слайд. В слайд-шоу они запускаются щелчком мыши, а оператор
+/// за другим компьютером (и курсор на экране показа обычно скрыт) — поэтому запускаем их командой моста.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Media {
+    /// Номер фигуры на слайде (`Shape.Id`) — по нему мост находит проигрыватель.
+    pub id: i32,
+    pub name: String,
+    /// Видео (иначе звук).
+    pub video: bool,
+    /// Состояние проигрывателя PowerPoint: 0 — играет, 1 — пауза, 2 — остановлен, 3 — «не готов»
+    /// (так до первого запуска; `Play` при этом работает — проверено 16.10.2026).
+    pub state: u8,
+    /// Позиция и длительность, с.
+    pub pos: u32,
+    pub dur: u32,
+    /// Где на слайде: лево, верх, право, низ в долях слайда — для рамок на миниатюре.
+    pub rect: [f32; 4],
 }
 
 /// Постоянный мост: один процесс PowerShell и один PowerPoint на всё время работы программы.
@@ -32,8 +53,10 @@ pub enum PptEvent {
 /// Команды (stdin): `open <sid> <в окне 0/1> <путь в base64 UTF-8> <монитор в base64 или -> <папка слайдов
 /// в base64 или -> <ширина картинки>`, `next`, `prev`, `goto N`, `poll`, `show`, `zoom N <ширина> <файл base64>`,
 /// `cursor 3|4` (указатель в слайд-шоу: 3 — всегда скрыт, 4 — стрелка при движении, сама прячется),
-/// `close`, `quit`.
+/// `media play|pause|stop <id фигуры>`, `close`, `quit`.
 /// Ответы: `host`, `ready <sid> N hwnd`, `pos <sid> cur total`, `slide <sid> N`, `zoom <sid> N`, `zoomerr <sid> текст`,
+/// `media <sid> <слайд> id:имя-hex:вид:состояние:позиция:длительность:лево:верх:ширина:высота;…` (видео и звук на
+/// текущем слайде; координаты — в десятитысячных долях слайда; шлётся только при изменении),
 /// `ended <sid>`, `error <sid> текст`.
 ///
 /// Слайды для превью мост сохраняет сам, по одному в паузах между командами: команды ждут не дольше
@@ -49,6 +72,83 @@ $script:app = $null; $script:pres = $null; $script:win = $null; $script:total = 
 $script:cursor = 3
 # Сохранение слайдов картинками: папка, размер и какие слайды ещё не сохранены.
 $script:exp = $null
+# Видео и звук на текущем слайде: для какого слайда собран список, сам список, что последним сообщили.
+$script:mslide = -1; $script:mlist = @(); $script:mlast = $null
+# Папка слайдов презентации — туда же перечень фигур слайда (для разбора, если видео не нашлось).
+$script:sdir = $null
+
+# Видео и звук среди фигур — и внутри групп на любой глубине. Медиа — фигура с типом «медиа» (16),
+# заполнитель с медиа внутри или любая фигура с параметрами медиа (MediaFormat): по одному типу
+# находилось не всё (замечание пользователя 16.10.2026).
+function MediaShapes($shapes, $list) {
+    foreach ($sh in $shapes) {
+        $t = 0; try { $t = [int]$sh.Type } catch {}
+        if ($t -eq 6) { try { MediaShapes $sh.GroupItems $list } catch {}; continue }
+        $m = ($t -eq 16)
+        if (-not $m -and $t -eq 14) { try { $m = ([int]$sh.PlaceholderFormat.ContainedType -eq 16) } catch {} }
+        # У обычных фигур MediaFormat пустой (без ошибки) — медиа только там, где он есть.
+        if (-not $m) { try { $m = ($sh.MediaFormat -ne $null) } catch {} }
+        if (-not $m) { continue }
+        $kind = 3; try { $kind = [int]$sh.MediaType } catch {}
+        # Длительность — у самой фигуры: Player.Duration у PowerPoint пустой (проверено 18.10.2026).
+        $len = 0; try { $len = [int]($sh.MediaFormat.Length / 1000) } catch {}
+        $hex = ([BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes([string]$sh.Name)) -replace '-', '')
+        $list.Add(@{ id = $sh.Id; name = $hex; kind = $kind; len = $len; top = [double]$sh.Top; left = [double]$sh.Left; w = [double]$sh.Width; h = [double]$sh.Height })
+    }
+}
+
+# Перечень всех фигур слайда (с группами) — в файл shapes_N.txt папки слайдов: если видео не
+# нашлось, по нему видно, как оно вставлено.
+function ShapeInventory($shapes, $lines, $depth) {
+    foreach ($sh in $shapes) {
+        $t = ''; $ct = ''; $mt = ''; $mf = ''; $link = ''
+        try { $t = [int]$sh.Type } catch {}
+        try { $ct = [int]$sh.PlaceholderFormat.ContainedType } catch {}
+        try { $mt = [int]$sh.MediaType } catch {}
+        try { $mf = [string]($sh.MediaFormat -ne $null) } catch { $mf = 'ошибка' }
+        try { $link = [string]$sh.LinkFormat.SourceFullName } catch {}
+        $lines.Add(('  ' * $depth) + ('{0} | id {1} | тип {2} | в заполнителе {3} | медиа {4} | MediaFormat {5} | {6:N0},{7:N0} {8:N0}x{9:N0} | {10}' -f $sh.Name, $sh.Id, $t, $ct, $mt, $mf, $sh.Left, $sh.Top, $sh.Width, $sh.Height, $link))
+        if ($t -eq 6) { try { ShapeInventory $sh.GroupItems $lines ($depth + 1) } catch {} }
+    }
+}
+
+# Видео и звук на текущем слайде, их состояние и позиция — программе, только если что-то изменилось.
+# Фигуры перебираем только при смене слайда, на опросе — лишь проигрыватели.
+function MediaReport($view) {
+    try {
+        $slide = $view.Slide
+        $idx = $slide.SlideIndex
+        if ($idx -ne $script:mslide) {
+            $script:mslide = $idx
+            $list = New-Object 'Collections.Generic.List[object]'
+            MediaShapes $slide.Shapes $list
+            # «Видео 1, 2, 3» — в порядке чтения слайда: по строкам сверху вниз, в строке слева направо.
+            $script:mlist = @($list | Sort-Object { [math]::Round($_.top / 60) }, { $_.left })
+            if ($script:sdir) {
+                try {
+                    $lines = New-Object 'Collections.Generic.List[string]'
+                    $lines.Add('Слайд ' + $idx + ', найдено медиа: ' + $script:mlist.Count)
+                    ShapeInventory $slide.Shapes $lines 0
+                    [IO.File]::WriteAllLines((Join-Path $script:sdir ('shapes_' + $idx + '.txt')), $lines, [Text.Encoding]::UTF8)
+                } catch {}
+            }
+        }
+        $sw = [double]$script:pres.PageSetup.SlideWidth; $shh = [double]$script:pres.PageSetup.SlideHeight
+        $parts = New-Object 'Collections.Generic.List[string]'
+        foreach ($m in $script:mlist) {
+            $st = 3; $pos = 0; $dur = $m.len
+            # Проигрыватель берём один раз на слайд — на опросе только читаем его состояние.
+            try {
+                if (-not $m.pl) { $m.pl = $view.Player($m.id) }
+                $st = [int]$m.pl.State; $pos = [int][math]::Floor($m.pl.CurrentPosition / 1000)
+            } catch { $m.pl = $null }
+            $r = ('{0}:{1}:{2}:{3}' -f [int](10000 * $m.left / $sw), [int](10000 * $m.top / $shh), [int](10000 * $m.w / $sw), [int](10000 * $m.h / $shh))
+            $parts.Add([string]$m.id + ':' + $m.name + ':' + $m.kind + ':' + $st + ':' + $pos + ':' + $dur + ':' + $r)
+        }
+        $s = [string]$idx + ' ' + ($parts -join ';')
+    } catch { $s = '0' }
+    if ($s -ne $script:mlast) { $script:mlast = $s; Say ('media ' + $script:sid + ' ' + $s) }
+}
 
 # Живой PowerPoint; если его закрыли или он упал — запускаем заново.
 function App {
@@ -62,6 +162,7 @@ function CloseShow {
     if ($script:win) { try { $script:win.View.Exit() } catch {} }
     if ($script:pres) { try { $script:pres.Saved = -1; $script:pres.Close() } catch {} }
     $script:win = $null; $script:pres = $null; $script:exp = $null
+    $script:mslide = -1; $script:mlist = @(); $script:mlast = $null
 }
 
 # Какие слайды сохранить картинками (уже сохранённые — пропускаем; все готовы — отметка done).
@@ -154,8 +255,10 @@ while ($true) {
             }
             $hwnd = 0; try { $hwnd = $script:win.HWND } catch {}
             Say ('ready ' + $script:sid + ' ' + $script:total + ' ' + $hwnd)
+            $script:sdir = $null
             if ($parts.Count -gt 6 -and $parts[5] -ne '-') {
-                try { PlanSlides ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[5]))) $parts[6] } catch {}
+                try { $script:sdir = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($parts[5])) } catch {}
+                try { PlanSlides $script:sdir $parts[6] } catch {}
             }
         } catch {
             Say ('error ' + $script:sid + ' ' + (Msg $_)); CloseShow
@@ -200,10 +303,15 @@ while ($true) {
         } elseif ($cmd -eq 'show') {
             # Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
             try { $script:win.Activate() } catch {}
+        } elseif ($cmd -eq 'media') {
+            # Видео на слайде — без мыши: через проигрыватель слайд-шоу.
+            $p = $view.Player([int]$parts[2])
+            if ($parts[1] -eq 'play') { $p.Play() } elseif ($parts[1] -eq 'pause') { $p.Pause() } elseif ($parts[1] -eq 'stop') { $p.Stop() }
         }
         # Опрос (poll) PowerPoint лишний раз не трогаем — он может как раз менять слайд.
         if ($cmd -ne 'poll') { try { $script:pres.Saved = -1 } catch {} }
         Say ('pos ' + $script:sid + ' ' + $view.CurrentShowPosition + ' ' + $script:total)
+        MediaReport $view
     } catch {
         # PowerPoint мог быть просто занят; показ окончен, только если его окна больше нет.
         $alive = $false
@@ -396,8 +504,10 @@ impl Host {
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(400));
             let Some(proc) = proc.upgrade() else { break };
-            if current.load(Ordering::SeqCst) != 0 {
-                let _ = waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst);
+            // Новый опрос — только когда мост ответил на прошлое: иначе, пока PowerPoint занят (видео на
+            // слайде), опросы копились в очереди, и команды («пауза» видео) ждали за ними по 5–10 с
+            // (замер 18.10.2026).
+            if current.load(Ordering::SeqCst) != 0 && waiting.compare_exchange(0, now_ms(), Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                 write_line(&proc, "poll");
             }
         });
@@ -476,6 +586,7 @@ impl Host {
                         }
                     }
                     "zoomerr" => on_event(sid, PptEvent::ZoomFailed(rest.join(" "))),
+                    "media" => on_event(sid, PptEvent::Media(num(0).unwrap_or(0), rest.get(1).map_or(Vec::new(), |s| parse_media(s)))),
                     "ended" => on_event(sid, PptEvent::Ended),
                     "error" => on_event(sid, PptEvent::Error(rest.join(" "))),
                     _ => {}
@@ -521,6 +632,11 @@ impl Host {
 
     /// Сохранить слайд `slide` (с единицы) картинкой шириной `width` в файл `path` — для увеличения.
     /// Готово — событие `Zoom(slide)`.
+    /// Видео на слайде: `action` — `play`, `pause` или `stop`; `id` — номер фигуры (`Media::id`).
+    pub fn media(&self, action: &str, id: i32) {
+        self.send(&format!("media {action} {id}"));
+    }
+
     pub fn export_zoom(&self, slide: usize, width: u32, path: &Path) {
         self.send(&format!("zoom {slide} {width} {}", base64(path.to_string_lossy().as_bytes())));
     }
@@ -624,8 +740,44 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// `id:имя-hex:вид:состояние:позиция:длительность:лево:верх:ширина:высота;…` из ответа `media` моста.
+fn parse_media(s: &str) -> Vec<Media> {
+    s.split(';')
+        .filter_map(|e| {
+            let f: Vec<&str> = e.split(':').collect();
+            let n = |i: usize| f.get(i).and_then(|x| x.parse::<i64>().ok());
+            let hex = f.get(1)?;
+            let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()).collect();
+            let k = |i: usize| n(i).unwrap_or(0) as f32 / 10000.0;
+            let (x, y, w, h) = (k(6), k(7), k(8), k(9));
+            Some(Media {
+                id: n(0)? as i32,
+                name: String::from_utf8_lossy(&bytes).into_owned(),
+                // MediaType: 2 — звук, 3 — видео.
+                video: n(2)? != 2,
+                state: n(3)?.clamp(0, 3) as u8,
+                pos: n(4).unwrap_or(0).max(0) as u32,
+                dur: n(5).unwrap_or(0).max(0) as u32,
+                rect: [x, y, x + w, y + h],
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parses_media_line() {
+        // «Видео 3» в UTF-8 hex, видео играет, 12 с из 90, справа вверху; «a b» — звук, остановлен.
+        let hex: String = "Видео 3".bytes().map(|b| format!("{b:02X}")).collect();
+        let v = super::parse_media(&format!("5:{hex}:3:0:12:90:5000:1000:2500:3000;12:612062:2:2:0:0:0:0:0:0"));
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].id, v[0].name.as_str(), v[0].video, v[0].state, v[0].pos, v[0].dur), (5, "Видео 3", true, 0, 12, 90));
+        assert_eq!(v[0].rect, [0.5, 0.1, 0.75, 0.4]);
+        assert_eq!((v[1].id, v[1].name.as_str(), v[1].video, v[1].state), (12, "a b", false, 2));
+        assert!(super::parse_media("").is_empty());
+    }
+
     #[test]
     fn base64() {
         assert_eq!(super::base64(b""), "");
