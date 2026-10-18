@@ -54,7 +54,8 @@ pub const THUMB_W: u32 = 480;
 pub const THUMB_H: u32 = 270;
 
 pub enum Out {
-    Prepared { id: u64, result: Result<(Option<PathBuf>, usize), String> },
+    /// `linked` — у PPTX: видео и звук по ссылке на файлы, которых нет на этом компьютере.
+    Prepared { id: u64, result: Result<(Option<PathBuf>, usize), String>, linked: Vec<String> },
     Ppt { gen: u64, ev: crate::ppt::PptEvent },
     /// Esc, нажатый в слайд-шоу PowerPoint (перехвачен до PowerPoint).
     ShowEsc,
@@ -92,7 +93,9 @@ pub fn prepare(id: u64, src: PathBuf, out: Sender<Out>, wake: impl Fn() + Send +
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(|| prepare_inner(&src))
             .unwrap_or_else(|_| Err("внутренняя ошибка при обработке файла".into()));
-        let _ = out.send(Out::Prepared { id, result });
+        let ext = src.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let linked = if result.is_ok() && (ext == "pptx" || ext == "ppsx") { linked_media(&src) } else { Vec::new() };
+        let _ = out.send(Out::Prepared { id, result, linked });
         wake();
     });
 }
@@ -173,6 +176,74 @@ fn prepare_inner(src: &Path) -> Result<(Option<PathBuf>, usize), String> {
         }
         _ => Err("неподдерживаемый формат".into()),
     }
+}
+
+/// Видео и звук, вставленные в PPTX **ссылкой** на файл (а не внутрь презентации), которых нет на
+/// этом компьютере: «имя файла (слайд N)», по порядку слайдов. На сервер уходит только сам PPTX —
+/// такие видео на экране не появятся. Ссылки — связи слайда с `TargetMode="External"` и типом
+/// video / audio / media; онлайн-видео (http) — не файл, их не считаем.
+pub fn linked_media(src: &Path) -> Vec<String> {
+    let Ok(f) = std::fs::File::open(src) else { return Vec::new() };
+    let Ok(mut zip) = zip::ZipArchive::new(f) else { return Vec::new() };
+    let rels: Vec<String> = zip.file_names().filter(|n| n.starts_with("ppt/slides/_rels/slide") && n.ends_with(".xml.rels")).map(String::from).collect();
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for name in rels {
+        let slide: usize = name.trim_start_matches("ppt/slides/_rels/slide").trim_end_matches(".xml.rels").parse().unwrap_or(0);
+        let mut xml = String::new();
+        let Ok(mut entry) = zip.by_name(&name) else { continue };
+        if std::io::Read::read_to_string(&mut entry, &mut xml).is_err() {
+            continue;
+        }
+        for rel in xml.split("<Relationship ").skip(1) {
+            let attr = |a: &str| rel.split(&format!("{a}=\"")).nth(1).and_then(|s| s.split('"').next()).map(xml_unescape);
+            let kind = attr("Type").unwrap_or_default();
+            let external = attr("TargetMode").is_some_and(|m| m == "External");
+            if !external || !(kind.ends_with("/video") || kind.ends_with("/audio") || kind.ends_with("/media")) {
+                continue;
+            }
+            let target = attr("Target").unwrap_or_default();
+            if target.starts_with("http://") || target.starts_with("https://") {
+                continue;
+            }
+            let path = link_path(&target, src);
+            if path.is_file() {
+                continue;
+            }
+            let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(target);
+            if !found.iter().any(|(s, f)| *s == slide && *f == file) {
+                found.push((slide, file));
+            }
+        }
+    }
+    found.sort();
+    found.into_iter().map(|(s, f)| format!("{f} (слайд {s})")).collect()
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'")
+}
+
+/// Цель ссылки → путь: `file:///D:/Видео/a%20b.mp4`, `D:\Видео\a.mp4` или путь относительно PPTX.
+fn link_path(target: &str, pptx: &Path) -> PathBuf {
+    let t = target.strip_prefix("file:///").or_else(|| target.strip_prefix("file://")).unwrap_or(target);
+    // %XX → байты UTF-8.
+    let bytes = t.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let p = PathBuf::from(String::from_utf8_lossy(&out).into_owned());
+    let absolute = p.is_absolute() || t.as_bytes().get(1) == Some(&b':') || t.starts_with("\\\\");
+    if absolute { p } else { pptx.parent().map_or(p.clone(), |d| d.join(&p)) }
 }
 
 /// PPTX — это zip-архив; слайды лежат в нём как ppt/slides/slideN.xml.
@@ -340,6 +411,37 @@ fn worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Видео по ссылке: находится только ссылка на отсутствующий файл (не онлайн-видео, не вставленное
+    /// внутрь, не существующий файл); %20 в пути раскодируется.
+    #[test]
+    fn finds_linked_media() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("presentator_linked_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let present = dir.join("есть.mp4");
+        std::fs::write(&present, b"x").unwrap();
+        let rels = format!(
+            r#"<?xml version="1.0"?><Relationships>
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/video" Target="file:///C:/нет/ролик%201.mp4" TargetMode="External"/>
+<Relationship Id="rId2" Type="http://schemas.microsoft.com/office/2007/relationships/media" Target="file:///C:/нет/ролик%201.mp4" TargetMode="External"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/video" Target="file:///{}" TargetMode="External"/>
+<Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/video" Target="https://www.youtube.com/embed/x" TargetMode="External"/>
+<Relationship Id="rId5" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/video" Target="../media/media1.mp4"/>
+</Relationships>"#,
+            present.display().to_string().replace('\\', "/")
+        );
+        let pptx = dir.join("t.pptx");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&pptx).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        z.start_file("ppt/slides/_rels/slide3.xml.rels", opts).unwrap();
+        z.write_all(rels.as_bytes()).unwrap();
+        z.start_file("ppt/slides/slide3.xml", opts).unwrap();
+        z.write_all(b"<p/>").unwrap();
+        z.finish().unwrap();
+        assert_eq!(linked_media(&pptx), vec!["ролик 1.mp4 (слайд 3)".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use std::time::Instant;
 
     /// Только рендер, без окна и текстур: чередуем два PDF, как при переключении презентаций.

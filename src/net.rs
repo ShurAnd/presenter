@@ -207,6 +207,9 @@ pub struct ItemInfo {
     /// Видео: по окончании начинать заново.
     #[serde(default)]
     pub repeat: bool,
+    /// PPTX: видео и звук по ссылке на файлы, которых нет на сервере («файл (слайд N)»).
+    #[serde(default)]
+    pub linked: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -243,6 +246,9 @@ pub struct StateMsg {
     /// Видео и звук на текущем слайде PowerPoint (их запускают кнопками — мыши на экране показа нет).
     #[serde(default)]
     pub media: Vec<MediaInfo>,
+    /// Версия программы сервера (пусто — старый сервер, без сверки версий): клиент предупреждает о расхождении.
+    #[serde(default)]
+    pub version: String,
 }
 
 /// Миниатюры текущего и следующего слайда: (элемент, страница с нуля, JPEG).
@@ -277,6 +283,9 @@ enum C2S {
         password: String,
         #[serde(default)]
         upload: bool,
+        /// Версия программы клиента (пусто — старый клиент, без сверки версий).
+        #[serde(default)]
+        version: String,
     },
     Cmd { cmd: Cmd },
     /// `background` — это картинка фона сцены, а не файл для списка.
@@ -316,6 +325,8 @@ pub enum SrvEvent {
     Clients(usize),
     Cmd(Cmd),
     File { name: String, path: PathBuf },
+    /// Подключился клиент (версия его программы; пусто — старый клиент).
+    Hello { version: String },
     /// Принята картинка фона сцены (лежит в рабочей папке, её надо забрать).
     Background { name: String, path: PathBuf },
 }
@@ -449,7 +460,13 @@ async fn serve_client(
     let hello = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
     let (ok, upload_only) = match hello {
         Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str::<C2S>(t.as_str()) {
-            Ok(C2S::Hello { password: p, upload }) => (p == password, upload),
+            Ok(C2S::Hello { password: p, upload, version }) => {
+                if p == password && !upload {
+                    let _ = ev.send(SrvEvent::Hello { version });
+                    wake();
+                }
+                (p == password, upload)
+            }
             _ => (false, false),
         },
         _ => (false, false),
@@ -636,7 +653,7 @@ async fn client_task(
         Ok(Err(e)) => return format!("Не удалось подключиться к {host}:{port} ({e})"),
         Err(_) => return format!("Сервер {host}:{port} не отвечает"),
     };
-    if ws.send(js(&C2S::Hello { password, upload: false })).await.is_err() {
+    if ws.send(js(&C2S::Hello { password, upload: false, version: env!("CARGO_PKG_VERSION").into() })).await.is_err() {
         return "Соединение разорвано".into();
     }
     match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -792,7 +809,7 @@ async fn open_upload_conn(
         .await
         .map_err(|_| "сервер не отвечает".to_string())?
         .map_err(|e| e.to_string())?;
-    ws.send(js(&C2S::Hello { password: password.to_string(), upload: true })).await.map_err(|e| e.to_string())?;
+    ws.send(js(&C2S::Hello { password: password.to_string(), upload: true, version: env!("CARGO_PKG_VERSION").into() })).await.map_err(|e| e.to_string())?;
     match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
         Ok(Some(Ok(Message::Text(t)))) => match serde_json::from_str::<S2C>(t.as_str()) {
             Ok(S2C::Welcome) => Ok(ws),
