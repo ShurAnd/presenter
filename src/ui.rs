@@ -465,6 +465,30 @@ impl App {
         });
     }
 
+    /// Предупреждение видно оператору и при удалённом управлении; показ не трогаем.
+    pub(crate) fn ppt_focus_bar(&mut self, ctx: &egui::Context, view: &StateMsg) {
+        let (notice, window, can_restore) = match &view.ppt_focus {
+            PptFocus::Lost { window } => ("ВНИМАНИЕ: PowerPoint потерял фокус. USB-кликер может не работать.", window.as_str(), true),
+            PptFocus::Restoring { window } => ("Пробуем вернуть фокус PowerPoint…", window.as_str(), false),
+            PptFocus::RestoreFailed { window } => ("Не удалось вернуть фокус: Windows может блокировать активацию. Показ продолжается.", window.as_str(), true),
+            _ => return,
+        };
+        egui::TopBottomPanel::top("ppt_focus_warning")
+            .frame(egui::Frame::new().fill(Color32::from_rgb(255, 240, 210)).inner_margin(6.0))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(notice).strong().color(Color32::from_rgb(125, 65, 0)));
+                    ui.label(RichText::new(format!("Активно: {window}")).color(Color32::DARK_GRAY));
+                    if ui.add_enabled(can_restore, cbutton("Вернуть фокус PowerPoint", BLUE))
+                        .on_hover_text("Только активировать существующее слайд-шоу. Не закрывает окна и не перезапускает показ.")
+                        .clicked()
+                    {
+                        self.act(Cmd::RestorePptFocus);
+                    }
+                });
+            });
+    }
+
     pub(crate) fn bottom_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         let active = view.active.is_some();
         ui.horizontal(|ui| {

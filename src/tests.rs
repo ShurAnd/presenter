@@ -666,3 +666,23 @@ fn e2e_video() {
     c.send(CliReq::Cmd(Cmd::Close));
     wait("closed", &|s| s.active.is_none());
 }
+
+/// Новое поле состояния не ломает чтение состояния от старого сервера.
+#[test]
+fn ppt_focus_backward_compatible() {
+    let mut old = serde_json::to_value(StateMsg::default()).unwrap();
+    old.as_object_mut().unwrap().remove("ppt_focus");
+    let decoded: StateMsg = serde_json::from_value(old).unwrap();
+    assert_eq!(decoded.ppt_focus, PptFocus::Unknown);
+}
+
+#[test]
+fn ppt_focus_roundtrip_and_command() {
+    let state = PptFocus::Lost { window: "Microsoft Office".into() };
+    let mut msg = StateMsg::default();
+    msg.ppt_focus = state.clone();
+    let decoded: StateMsg = serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+    assert_eq!(decoded.ppt_focus, state);
+    let cmd: Cmd = serde_json::from_str(&serde_json::to_string(&Cmd::RestorePptFocus).unwrap()).unwrap();
+    assert!(matches!(cmd, Cmd::RestorePptFocus));
+}

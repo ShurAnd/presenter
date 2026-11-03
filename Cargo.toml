@@ -1,11 +1,14 @@
 [package]
 name = "presentator"
-version = "2.4.0"
+version = "2.4.1"
 edition = "2021"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 hayro = { version = "0.8", features = ["embed-fonts"] }
+# PDFium 7881 is embedded into the Windows EXE at compile time.
+# Its DLL is prepared automatically by scripts/build_release.ps1.
+pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdfium_7881", "thread_safe"] }
 rfd = "0.15"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "fs"] }
 tokio-tungstenite = "0.26"
@@ -15,6 +18,7 @@ serde_json = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 raw-window-handle = "0.6"
+sha2 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

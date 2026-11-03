@@ -72,7 +72,70 @@ extern "system" {
     fn FindWindowW(class: *const u16, title: *const u16) -> isize;
     fn GetWindowLongW(hwnd: isize, index: i32) -> i32;
     fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
+    fn IsWindow(hwnd: isize) -> i32;
+    fn GetForegroundWindow() -> isize;
+    fn GetAncestor(hwnd: isize, flags: u32) -> isize;
+    fn GetWindowTextW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+    fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
 }
+
+/// Снимок фокуса активной Windows-сессии (никаких действий с окнами).
+pub enum FocusProbe {
+    Focused,
+    Away { hwnd: isize, title: String },
+    Unknown,
+}
+
+/// Сравниваем корневые окна, чтобы дочерние HWND слайд-шоу не давали ложную тревогу.
+/// Дескриптор показа берём из PowerPoint COM, не ищем случайное окно другого показа.
+pub fn probe_focus(slideshow: isize) -> FocusProbe {
+    #[cfg(windows)]
+    unsafe {
+        if slideshow == 0 || IsWindow(slideshow) == 0 {
+            return FocusProbe::Unknown;
+        }
+        let foreground = GetForegroundWindow();
+        if foreground == 0 {
+            return FocusProbe::Unknown;
+        }
+        const GA_ROOT: u32 = 2;
+        let root = GetAncestor(slideshow, GA_ROOT);
+        let front_root = GetAncestor(foreground, GA_ROOT);
+        if root != 0 && root == front_root {
+            return FocusProbe::Focused;
+        }
+        let mut buf = [0u16; 160];
+        let n = GetWindowTextW(front_root, buf.as_mut_ptr(), buf.len() as i32);
+        let title = if n > 0 {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            let n = GetClassNameW(front_root, buf.as_mut_ptr(), buf.len() as i32);
+            if n > 0 { format!("Окно ({})", String::from_utf16_lossy(&buf[..n as usize])) }
+            else { "Другое окно Windows".into() }
+        };
+        return FocusProbe::Away { hwnd: foreground, title };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = slideshow;
+        FocusProbe::Unknown
+    }
+}
+
+/// Единственная попытка активировать *существующее* окно показа.
+/// Успех проверяется отдельным опросом: Windows вправе запретить SetForegroundWindow.
+pub fn request_focus(slideshow: isize) {
+    #[cfg(windows)]
+    unsafe {
+        if slideshow != 0 && IsWindow(slideshow) != 0 {
+            let _ = SetForegroundWindow(slideshow);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = slideshow;
+}
+
 
 /// Заголовок окна сцены — по нему мост находит её, чтобы положить прямо под слайд-шоу.
 pub const STAGE_TITLE: &str = "Presentator — сцена";
@@ -299,6 +362,11 @@ impl Host {
 
     pub fn prev(&self) {
         self.post(Req::Prev);
+    }
+
+    /// Не меняя слайды, попросить существующий COM-объект окна показа активироваться.
+    pub fn activate(&self) {
+        self.post(Req::Show);
     }
 
     /// Перейти к слайду `n` (с единицы).
@@ -1144,3 +1212,7 @@ mod bridge {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ppt_flow_tests.rs"]
+mod flow_tests;

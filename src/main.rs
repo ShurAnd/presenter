@@ -14,6 +14,8 @@ mod network;
 mod player;
 mod ppt;
 mod registry;
+#[cfg(target_os = "windows")]
+mod pdfium_bundle;
 mod render;
 mod screen;
 mod stage;
@@ -33,7 +35,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use net::{MediaAction, MediaInfo, AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
+use net::{MediaAction, MediaInfo, AudioInfo, AudioState, CliEvent, CliReq, ClientHandle, Cmd, ItemInfo, PptFocus, Screen, ServerHandle, SrvEvent, StateMsg, VideoInfo, VideoState};
 use render::{Out, PageKey, Renderer, AUDIO_EXTS, FULL_VIEW, THUMB_H, THUMB_W, VIDEO_EXTS, ZOOMS};
 use serde::{Deserialize, Serialize};
 
@@ -336,6 +338,13 @@ struct App {
     dirty: bool,
     /// Постоянный мост к PowerPoint (один на всё время работы).
     ppt_host: ppt::Host,
+    /// Состояние фокуса на машине показа; через StateMsg передаётся оператору.
+    ppt_focus: PptFocus,
+    ppt_focus_polled: Instant,
+    /// Два одинаковых наблюдения подряд защищают от кратких переключений окон.
+    ppt_focus_candidate: Option<isize>,
+    /// Ручная активация: ждём результат до двух секунд, не трогая сам показ.
+    ppt_focus_restore_deadline: Option<Instant>,
     /// Набираемый с клавиатуры номер слайда (цифры, затем Enter) и время последней цифры.
     goto_buf: String,
     goto_at: Option<Instant>,
@@ -490,7 +499,7 @@ impl App {
 
         let (out_tx, out_rx) = channel();
         let ctx = cc.egui_ctx.clone();
-        let renderer = Renderer::new(out_tx.clone(), move || ctx.request_repaint());
+        let renderer = Renderer::new(out_tx.clone(), move || ctx.request_repaint(), &cfg.pdf_engine);
         let (srv_tx, srv_rx) = channel();
         let (mirror_tx, mirror_rx) = channel();
         let (cli_tx, cli_rx) = channel();
@@ -524,6 +533,10 @@ impl App {
             show_gen: 0,
             dirty: false,
             ppt_host,
+            ppt_focus: PptFocus::Unknown,
+            ppt_focus_polled: Instant::now(),
+            ppt_focus_candidate: None,
+            ppt_focus_restore_deadline: None,
             goto_buf: String::new(),
             goto_at: None,
             goto_field: String::new(),
@@ -661,6 +674,7 @@ impl eframe::App for App {
             self.add_files(dropped, ctx);
         }
 
+        self.tick_ppt_focus(ctx);
         let view = self.view();
         self.keys(ctx, &view);
         self.tick_previews(&view);
@@ -671,6 +685,7 @@ impl eframe::App for App {
 
         let margin = egui::Frame::new().fill(Color32::from_gray(0xfa)).inner_margin(6.0);
         egui::TopBottomPanel::top("top").frame(margin).show(ctx, |ui| self.top_bar(ui, &view));
+        self.ppt_focus_bar(ctx, &view);
         self.alarm_bar(ctx);
         self.version_bar(ctx);
         self.health_window(ctx);
@@ -721,3 +736,5 @@ impl eframe::App for App {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod regression_tests;

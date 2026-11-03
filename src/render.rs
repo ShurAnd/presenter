@@ -10,6 +10,28 @@ use hayro::hayro_interpret::InterpreterSettings;
 use hayro::hayro_syntax::Pdf;
 use hayro::vello_cpu::color::palette::css::WHITE;
 use hayro::{PixmapSettings, RenderCache, RenderSettings};
+use pdfium_render::prelude::{PdfDocument, Pdfium, PdfRenderConfig};
+
+/// Исполнитель PDF (сохранён в локальной конфигурации сервера показа).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PdfEngine {
+    #[default]
+    Pdfium,
+    Hayro,
+}
+
+impl PdfEngine {
+    pub fn from_config(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("hayro") { Self::Hayro } else { Self::Pdfium }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Pdfium => "pdfium", Self::Hayro => "hayro" }
+    }
+    pub fn label(self) -> &'static str {
+        match self { Self::Pdfium => "PDFium", Self::Hayro => "Hayro" }
+    }
+}
+
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PageKey {
@@ -88,8 +110,9 @@ fn load_pdf(path: &Path) -> Result<Pdf, String> {
     Pdf::new(data).map_err(|e| format!("не удалось открыть PDF: {e:?}"))
 }
 
-/// Готовит файл к показу в отдельном потоке: считаются страницы или слайды.
-pub fn prepare(id: u64, src: PathBuf, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
+/// Готовит остальные форматы в отдельном потоке, PDFium-файлы обрабатывает
+/// PDFium-поток (чтобы не обращаться к PDFium одновременно из разных потоков).
+fn prepare_in_background(id: u64, src: PathBuf, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(|| prepare_inner(&src))
             .unwrap_or_else(|_| Err("внутренняя ошибка при обработке файла".into()));
@@ -312,74 +335,165 @@ pub fn load_ppt_zoom(gen: u64, page: usize, path: PathBuf, out: Sender<Out>, wak
     });
 }
 
-/// Рендер страниц PDF в нескольких потоках. GUI каждый кадр сообщает, какие страницы нужны
-/// (самые важные — первыми: текущая, следующие, предыдущая), рабочие потоки берут их по порядку.
-/// Новый список заменяет старый — устаревшие заказы при быстром листании просто отбрасываются,
-/// а страницы, которые уже рендерятся, повторно не заказываются.
+/// Подготовка PDFium и рендер идут в одном выделенном потоке. Это важно:
+/// глобальное состояние PDFium небезопасно для параллельных вызовов из разных
+/// потоков. Для Hayro остаётся прежний пул до четырёх потоков.
 pub struct Renderer {
     shared: Arc<Shared>,
+    pdfium_ready: bool,
+    pdfium_error: Option<String>,
 }
 
 struct Shared {
     queue: Mutex<Queue>,
     cv: Condvar,
-    /// Открытый документ — один на все потоки (hayro::Pdf можно читать параллельно).
-    doc: Mutex<Option<(PathBuf, Arc<Pdf>)>>,
+    /// Открытый документ — один на все потоки Hayro.
+    hayro_doc: Mutex<Option<(PathBuf, Arc<Pdf>)>>,
 }
 
-#[derive(Default)]
 struct Queue {
     pdf: Option<PathBuf>,
     jobs: Vec<PageKey>,
-    busy: HashSet<PageKey>,
+    busy: HashSet<(u64, PageKey)>,
+    /// Версия очереди: прежние результаты после переключения PDF/движка не показываются.
+    epoch: u64,
+    engine: PdfEngine,
+    pdfium_prepares: Vec<(u64, PathBuf)>,
+}
+
+impl Default for Queue {
+    fn default() -> Self {
+        Self {
+            pdf: None, jobs: Vec::new(), busy: HashSet::new(),
+            epoch: 0, engine: PdfEngine::Hayro, pdfium_prepares: Vec::new(),
+        }
+    }
 }
 
 impl Renderer {
-    pub fn new(out: Sender<Out>, wake: impl Fn() + Send + Sync + 'static) -> Renderer {
-        let shared = Arc::new(Shared { queue: Mutex::new(Queue::default()), cv: Condvar::new(), doc: Mutex::new(None) });
+    pub fn new(out: Sender<Out>, wake: impl Fn() + Send + Sync + 'static, preferred: &str) -> Renderer {
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(Queue::default()), cv: Condvar::new(),
+            hayro_doc: Mutex::new(None),
+        });
         let wake = Arc::new(wake);
-        // Половина ядер, но не больше 4: остальное — интерфейсу, видео и PowerPoint.
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get() / 2).clamp(1, 4);
         for _ in 0..workers {
             let (shared, out, wake) = (shared.clone(), out.clone(), wake.clone());
-            std::thread::spawn(move || worker(&shared, &out, &*wake));
+            std::thread::spawn(move || hayro_worker(&shared, &out, &*wake));
         }
-        Renderer { shared }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let (shared, out, wake) = (shared.clone(), out.clone(), wake.clone());
+            std::thread::spawn(move || pdfium_worker(&shared, &out, &*wake, ready_tx));
+        }
+        // PDFium загружается только в PDFium-потоке, один раз за сеанс.
+        let availability = ready_rx.recv().unwrap_or_else(|_| Err("поток PDFium не запустился".into()));
+        let pdfium_error = availability.err();
+        let pdfium_ready = pdfium_error.is_none();
+        {
+            let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if pdfium_ready && PdfEngine::from_config(preferred) == PdfEngine::Pdfium {
+                q.engine = PdfEngine::Pdfium;
+            }
+        }
+        Renderer { shared, pdfium_ready, pdfium_error }
     }
 
-    /// Какие страницы нужны сейчас, по убыванию важности. Пустой список — ничего не рендерить.
-    pub fn want(&self, pdf: &Path, keys: Vec<PageKey>) {
-        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-        let jobs: Vec<PageKey> = keys.into_iter().filter(|k| !q.busy.contains(k)).collect();
-        if q.jobs == jobs && q.pdf.as_deref() == Some(pdf) {
-            return;
+    pub fn engine(&self) -> PdfEngine {
+        self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).engine
+    }
+
+    pub fn pdfium_error(&self) -> Option<&str> {
+        self.pdfium_error.as_deref()
+    }
+
+    pub fn set_engine(&self, engine: PdfEngine) -> Result<(), String> {
+        if engine == PdfEngine::Pdfium && !self.pdfium_ready {
+            return Err(format!("PDFium недоступен: {}", self.pdfium_error.as_deref().unwrap_or("библиотека не загружена")));
         }
-        q.pdf = Some(pdf.to_path_buf());
-        q.jobs = jobs;
-        if !q.jobs.is_empty() {
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.engine != engine {
+            q.engine = engine;
+            q.epoch = q.epoch.wrapping_add(1);
+            q.jobs.clear();
             self.shared.cv.notify_all();
         }
+        Ok(())
     }
 
-    /// Отменить всё, что ещё не начато (показ закрыт).
+    /// Подготовка файлов для списка. Для PDF используется тот же движок, что и
+    /// для показа: Hayro может не распознать PDF, который PDFium умеет открыть.
+    pub fn prepare(&self, id: u64, src: PathBuf, out: Sender<Out>, wake: impl Fn() + Send + 'static) {
+        let pdf = src.extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("pdf"));
+        if pdf && self.engine() == PdfEngine::Pdfium {
+            let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            q.pdfium_prepares.push((id, src));
+            self.shared.cv.notify_all();
+        } else {
+            prepare_in_background(id, src, out, wake);
+        }
+    }
+
+    /// Какие страницы нужны сейчас, по убыванию важности.
+    pub fn want(&self, pdf: &Path, keys: Vec<PageKey>) {
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.pdf.as_deref() != Some(pdf) {
+            q.epoch = q.epoch.wrapping_add(1);
+            q.pdf = Some(pdf.to_path_buf());
+        }
+        let jobs: Vec<PageKey> = keys.into_iter().filter(|k| !q.busy.contains(&(q.epoch, *k))).collect();
+        if q.jobs == jobs { return; }
+        q.jobs = jobs;
+        if !q.jobs.is_empty() { self.shared.cv.notify_all(); }
+    }
+
     pub fn cancel(&self) {
-        self.shared.queue.lock().unwrap_or_else(|e| e.into_inner()).jobs.clear();
+        let mut q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+        q.epoch = q.epoch.wrapping_add(1);
+        q.jobs.clear();
+        q.pdf = None;
     }
 }
 
-fn worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync)) {
+fn next_job(shared: &Shared, engine: PdfEngine) -> (PageKey, PathBuf, u64) {
+    let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+    while q.jobs.is_empty() || q.engine != engine {
+        q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+    }
+    let key = q.jobs.remove(0);
+    let epoch = q.epoch;
+    q.busy.insert((epoch, key));
+    (key, q.pdf.clone().unwrap_or_default(), epoch)
+}
+
+fn deliver(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync),
+           key: PageKey, path: &Path, epoch: u64, result: Result<ColorImage, String>) {
+    let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+    q.busy.remove(&(epoch, key));
+    let current = q.epoch == epoch && q.pdf.as_deref() == Some(path);
+    drop(q);
+    if !current { return; }
+    let (id, page) = (key.id, key.page);
+    let ev = match result {
+        Ok(image) if key.thumb => match to_jpeg(&image) {
+            Ok(jpg) => Out::Thumb { id, page, image, jpg },
+            Err(_) => Out::ThumbErr { id, page },
+        },
+        Ok(image) => Out::Page { key, image },
+        Err(_) if key.thumb => Out::ThumbErr { id, page },
+        Err(msg) => Out::PageErr { key, msg },
+    };
+    let _ = out.send(ev);
+    wake();
+}
+
+fn hayro_worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync)) {
     loop {
-        let (key, path) = {
-            let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
-            while q.jobs.is_empty() {
-                q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
-            }
-            let key = q.jobs.remove(0);
-            q.busy.insert(key);
-            (key, q.pdf.clone().unwrap_or_default())
-        };
+        let (key, path, epoch) = next_job(shared, PdfEngine::Hayro);
         let doc = {
-            let mut d = shared.doc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut d = shared.hayro_doc.lock().unwrap_or_else(|e| e.into_inner());
             match d.as_ref().filter(|(p, _)| *p == path) {
                 Some((_, pdf)) => Ok(pdf.clone()),
                 None => load_pdf(&path).map(|pdf| {
@@ -391,26 +505,205 @@ fn worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync)) {
         };
         let res = doc.and_then(|pdf| {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_page(&pdf, key)))
-                .unwrap_or_else(|_| Err("ошибка рендера страницы".into()))
+                .unwrap_or_else(|_| Err("ошибка Hayro при отрисовке страницы".into()))
         });
-        shared.queue.lock().unwrap_or_else(|e| e.into_inner()).busy.remove(&key);
-        let (id, page) = (key.id, key.page);
-        let _ = out.send(match res {
-            Ok(image) if key.thumb => match to_jpeg(&image) {
-                Ok(jpg) => Out::Thumb { id, page, image, jpg },
-                Err(_) => Out::ThumbErr { id, page },
-            },
-            Ok(image) => Out::Page { key, image },
-            Err(_) if key.thumb => Out::ThumbErr { id, page },
-            Err(msg) => Out::PageErr { key, msg },
-        });
-        wake();
+        deliver(shared, out, wake, key, &path, epoch, res);
     }
+}
+
+/// PDFium используется только отсюда — его документ остаётся открытым между
+/// слайдами, чтобы дорогие PDF не разбирались заново при каждом перелистывании.
+fn pdfium_worker(shared: &Shared, out: &Sender<Out>, wake: &(dyn Fn() + Send + Sync),
+                 ready: std::sync::mpsc::SyncSender<Result<(), String>>) {
+    // Windows: PDFium поставляется ВНУТРИ presentator.exe; никакие DLL возле
+    // программы не нужны. Как и libmpv, он извлекается в служебный каталог
+    // LOCALAPPDATA, а загружается по полному пути. Системные DLL не ищем:
+    // это исключает случайную загрузку другой несовместимой версии PDFium.
+    #[cfg(target_os = "windows")]
+    let bindings = crate::pdfium_bundle::extract_pdfium()
+        .and_then(|path| Pdfium::bind_to_library(&path)
+            .map_err(|e| format!("не удалось загрузить встроенный PDFium: {e:?}")));
+    #[cfg(not(target_os = "windows"))]
+    let bindings = Pdfium::bind_to_system_library()
+        .map_err(|e| format!("PDFium не найден: {e:?}"));
+    let bindings = match bindings {
+        Ok(bindings) => bindings,
+        Err(e) => {
+            let _ = ready.send(Err(format!("{e:?}")));
+            return;
+        }
+    };
+    let pdfium = Pdfium::new(bindings);
+    let _ = ready.send(Ok(()));
+    let mut cached: Option<(PathBuf, PdfDocument<'_>)> = None;
+    loop {
+        enum Work { Prepare(u64, PathBuf), Page(PageKey, PathBuf, u64) }
+        let task = {
+            let mut q = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                // Показ важнее предварительного подсчёта страниц других файлов.
+                if !q.jobs.is_empty() && q.engine == PdfEngine::Pdfium {
+                    let key = q.jobs.remove(0);
+                    let epoch = q.epoch;
+                    q.busy.insert((epoch, key));
+                    break Work::Page(key, q.pdf.clone().unwrap_or_default(), epoch);
+                }
+                if !q.pdfium_prepares.is_empty() {
+                    let (id, path) = q.pdfium_prepares.remove(0);
+                    break Work::Prepare(id, path);
+                }
+                q = shared.cv.wait(q).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let path = match &task { Work::Prepare(_, p) | Work::Page(_, p, _) => p.clone() };
+        if cached.as_ref().is_none_or(|(p, _)| p != &path) {
+            cached = None; // Сначала закрываем прошлый документ, освобождая память.
+            if let Ok(doc) = pdfium.load_pdf_from_file(&path, None) {
+                cached = Some((path.clone(), doc));
+            }
+        }
+        let opened = cached.as_ref().filter(|(p, _)| p == &path).map(|(_, d)| d);
+        match task {
+            Work::Prepare(id, _) => {
+                let result = opened.ok_or_else(|| "PDFium не смог открыть документ".to_string())
+                    .and_then(|doc| {
+                        let pages = doc.pages().len() as usize;
+                        if pages == 0 { Err("в PDF нет страниц".into()) }
+                        else { Ok((Some(path.clone()), pages)) }
+                    });
+                let _ = out.send(Out::Prepared { id, result, linked: Vec::new() });
+                wake();
+            }
+            Work::Page(key, _, epoch) => {
+                let result = opened.ok_or_else(|| "PDFium не смог открыть документ".to_string())
+                    .and_then(|doc| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| render_pdfium_page(doc, key)))
+                            .unwrap_or_else(|_| Err("ошибка PDFium при отрисовке страницы".into()))
+                    });
+                deliver(shared, out, wake, key, &path, epoch, result);
+            }
+        }
+    }
+}
+
+/// Одна страница или её видимый фрагмент, без огромных промежуточных битмапов.
+/// Для увеличения используем set_origin() и маленький конечный битмап.
+fn render_pdfium_page(doc: &PdfDocument<'_>, key: PageKey) -> Result<ColorImage, String> {
+    let index = i32::try_from(key.page).map_err(|_| "номер страницы слишком большой")?;
+    let page = doc.pages().get(index).map_err(|e| format!("нет такой страницы: {e:?}"))?;
+    let (pw, ph) = (page.width().value as f64, page.height().value as f64);
+    if !pw.is_finite() || !ph.is_finite() || pw <= 0.0 || ph <= 0.0 {
+        return Err("страница PDF нулевого размера".into());
+    }
+    let v = key.view.map(|n| n as f64 / 10000.0);
+    let (rx, ry) = (v[0] * pw, v[1] * ph);
+    let (rw, rh) = ((v[2] - v[0]) * pw, (v[3] - v[1]) * ph);
+    if rw <= 0.0 || rh <= 0.0 || key.w == 0 || key.h == 0 {
+        return Err("неверная видимая часть PDF".into());
+    }
+    let scale = (key.w as f64 / rw).min(key.h as f64 / rh);
+    // Ограничение памяти и размера PdfiumBitmap при аномальных PDF.
+    let (w, h) = ((rw * scale).round().clamp(1.0, 8192.0) as i32,
+                  (rh * scale).round().clamp(1.0, 8192.0) as i32);
+    if (w as u64) * (h as u64) > 33_554_432 {
+        return Err("страница слишком велика для рендера (лимит 32 Мпикс)".into());
+    }
+    // Важно: масштаб вычисляем после округления пикселей, чтобы края совпадали.
+    let actual_scale = (w as f64 / rw).min(h as f64 / rh) as f32;
+    let config = PdfRenderConfig::new()
+        .scale_page_by_factor(actual_scale)
+        .set_fixed_size(w, h)
+        .set_origin(-(rx * actual_scale as f64).round() as i32,
+                    -(ry * actual_scale as f64).round() as i32);
+    let bitmap = page.render_with_config(&config)
+        .map_err(|e| format!("ошибка PDFium при отрисовке страницы: {e:?}"))?;
+    let width = bitmap.width() as usize;
+    let height = bitmap.height() as usize;
+    let rgba = bitmap.as_rgba_bytes();
+    if rgba.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err("PDFium вернул буфер неожиданного размера".into());
+    }
+    Ok(ColorImage::from_rgba_unmultiplied([width, height], &rgba))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pptx_slide_count_ignores_related_files_and_notes() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("presentator-slides-{}.pptx", crate::net::unique_prefix()));
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            let opts = zip::write::SimpleFileOptions::default();
+            for name in [
+                "ppt/slides/slide1.xml",
+                "ppt/slides/slide2.xml",
+                "ppt/slides/_rels/slide1.xml.rels",
+                "ppt/notesSlides/slide3.xml",
+                "docProps/app.xml",
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(b"<xml/>").unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let result = count_slides(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(result.unwrap(), 2);
+    }
+
+    #[test]
+    fn pptx_slide_count_reports_invalid_archives() {
+        let path = std::env::temp_dir().join(format!("presentator-bad-{}.pptx", crate::net::unique_prefix()));
+        std::fs::write(&path, b"not a zip").unwrap();
+        let result = count_slides(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn media_link_path_decodes_percent_encoding() {
+        let pptx = Path::new("C:/presentations/session.pptx");
+        let target = link_path("../media/clip%20one.mp4", pptx);
+        assert_eq!(target.file_name().unwrap().to_string_lossy(), "clip one.mp4");
+        let target = link_path("file:///D:/Media/a%20b.mov", pptx);
+        assert_eq!(target.file_name().unwrap().to_string_lossy(), "a b.mov");
+    }
+
+    #[test]
+    fn pdf_engine_preference() {
+        assert_eq!(PdfEngine::from_config("pdfium"), PdfEngine::Pdfium);
+        assert_eq!(PdfEngine::from_config(""), PdfEngine::Pdfium);
+        assert_eq!(PdfEngine::from_config("Hayro"), PdfEngine::Hayro);
+        assert_eq!(PdfEngine::Hayro.as_str(), "hayro");
+    }
+
+    /// Проверка PDFium на Windows со встроенной в EXE библиотекой:
+    /// $env:TEST_PDF="C:\\temp\\complex.pdf"
+    /// cargo test --release pdfium_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn pdfium_smoke() {
+        let file = PathBuf::from(std::env::var("TEST_PDF").expect("TEST_PDF = путь к PDF"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let renderer = Renderer::new(tx.clone(), || {}, "pdfium");
+        assert_eq!(renderer.engine(), PdfEngine::Pdfium, "{:?}", renderer.pdfium_error());
+        renderer.prepare(100, file.clone(), tx, || {});
+        let count = match rx.recv_timeout(std::time::Duration::from_secs(60)).expect("PDF prepare timeout") {
+            Out::Prepared { result: Ok((_, pages)), .. } => pages,
+            Out::Prepared { result: Err(e), .. } => panic!("PDFium prepare: {e}"),
+            _ => panic!("неожиданное событие при подготовке PDF"),
+        };
+        assert!(count > 0);
+        renderer.want(&file, vec![PageKey { id: 100, page: 0, w: 1920, h: 1080, thumb: false, view: FULL_VIEW }]);
+        match rx.recv_timeout(std::time::Duration::from_secs(90)).expect("PDF render timeout") {
+            Out::Page { image, .. } => assert!(image.size[0] > 0 && image.size[1] > 0),
+            Out::PageErr { msg, .. } => panic!("PDFium render: {msg}"),
+            _ => panic!("неожиданное событие при отрисовке PDF"),
+        }
+    }
 
     /// Видео по ссылке: находится только ссылка на отсутствующий файл (не онлайн-видео, не вставленное
     /// внутрь, не существующий файл); %20 в пути раскодируется.
@@ -452,7 +745,7 @@ mod tests {
         let files: Vec<PathBuf> = std::env::var("TEST_PDF").unwrap().split(';').map(PathBuf::from).collect();
         let rounds: usize = std::env::var("TEST_ROUNDS").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
         let (tx, rx) = std::sync::mpsc::channel();
-        let r = Renderer::new(tx, || {});
+        let r = Renderer::new(tx, || {}, "hayro");
         for i in 0..rounds {
             let pdf = &files[i % files.len()];
             let keys: Vec<PageKey> = (0..5).map(|page| PageKey { id: i as u64, page, w: 1920, h: 1080, thumb: false, view: FULL_VIEW }).collect();

@@ -36,6 +36,7 @@ impl App {
             zoom: self.show.as_ref().map_or(1.0, |s| s.zoom),
             view: self.slide_view(),
             media: self.slide_media(),
+            ppt_focus: self.ppt_focus.clone(),
             version: env!("CARGO_PKG_VERSION").into(),
             cursor: self.show_cursor,
         }
@@ -286,6 +287,30 @@ impl App {
                 self.ppt_host.set_cursor(on);
                 video::set_cursor(on);
             }
+            Cmd::RestorePptFocus => {
+                // Работает только в режиме обычного показа: при увеличении сцена
+                // намеренно перекрывает PowerPoint, поэтому восстанавливать нечего.
+                let hwnd = self.show.as_ref().and_then(|s| match &s.kind {
+                    ShowKind::Ppt(p) if p.phase == PptPhase::Shown && s.zoom <= 1.0 && p.hwnd != 0 => Some(p.hwnd),
+                    _ => None,
+                });
+                if let Some(hwnd) = hwnd {
+                    let window = match &self.ppt_focus {
+                        PptFocus::Lost { window } | PptFocus::RestoreFailed { window } => window.clone(),
+                        _ => "другое окно".into(),
+                    };
+                    self.ppt_focus = PptFocus::Restoring { window };
+                    self.ppt_focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
+                    self.ppt_focus_candidate = None;
+                    self.ppt_focus_polled = Instant::now() - Duration::from_secs(1);
+                    // Ни Close, ни Open, ни GoTo: только активация существующего окна.
+                    ppt::request_focus(hwnd);
+                    self.ppt_host.activate();
+                    jlog!("Оператор запросил восстановление фокуса PowerPoint");
+                } else {
+                    self.status = "Фокус недоступен: слайд-шоу PowerPoint не готово или увеличено".into();
+                }
+            }
             Cmd::PptMedia { id, action } => {
                 if self.show.as_ref().is_some_and(Show::is_ppt) {
                     let a = match action {
@@ -396,6 +421,78 @@ impl App {
             PptPhase::Shown => {}
         }
         self.tick_ppt_zoom();
+    }
+
+    /// Сравниваем фокус в Windows только для готового обычного показа PPTX.
+    /// Не меняем положение окна и не управляем PowerPoint при опросе.
+    pub(crate) fn tick_ppt_focus(&mut self, ctx: &egui::Context) {
+        let hwnd = self.show.as_ref().and_then(|s| match &s.kind {
+            ShowKind::Ppt(p) if p.phase == PptPhase::Shown && s.zoom <= 1.0 => Some(p.hwnd),
+            _ => None,
+        }).unwrap_or(0);
+        if hwnd == 0 {
+            self.ppt_focus_candidate = None;
+            self.ppt_focus_restore_deadline = None;
+            self.update_ppt_focus(PptFocus::Unknown);
+            return;
+        }
+        let now = Instant::now();
+        let interval = Duration::from_millis(if self.ppt_focus_restore_deadline.is_some() { 200 } else { 500 });
+        let elapsed = now.saturating_duration_since(self.ppt_focus_polled);
+        if elapsed < interval {
+            ctx.request_repaint_after(interval - elapsed);
+            return;
+        }
+        self.ppt_focus_polled = now;
+        let probe = ppt::probe_focus(hwnd);
+        if matches!(&probe, ppt::FocusProbe::Focused) {
+            self.ppt_focus_candidate = None;
+            self.ppt_focus_restore_deadline = None;
+            self.update_ppt_focus(PptFocus::Ok);
+        } else if let Some(deadline) = self.ppt_focus_restore_deadline {
+            if now >= deadline {
+                self.ppt_focus_restore_deadline = None;
+                let window = match &self.ppt_focus {
+                    PptFocus::Restoring { window } => window.clone(),
+                    _ => "другое окно".into(),
+                };
+                self.update_ppt_focus(PptFocus::RestoreFailed { window });
+            }
+        } else {
+            match probe {
+                ppt::FocusProbe::Away { hwnd: front, title } => {
+                    if self.ppt_focus_candidate == Some(front) {
+                        // Не сбрасываем неудачную попытку, пока окно не вернуло фокус.
+                        if !matches!(&self.ppt_focus, PptFocus::RestoreFailed { .. }) {
+                            self.update_ppt_focus(PptFocus::Lost { window: title });
+                        }
+                    } else {
+                        self.ppt_focus_candidate = Some(front);
+                    }
+                }
+                ppt::FocusProbe::Unknown => {
+                    self.ppt_focus_candidate = None;
+                    self.update_ppt_focus(PptFocus::Unknown);
+                }
+                ppt::FocusProbe::Focused => {}
+            }
+        }
+        ctx.request_repaint_after(interval);
+    }
+
+    fn update_ppt_focus(&mut self, state: PptFocus) {
+        if self.ppt_focus != state {
+            match &state {
+                PptFocus::Lost { window } => jlog!("PowerPoint потерял фокус: {window}"),
+                PptFocus::RestoreFailed { .. } => jlog!("Не удалось восстановить фокус PowerPoint"),
+                PptFocus::Ok if matches!(&self.ppt_focus, PptFocus::Lost { .. } | PptFocus::Restoring { .. } | PptFocus::RestoreFailed { .. }) => {
+                    jlog!("Фокус слайд-шоу PowerPoint восстановлен");
+                }
+                _ => {}
+            }
+            self.ppt_focus = state;
+            self.dirty = true;
+        }
     }
 
     /// Файл крупной картинки слайда (с нуля) — в папке слайдов этой презентации.
@@ -683,7 +780,7 @@ impl App {
             self.ppt_host.prewarm();
         }
         let ctx = ctx.clone();
-        render::prepare(id, path, self.out_tx.clone(), move || ctx.request_repaint());
+        self.renderer.prepare(id, path, self.out_tx.clone(), move || ctx.request_repaint());
         self.dirty = true;
     }
 
@@ -1051,3 +1148,7 @@ impl App {
 pub(crate) fn linked_text(linked: &[String]) -> String {
     format!("{} видео по ссылке на файлы, которых нет на этом компьютере ({})", linked.len(), linked.join(", "))
 }
+
+#[cfg(test)]
+#[path = "commands_flow_tests.rs"]
+mod flow_tests;

@@ -56,6 +56,40 @@ impl App {
                 ui.add_space(4.0);
                 ui.checkbox(&mut self.cfg.windowed, "Сцена и показ в окне, а не на весь экран (только для теста на одном компьютере)");
 
+                section(ui, "PDF — движок отрисовки");
+                ui.label(RichText::new("PDFium — для сложных градиентов, прозрачности и векторной графики; Hayro — прежний движок. Выбор действует на этом компьютере (на сервере показа).").size(11.5).color(GRAY));
+                let current_engine = self.renderer.engine();
+                let mut choice = current_engine;
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut choice, render::PdfEngine::Pdfium, "PDFium (рекомендуется)");
+                    ui.radio_value(&mut choice, render::PdfEngine::Hayro, "Hayro (совместимость)");
+                });
+                if choice != current_engine {
+                    match self.renderer.set_engine(choice) {
+                        Ok(()) => {
+                            self.cfg.pdf_engine = choice.as_str().into();
+                            self.save_cfg();
+                            // Новое содержимое должно рендериться выбранным движком; старые
+                            // картинки и статусы неудачи больше не соответствуют PDF.
+                            self.textures.clear();
+                            self.failed.clear();
+                            self.last_tex = None;
+                            self.render_error = None;
+                            let pdf_ids: std::collections::HashSet<u64> = self.items.iter()
+                                .filter(|it| it.kind == "PDF").map(|it| it.id).collect();
+                            self.previews.retain(|(id, _), _| !pdf_ids.contains(id));
+                            self.thumb_jpg.retain(|(id, _), _| !pdf_ids.contains(id));
+                            self.thumb_busy.retain(|(id, _)| !pdf_ids.contains(id));
+                            self.thumb_failed.retain(|(id, _)| !pdf_ids.contains(id));
+                            self.status = format!("PDF-движок переключён: {}", choice.label());
+                        }
+                        Err(e) => self.status = e,
+                    }
+                }
+                if let Some(err) = self.renderer.pdfium_error() {
+                    ui.label(RichText::new(format!("PDFium недоступен: {err}. Используется Hayro. Встроенная библиотека должна извлечься автоматически. Проверьте доступ на запись в %LOCALAPPDATA%\\Presentator и перезапустите программу.")).size(11.5).color(RED));
+                }
+
                 section(ui, "Запуск");
                 let mut auto = self.autostart;
                 let resp = ui.checkbox(&mut auto, "Запускать сервер при входе в Windows (с самовосстановлением после сбоя)").on_hover_text(

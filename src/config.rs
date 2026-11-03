@@ -13,6 +13,8 @@ pub(crate) struct Config {
     pub(crate) windowed: bool,
     /// Клавиши в окне программы (стрелки, PageUp/PageDown, пробел, цифры + Enter) управляют показом.
     pub(crate) keyboard: bool,
+    /// Предпочтительный PDF-движок на этом ПК: "pdfium" или "hayro".
+    pub(crate) pdf_engine: String,
     /// Монитор для показа: системное имя `\\.\DISPLAY2`; пусто — основной.
     pub(crate) monitor: String,
     /// Серверы, к которым подключались, — последний использованный первым.
@@ -45,6 +47,7 @@ impl Default for Config {
             name: String::new(),
             windowed: false,
             keyboard: true,
+            pdf_engine: "pdfium".into(),
             monitor: String::new(),
             servers: Vec::new(),
             reserve: String::new(),

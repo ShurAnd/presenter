@@ -77,7 +77,24 @@ pub enum Cmd {
     Cursor { on: bool },
     /// Видео или звук на слайде PowerPoint (`MediaInfo::id`): запустить / пауза / стоп.
     PptMedia { id: i32, action: MediaAction },
+    /// Ручное восстановление фокуса слайд-шоу PowerPoint на компьютере показа.
+    /// Не открывает презентацию заново, не переключает слайды и не закрывает окна.
+    RestorePptFocus,
 }
+
+/// Наблюдение за фокусом именно окна слайд-шоу (не за видимостью презентации).
+/// Новое необязательное поле — старые серверы/клиенты могут его не передавать.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PptFocus {
+    /// PPTX не показывается, идёт загрузка/увеличение или HWND неизвестен.
+    #[default]
+    Unknown,
+    Ok,
+    Lost { window: String },
+    Restoring { window: String },
+    RestoreFailed { window: String },
+}
+
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum MediaAction {
@@ -246,6 +263,9 @@ pub struct StateMsg {
     /// Видео и звук на текущем слайде PowerPoint (их запускают кнопками — мыши на экране показа нет).
     #[serde(default)]
     pub media: Vec<MediaInfo>,
+    /// Состояние фокуса PowerPoint на компьютере показа.
+    #[serde(default)]
+    pub ppt_focus: PptFocus,
     /// Версия программы сервера (пусто — старый сервер, без сверки версий): клиент предупреждает о расхождении.
     #[serde(default)]
     pub version: String,
@@ -875,9 +895,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filename_sanitizer_rejects_windows_forbidden_characters() {
+        assert_eq!(safe_name("report:2026/11\\final?.pdf"), "report_2026_11_final_.pdf");
+        assert_eq!(safe_name("  .   "), "file");
+        assert_eq!(safe_name("\n\t"), "__");
+        assert_eq!(safe_name("  "), "file");
+        assert_eq!(safe_name("Доклад.pptx"), "Доклад.pptx");
+    }
+
+    #[test]
+    fn thumbnail_frames_reject_incomplete_headers() {
+        for len in 0..12 {
+            assert!(parse_thumb(&vec![0u8; len]).is_none(), "len={len}");
+        }
+        let mut header = vec![0u8; 12];
+        header[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        header[8..12].copy_from_slice(&42u32.to_le_bytes());
+        assert_eq!(parse_thumb(&header), Some((u64::MAX, 42, &b""[..])));
+    }
+
+    #[test]
+    fn image_decoder_rejects_garbage_and_reads_png() {
+        assert!(decode_image(b"not an image").is_none());
+        let img = image::DynamicImage::new_rgba8(3, 2);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let decoded = decode_image(&bytes.into_inner()).unwrap();
+        assert_eq!(decoded.size, [3, 2]);
+    }
+
+    #[test]
     fn thumb_frame_roundtrip() {
         let Message::Binary(b) = thumb_frame(0x0102_0304_0506_0708, 41, b"jpeg") else { panic!("ожидался бинарный кадр") };
         assert_eq!(parse_thumb(&b), Some((0x0102_0304_0506_0708, 41, &b"jpeg"[..])));
         assert_eq!(parse_thumb(&b[..11]), None);
     }
 }
+
+#[cfg(test)]
+#[path = "net_loopback_tests.rs"]
+mod loopback_tests;

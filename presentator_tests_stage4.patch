@@ -1,0 +1,672 @@
+diff --git a/TESTING_STAGE4.md b/TESTING_STAGE4.md
+new file mode 100644
+index 0000000..099a3c1
+--- /dev/null
++++ b/TESTING_STAGE4.md
+@@ -0,0 +1,126 @@
++# Presentator 2.4.1 — этап 4: команды и мост PowerPoint
++
++Этап 4 устанавливается **поверх успешно проверенного этапа 3**.
++Исходная база восстановлена из `presentator_test_sources.zip` и патчей
++этапов 2–3; если после этапа 3 вы вручную меняли `src/commands.rs` или
++`src/ppt.rs`, используйте проверку патча до применения и не перезаписывайте
++свои изменения автоматически.
++
++## Область изменений
++
++Только тестовый код, подключаемый через `#[cfg(test)]`:
++
++- `src/commands.rs` — подключение модуля тестов (3 строки);
++- `src/ppt.rs` — подключение модуля тестов (3 строки);
++- `src/commands_flow_tests.rs` — 14 новых тестов;
++- `src/ppt_flow_tests.rs` — 10 новых тестов.
++
++Функции приложения, протокол, `Cargo.toml`, зависимости, PowerPoint COM,
++рендер, конфигурация и релизный EXE **не менялись**. Тестовые модули
++вообще не компилируются в обычный release-билд.
++
++## Что проверяют 14 тестов диспетчера команд
++
++- Открытие PDF в синтетическом списке, установка сцены и смена показа;
++- Отказ открывать отсутствующие, ещё не подготовленные и ошибочные записи;
++- Навигация `Next` / `Prev` / `GoTo` с ограничением допустимых страниц;
++- Сброс увеличения при смене PDF-страницы;
++- Увеличение, перемещение и возврат к полной странице без выхода за границы;
++- `Clock` / `Timer` / `Background` закрывают показ, но оставляют сцену;
++- Предупреждение об отсутствующих связанных медиафайлах;
++- Точность локального состояния списка (готов, обрабатывается, ошибка);
++- Переключение между локальным и полученным от сервера состоянием;
++- PowerPoint-медиа доступно только на соответствующем слайде;
++- `RestorePptFocus` без готового показа не пытается управлять окном;
++- Команды перелистывания PPTX не подменяют позицию до подтверждения моста;
++- Состояние сцены при разных фазах показа PPTX;
++- Флаг повтора меняется только у названного элемента и формат предупреждения.
++
++**Ограничение:** для проверки реального `App::apply` создаётся тестовый
++экземпляр `App`; он инициализирует его обычный `Renderer` (фоновые потоки,
++PDFium, если он доступен). Не открываются пользовательские файлы, окно
++PowerPoint, устройства аудио, WebSocket-порт 14999. Поскольку вызывается
++производственный обработчик команд, он может **добавить записи в штатный
++журнал Presentator** в `%APPDATA%\presenter\presentator.log`. Запускайте
++тесты отдельно от реального мероприятия.
++
++## Что проверяют 10 тестов моста PowerPoint
++
++- Последовательность команд `Next`, `Prev`, `Goto`, `Show`;
++- Точные аргументы `Cursor`, `Media`, `Zoom`;
++- `Close` идемпотентен и не завершает рабочий поток;
++- Закрытие при отсутствии показа ничего не отправляет;
++- `lag_probe` сообщает показатели только для активного показа;
++- `restart` сбрасывает текущий показ, ожидание и очередь;
++- Команды без открытого моста не запускают PowerPoint;
++- Неожиданное завершение **текущего** моста порождает `PptEvent::Error`;
++- Закрытый показ не вызывает ложного уведомления;
++- Позднее завершение **старого** моста после перезапуска не влияет на новый.
++
++В этих тестах вместо реального рабочего потока используется
++`std::sync::mpsc` с подставным `Worker`: не запускается PowerPoint,
++COM и не посылаются команды на настоящий показ.
++
++## Ожидаемый подсчёт
++
++На этапе 3 было 92 теста: 71 обычный и 21 `ignored`. В этапе 4 добавлены
++24 обычных. **Ожидается 116 всего / 95 обычных / 21 `ignored`.**
++Это расчёт по исходникам, не результат выполнения Windows Cargo.
++
++## Установка ZIP поверх этапа 3
++
++1. Закройте приложение, если прямо сейчас идёт показ, и сохраните изменения
++   текущего проекта в Git.
++2. Распакуйте `presentator_tests_stage4.zip` в `C:\rust\presenter`
++   с заменой **только перечисленных файлов**.
++3. Проверьте, что тестовый модуль подключился:
++
++   ```powershell
++   cargo test --all-targets -- --list | Select-String 'flow_tests'
++   ```
++
++4. Запустите только новый набор:
++
++   ```powershell
++   cargo test flow_tests -- --nocapture
++   ```
++
++5. Если он прошёл, запустите полный безопасный набор:
++
++   ```powershell
++   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_tests.ps1
++   ```
++
++6. Сгенерируйте повторный отчёт о покрытии:
++
++   ```powershell
++   powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify_tests.ps1 -Coverage
++   ```
++
++   Основной показатель для сравнения — покрытие `commands.rs` и `ppt.rs`.
++   Базовая сводка третьего этапа: 13,92% строк по проекту.
++   Не обещается фиксированный прирост: проценты определит `cargo-llvm-cov`.
++
++## Безопасный вариант установки через Git
++
++Для чистого репозитория этапа 3 сначала используйте проверку:
++
++```powershell
++# если патч лежит в корне проекта:
++git apply --check .\presentator_tests_stage4.patch
++git apply .\presentator_tests_stage4.patch
++```
++
++Если проверка не проходит, **не применяйте его принудительно**: пришлите
++вывод ошибки. При ручных изменениях в исходниках патч может требовать
++согласования. Не запускайте весь комплект `#[ignore]` командой
++`cargo test -- --ignored`: в старых сценариях есть управление настоящим
++сервером и презентациями.
++
++## Что не проверено здесь
++
++В этой среде нет Rust toolchain и установленного PowerPoint, поэтому
++`cargo test` и `cargo build --release` здесь не выполнялись. Сборка,
++24 новых теста и новый процент покрытия должны быть подтверждены на Windows.
++Мост PowerPoint проверен на уровне очереди команд и правил обработки
++завершения потока, но это **не** полноценный COM E2E-тест PowerPoint.
+diff --git a/src/commands.rs b/src/commands.rs
+index 2e257b6..58581d1 100644
+--- a/src/commands.rs
++++ b/src/commands.rs
+@@ -1148,3 +1148,7 @@ impl App {
+ pub(crate) fn linked_text(linked: &[String]) -> String {
+     format!("{} видео по ссылке на файлы, которых нет на этом компьютере ({})", linked.len(), linked.join(", "))
+ }
++
++#[cfg(test)]
++#[path = "commands_flow_tests.rs"]
++mod flow_tests;
+diff --git a/src/commands_flow_tests.rs b/src/commands_flow_tests.rs
+new file mode 100644
+index 0000000..4f6474f
+--- /dev/null
++++ b/src/commands_flow_tests.rs
+@@ -0,0 +1,344 @@
++//! Stage 4: tests of the real App command dispatcher, with no PowerPoint or real files.
++//! PDF entries are synthetic; no GUI window, external server or PowerPoint is used.
++//! Production command logging may still append to the usual application log.
++use super::*;
++
++fn test_app() -> App {
++    let cfg = Config { pdf_engine: "hayro".into(), ..Config::default() };
++    let ctx = egui::Context::default();
++    let (out_tx, out_rx) = channel();
++    let renderer = Renderer::new(out_tx.clone(), || {}, &cfg.pdf_engine);
++    let (srv_tx, srv_rx) = channel();
++    let (mirror_tx, mirror_rx) = channel();
++    let (cli_tx, cli_rx) = channel();
++    let ppt_host = ppt::Host::new(|_, _| {});
++    let player = player::Player::new(cfg.audio_list, cfg.audio_repeat, cfg.audio_volume, |_| {});
++    App {
++            player,
++            saved_audio: String::new(),
++            audio_selected: None,
++            audio_seek: None,
++            cfg,
++            ctx: ctx.clone(),
++            work_dir: std::env::temp_dir().join("presentator_stage4_tests_no_io"),
++            items: Vec::new(),
++            next_id: 1,
++            show: None,
++            show_gen: 0,
++            dirty: false,
++            ppt_host,
++            ppt_focus: PptFocus::Unknown,
++            ppt_focus_polled: Instant::now(),
++            ppt_focus_candidate: None,
++            ppt_focus_restore_deadline: None,
++            goto_buf: String::new(),
++            goto_at: None,
++            goto_field: String::new(),
++            forgotten: HashSet::new(),
++            saved_list: String::new(),
++            screen: Screen::Background,
++            timer: screen::Timer::default(),
++            timer_min: String::new(),
++            timer_sec: String::new(),
++            remote_at: Instant::now(),
++            previews: HashMap::new(),
++            thumb_jpg: HashMap::new(),
++            thumb_busy: HashSet::new(),
++            thumb_failed: HashSet::new(),
++            ui_frames: Arc::new(AtomicU64::new(0)),
++            collector: None,
++            local_health: None,
++            remote_health: None,
++            rtt: None,
++            last_seen: None,
++            remote_live: false,
++            health_at: None,
++            lost: None,
++            reconnect: None,
++            mirror: None,
++            mirror_tx,
++            mirror_rx,
++            resume: None,
++            last_show: None,
++            pending_add: Vec::new(),
++            autostart: false,
++            health_open: false,
++            help_open: false,
++            media_hover: None,
++            show_cursor: false,
++            cursor_moved: None,
++            stage_px: (1920.0, 1080.0),
++            slide_aspect: 16.0 / 9.0,
++            reserve_form: None,
++            stage: false,
++            stage_sent: None,
++            bg: None,
++            bg_checked: false,
++            bg_gen: 0,
++            bg_shown: false,
++            esc_at: None,
++            main_hwnd: 0,
++            main_minimized: false,
++            stage_up: false,
++            renderer,
++            out_tx,
++            out_rx,
++            textures: HashMap::new(),
++            failed: HashSet::new(),
++            last_tex: None,
++            render_error: None,
++            server: None,
++            server_online: false,
++            srv_tx,
++            srv_rx,
++            clients: 0,
++            client: None,
++            connected: false,
++            cli_tx,
++            cli_rx,
++            remote: StateMsg::default(),
++            tab: if std::env::args().any(|a| a == "--net") { Tab::Net } else { Tab::List },
++            logged_status: String::new(),
++            logged_net: String::new(),
++            logged_level: None,
++            awake: false,
++            confirm: None,
++            got_state: false,
++            version_hidden: false,
++            selected: None,
++            net_status: String::new(),
++            status: String::new(),
++    }
++}
++
++fn pdf_item(id: u64, pages: usize) -> Item {
++    Item {
++        id, name: format!("deck_{id}.pdf"), kind: "PDF".into(),
++        src: PathBuf::from(format!("not_created_{id}.pdf")),
++        pdf: Some(PathBuf::from(format!("not_created_{id}.pdf"))),
++        pages, status: Status::Ready, slides: None, repeat: false, linked: vec![],
++    }
++}
++
++fn open_pdf(app: &mut App, id: u64, pages: usize) {
++    app.items.push(pdf_item(id, pages));
++    app.apply(Cmd::Open { id });
++    assert_eq!(app.show.as_ref().map(|s| s.id), Some(id));
++}
++
++#[test]
++fn command_open_pdf_initializes_stage_and_replaces_show() {
++    let mut a = test_app();
++    open_pdf(&mut a, 11, 5);
++    assert!(a.stage);
++    assert_eq!(a.screen, Screen::Background);
++    assert_eq!(a.show.as_ref().unwrap().page, 0);
++    assert_eq!(a.show.as_ref().unwrap().zoom, 1.0);
++    let first_generation = a.show_gen;
++    open_pdf(&mut a, 22, 3);
++    assert_eq!(a.show.as_ref().unwrap().id, 22);
++    assert!(a.show_gen > first_generation);
++    assert_eq!(a.local_state().active, Some(22));
++    a.apply(Cmd::Close);
++    assert!(a.show.is_none());
++    assert_eq!(a.local_state().active, None);
++    assert!(a.stage); // Closing must not tear down the stage itself.
++}
++
++#[test]
++fn command_rejects_unknown_or_not_ready_items_without_interrupting_show() {
++    let mut a = test_app();
++    open_pdf(&mut a, 1, 4);
++    let generation = a.show_gen;
++    a.items.push(Item { status: Status::Preparing, ..pdf_item(2, 10) });
++    a.items.push(Item { status: Status::Error("invalid PDF".into()), ..pdf_item(3, 10) });
++    for id in [999, 2, 3] {
++        a.apply(Cmd::Open { id });
++        assert_eq!(a.show.as_ref().unwrap().id, 1);
++        assert_eq!(a.show_gen, generation);
++    }
++}
++
++#[test]
++fn command_pdf_navigation_clamps_boundaries_and_resets_zoom() {
++    let mut a = test_app();
++    open_pdf(&mut a, 1, 3);
++    a.apply(Cmd::Prev);
++    assert_eq!(a.show.as_ref().unwrap().page, 0);
++    a.apply(Cmd::Next);
++    assert_eq!(a.show.as_ref().unwrap().page, 1);
++    a.apply(Cmd::Zoom { step: 1 });
++    assert!(a.show.as_ref().unwrap().zoom > 1.0);
++    a.apply(Cmd::Next);
++    assert_eq!(a.show.as_ref().unwrap().page, 2);
++    assert_eq!(a.show.as_ref().unwrap().zoom, 1.0);
++    a.apply(Cmd::Next);
++    assert_eq!(a.show.as_ref().unwrap().page, 2);
++    a.apply(Cmd::GoTo { page: usize::MAX });
++    assert_eq!(a.show.as_ref().unwrap().page, 2);
++    a.apply(Cmd::GoTo { page: 0 });
++    assert_eq!(a.show.as_ref().unwrap().page, 0);
++}
++
++#[test]
++fn command_zoom_and_pan_never_expose_area_outside_pdf() {
++    let mut a = test_app();
++    open_pdf(&mut a, 1, 1);
++    for _ in 0..20 { a.apply(Cmd::Zoom { step: 1 }); }
++    assert_eq!(a.show.as_ref().unwrap().zoom, 4.0);
++    for _ in 0..25 { a.apply(Cmd::Pan { dx: 1, dy: -1 }); }
++    let view = a.slide_view();
++    assert!(view[0] >= 0.0 && view[1] >= 0.0, "{view:?}");
++    assert!(view[2] <= 1.0 && view[3] <= 1.0, "{view:?}");
++    a.apply(Cmd::Zoom { step: 0 });
++    assert_eq!(a.show.as_ref().unwrap().zoom, 1.0);
++    assert_eq!(a.show.as_ref().unwrap().center, (0.5, 0.5));
++    assert_eq!(a.slide_view(), [0.0, 0.0, 1.0, 1.0]);
++}
++
++#[test]
++fn command_background_clock_timer_close_show_but_keep_stage() {
++    let mut a = test_app();
++    open_pdf(&mut a, 10, 2);
++    for (cmd, screen) in [(Cmd::Clock, Screen::Clock), (Cmd::Timer, Screen::Timer), (Cmd::Background, Screen::Background)] {
++        a.apply(cmd);
++        assert!(a.show.is_none());
++        assert_eq!(a.screen, screen);
++        assert!(a.stage);
++        // Reopen a PDF to ensure the following mode switch genuinely closes it.
++        a.apply(Cmd::Open { id: 10 });
++        assert!(a.show.is_some());
++    }
++}
++
++#[test]
++fn command_open_warns_about_missing_linked_media_without_changing_pages() {
++    let mut a = test_app();
++    let mut it = pdf_item(1, 8);
++    it.linked = vec!["video.mp4 (слайд 3)".into()];
++    a.items.push(it);
++    a.apply(Cmd::Open { id: 1 });
++    assert_eq!(a.show.as_ref().unwrap().pages, 8);
++    assert!(a.status.contains("video.mp4"));
++    assert!(a.status.contains("Внимание"));
++}
++
++#[test]
++fn command_local_state_marks_ready_preparing_and_failed_items() {
++    let mut a = test_app();
++    a.items.push(pdf_item(1, 3));
++    a.items.push(Item { status: Status::Preparing, ..pdf_item(2, 5) });
++    a.items.push(Item { status: Status::Error("bad PDF".into()), ..pdf_item(3, 2) });
++    let state = a.local_state();
++    assert_eq!(state.items.len(), 3);
++    assert!(state.items[0].ready);
++    assert!(!state.items[1].ready);
++    assert!(state.items[1].status.contains("обработка"));
++    assert!(!state.items[2].ready);
++    assert!(state.items[2].status.contains("bad PDF"));
++    assert!(state.active.is_none());
++}
++
++#[test]
++fn command_switches_to_remote_state_when_connected() {
++    let mut a = test_app();
++    a.status = "local".into();
++    a.remote.message = "remote".into();
++    assert_eq!(a.view().message, "local");
++    a.connected = true;
++    assert_eq!(a.view().message, "remote");
++    a.connected = false;
++    assert_eq!(a.view().message, "local");
++}
++
++#[test]
++fn command_ppt_media_is_visible_only_on_matching_slide() {
++    let mut a = test_app();
++    a.show = Some(Show {
++        id: 15, page: 2, pages: 5,
++        kind: ShowKind::Ppt(PptShow {
++            phase: PptPhase::Shown, hwnd: 0, zoom_img: None,
++            zoom_busy: None, zoom_up: false,
++            media: (3, vec![ppt::Media {
++                id: 17, name: "clip".into(), video: true, state: 3,
++                pos: 0, dur: 90, rect: [0.1, 0.2, 0.7, 0.8],
++            }]),
++        }),
++        gen: 1, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5),
++    });
++    assert_eq!(a.slide_media().len(), 1);
++    assert_eq!(a.slide_media()[0].id, 17);
++    a.show.as_mut().unwrap().page = 3;
++    assert!(a.slide_media().is_empty());
++}
++
++#[test]
++fn command_restore_focus_without_active_slideshow_is_safe() {
++    let mut a = test_app();
++    a.apply(Cmd::RestorePptFocus);
++    assert!(a.status.contains("Фокус недоступен"));
++    assert_eq!(a.ppt_focus, PptFocus::Unknown);
++    assert!(a.ppt_focus_restore_deadline.is_none());
++}
++
++#[test]
++fn command_ppt_navigation_keeps_position_until_bridge_reports_it() {
++    let mut a = test_app();
++    a.show = Some(Show {
++        id: 8, page: 1, pages: 9,
++        kind: ShowKind::Ppt(PptShow {
++            phase: PptPhase::Shown, hwnd: 0, zoom_img: None,
++            zoom_busy: None, zoom_up: false, media: (0, vec![]),
++        }),
++        gen: 1, opened: Instant::now(), zoom: 2.0, center: (0.7, 0.7),
++    });
++    a.apply(Cmd::Next);
++    assert_eq!(a.show.as_ref().unwrap().page, 1);
++    assert_eq!(a.show.as_ref().unwrap().zoom, 1.0);
++    a.apply(Cmd::GoTo { page: 7 });
++    assert_eq!(a.show.as_ref().unwrap().page, 1);
++    a.apply(Cmd::Prev);
++    assert_eq!(a.show.as_ref().unwrap().page, 1);
++}
++
++#[test]
++fn command_stage_layering_follows_powerpoint_phase() {
++    let mut a = test_app();
++    a.show = Some(Show {
++        id: 9, page: 0, pages: 4,
++        kind: ShowKind::Ppt(PptShow {
++            phase: PptPhase::Loading, hwnd: 0, zoom_img: None,
++            zoom_busy: None, zoom_up: false, media: (0, vec![]),
++        }),
++        gen: 1, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5),
++    });
++    assert!(a.show.as_ref().unwrap().stage_on_top());
++    if let Some(ShowKind::Ppt(p)) = &mut a.show.as_mut().unwrap().kind {
++        p.phase = PptPhase::Shown;
++    }
++    assert!(!a.show.as_ref().unwrap().stage_on_top());
++    if let Some(ShowKind::Ppt(p)) = &mut a.show.as_mut().unwrap().kind {
++        p.phase = PptPhase::Lowered(Instant::now());
++    }
++    assert!(!a.show.as_ref().unwrap().stage_on_top());
++}
++
++#[test]
++fn command_video_repeat_changes_only_named_item() {
++    let mut a = test_app();
++    a.items.push(pdf_item(4, 1));
++    a.items.push(pdf_item(5, 1));
++    a.apply(Cmd::VideoRepeat { id: 5, on: true });
++    assert!(!a.items[0].repeat);
++    assert!(a.items[1].repeat);
++    a.apply(Cmd::VideoRepeat { id: 999, on: true });
++    assert!(!a.items[0].repeat);
++}
++
++#[test]
++fn command_linked_text_reports_all_missing_media() {
++    let content = vec!["a.mp4".into(), "b.mp3".into()];
++    let description = linked_text(&content);
++    assert!(description.contains("2 видео"));
++    assert!(description.contains("a.mp4, b.mp3"));
++}
+diff --git a/src/ppt.rs b/src/ppt.rs
+index c1cb20a..5904293 100644
+--- a/src/ppt.rs
++++ b/src/ppt.rs
+@@ -1212,3 +1212,7 @@ mod bridge {
+         }
+     }
+ }
++
++#[cfg(test)]
++#[path = "ppt_flow_tests.rs"]
++mod flow_tests;
+diff --git a/src/ppt_flow_tests.rs b/src/ppt_flow_tests.rs
+new file mode 100644
+index 0000000..4311c1b
+--- /dev/null
++++ b/src/ppt_flow_tests.rs
+@@ -0,0 +1,160 @@
++//! Stage 4: tests for the PowerPoint Host's actual dispatch and failure guards.
++//! The worker is an in-memory channel; none of these tests start COM or PowerPoint.
++use super::*;
++
++fn fake_host() -> (Host, Receiver<Req>) {
++    let host = Host::new(|_, _| {});
++    let (tx, rx) = mpsc::channel();
++    let (done_tx, done_rx) = mpsc::channel::<()>();
++    drop(done_tx); // prevent Host::shutdown waiting four seconds
++    *host.worker.lock().unwrap() = Some(Worker { tx, epoch: 1, done: done_rx });
++    host.epoch.store(1, Ordering::SeqCst);
++    (host, rx)
++}
++
++#[test]
++fn host_queues_navigation_in_order_without_com() {
++    let (host, rx) = fake_host();
++    host.next(); host.prev(); host.goto(7); host.activate();
++    assert!(matches!(rx.try_recv().unwrap(), Req::Next));
++    assert!(matches!(rx.try_recv().unwrap(), Req::Prev));
++    assert!(matches!(rx.try_recv().unwrap(), Req::Goto(7)));
++    assert!(matches!(rx.try_recv().unwrap(), Req::Show));
++    assert!(rx.try_recv().is_err());
++}
++
++#[test]
++fn host_sends_media_cursor_and_zoom_parameters_unmodified() {
++    let (host, rx) = fake_host();
++    host.set_cursor(true);
++    host.media("pause", 52);
++    let zoom = PathBuf::from("test_zoom_5.jpg");
++    host.export_zoom(5, 1800, &zoom);
++    host.set_cursor(false);
++    assert!(matches!(rx.try_recv().unwrap(), Req::Cursor(4)));
++    match rx.try_recv().unwrap() {
++        Req::Media(action, id) => { assert_eq!(action, "pause"); assert_eq!(id, 52); }
++        _ => panic!("expected media command"),
++    }
++    match rx.try_recv().unwrap() {
++        Req::Zoom(page, width, path) => {
++            assert_eq!((page, width), (5, 1800));
++            assert_eq!(path, zoom);
++        }
++        _ => panic!("expected zoom command"),
++    }
++    assert!(matches!(rx.try_recv().unwrap(), Req::Cursor(3)));
++    assert!(!host.cursor.load(Ordering::SeqCst));
++}
++
++#[test]
++fn host_close_is_idempotent_and_does_not_quit_worker() {
++    let (host, rx) = fake_host();
++    host.current.store(71, Ordering::SeqCst);
++    host.close(); host.close();
++    assert_eq!(host.current.load(Ordering::SeqCst), 0);
++    assert!(matches!(rx.try_recv().unwrap(), Req::Close));
++    assert!(rx.try_recv().is_err());
++    assert!(host.worker.lock().unwrap().is_some());
++}
++
++#[test]
++fn host_close_with_no_presentation_sends_nothing() {
++    let (host, rx) = fake_host();
++    host.close();
++    assert!(rx.try_recv().is_err());
++}
++
++#[test]
++fn host_lag_probe_is_none_until_show_is_active() {
++    let host = Host::new(|_, _| {});
++    let probe = host.lag_probe();
++    assert_eq!(probe(), None);
++    host.current.store(1, Ordering::SeqCst);
++    assert_eq!(probe(), Some(0));
++    host.waiting.store(u64::MAX, Ordering::SeqCst);
++    assert_eq!(probe(), Some(0)); // saturating arithmetic on inconsistent clock
++    host.current.store(0, Ordering::SeqCst);
++    assert_eq!(probe(), None);
++}
++
++#[test]
++fn host_restart_discards_stale_queue_without_killing_process() {
++    let (host, rx) = fake_host();
++    host.current.store(42, Ordering::SeqCst);
++    host.waiting.store(1234, Ordering::SeqCst);
++    host.next();
++    host.restart(); // pid == 0; cannot terminate any Windows process
++    assert_eq!(host.current.load(Ordering::SeqCst), 0);
++    assert_eq!(host.waiting.load(Ordering::SeqCst), 0);
++    assert!(host.worker.lock().unwrap().is_none());
++    assert!(matches!(rx.try_recv().unwrap(), Req::Next));
++    assert!(rx.try_recv().is_err());
++}
++
++#[test]
++fn host_does_not_reopen_worker_for_commands_without_open() {
++    let host = Host::new(|_, _| {});
++    host.next(); host.prev(); host.goto(3); host.close(); host.activate();
++    assert!(host.worker.lock().unwrap().is_none());
++    assert_eq!(host.epoch.load(Ordering::SeqCst), 0);
++}
++
++#[test]
++fn end_guard_emits_error_for_current_live_presentation() {
++    let (event_tx, event_rx) = mpsc::channel();
++    let host = Host::new(move |sid, ev| { let _ = event_tx.send((sid, ev)); });
++    let (worker_tx, _worker_rx) = mpsc::channel();
++    let (done_tx, done_rx) = mpsc::channel();
++    *host.worker.lock().unwrap() = Some(Worker { tx: worker_tx, epoch: 5, done: done_rx });
++    host.current.store(93, Ordering::SeqCst);
++    let guard = EndGuard {
++        _done: done_tx, epoch: 5,
++        worker: Arc::downgrade(&host.worker),
++        current: host.current.clone(), on_event: host.on_event.clone(),
++    };
++    drop(guard);
++    assert!(host.worker.lock().unwrap().is_none());
++    match event_rx.try_recv().unwrap() {
++        (93, PptEvent::Error(message)) => assert!(message.contains("завершился")),
++        _ => panic!("expected bridge-terminated event"),
++    }
++}
++
++#[test]
++fn end_guard_does_not_send_false_alarm_after_show_closed() {
++    let (event_tx, event_rx) = mpsc::channel();
++    let host = Host::new(move |sid, ev| { let _ = event_tx.send((sid, ev)); });
++    let (worker_tx, _worker_rx) = mpsc::channel();
++    let (done_tx, done_rx) = mpsc::channel();
++    *host.worker.lock().unwrap() = Some(Worker { tx: worker_tx, epoch: 2, done: done_rx });
++    // current = 0: no presentation is active
++    let guard = EndGuard {
++        _done: done_tx, epoch: 2,
++        worker: Arc::downgrade(&host.worker),
++        current: host.current.clone(), on_event: host.on_event.clone(),
++    };
++    drop(guard);
++    assert!(host.worker.lock().unwrap().is_none());
++    assert!(event_rx.try_recv().is_err());
++}
++
++#[test]
++fn end_guard_ignores_stale_worker_after_restart() {
++    let (event_tx, event_rx) = mpsc::channel();
++    let host = Host::new(move |sid, ev| { let _ = event_tx.send((sid, ev)); });
++    let (worker_tx, _worker_rx) = mpsc::channel();
++    let (done_tx, _done_rx) = mpsc::channel();
++    let (new_done_tx, new_done_rx) = mpsc::channel::<()>();
++    drop(new_done_tx);
++    *host.worker.lock().unwrap() = Some(Worker { tx: worker_tx, epoch: 3, done: new_done_rx });
++    host.current.store(88, Ordering::SeqCst);
++    let old_guard = EndGuard {
++        _done: done_tx, epoch: 2,
++        worker: Arc::downgrade(&host.worker),
++        current: host.current.clone(), on_event: host.on_event.clone(),
++    };
++    drop(old_guard);
++    assert!(host.worker.lock().unwrap().is_some());
++    assert!(event_rx.try_recv().is_err());
++}

@@ -1,0 +1,16 @@
+Presentator 2.4.1 — исправление сборки Windows
+
+Исправления:
+- Версия Cargo.toml обновлена до 2.4.1.
+- Скрипты PowerShell сохранены в UTF-8 с BOM (совместимость с Windows PowerShell 5.1).
+- PDFium распаковывается системным Windows tar.exe, а не tar из Git Bash.
+
+Применение:
+1. Сделайте git commit или резервную копию.
+2. Распакуйте архив в корень проекта с заменой файлов.
+3. Из Git Bash:
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/build_release.ps1
+4. Результат: target/release/presentator.exe
+
+Это обновление поверх уже установленной версии с PDFium single EXE.
+Не используйте архив как полный исходный проект: он содержит только измененные файлы.
