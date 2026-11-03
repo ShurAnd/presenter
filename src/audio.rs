@@ -266,3 +266,33 @@ mod win {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "audio_flow_tests.rs"]
+mod flow_tests;
+
+// Stage 9: the real Windows audio worker can process commands without ever
+// loading a track, initializing libmpv, or accessing an audio output device.
+#[cfg(all(test, windows))]
+mod stage9_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    #[test]
+    fn stage9_audio_worker_routes_empty_deck_commands_without_audio_device() {
+        let (tx, rx) = channel::<AudioEvent>();
+        let audio = Audio::start(55, move |ev| { let _ = tx.send(ev); });
+        audio.pause(Deck::Main, true);
+        audio.seek(Deck::Main, 15.0);
+        audio.repeat(Deck::Main, true);
+        audio.volume(90);
+        audio.stop(Deck::Main, false);
+        audio.stop(Deck::Insert, true);
+        let first = rx.recv_timeout(Duration::from_secs(4)).expect("main deck did not stop");
+        let second = rx.recv_timeout(Duration::from_secs(4)).expect("insertion deck did not stop");
+        assert!(matches!(first, AudioEvent::Stopped { deck: Deck::Main, .. }));
+        assert!(matches!(second, AudioEvent::Stopped { deck: Deck::Insert, .. }));
+        drop(audio);
+    }
+}

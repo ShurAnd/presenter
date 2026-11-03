@@ -828,3 +828,271 @@ mod tests {
         }
     }
 }
+
+// Stage 8: preparation, image decoding, caching, and queue event delivery.
+// These tests drive real file formats using isolated temporary files, without native windows.
+#[cfg(test)]
+mod stage8_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("presentator_stage8_render_{}", crate::net::unique_prefix()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn file(&self, name: &str) -> PathBuf { self.0.join(name) }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn small_img() -> ColorImage {
+        ColorImage::from_rgba_unmultiplied([2, 2], &[
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ])
+    }
+
+    fn test_key(thumb: bool) -> PageKey {
+        PageKey { id: 2, page: 3, w: 12, h: 8, thumb, view: FULL_VIEW }
+    }
+
+    #[test]
+    fn stage8_prepare_image_reports_one_page() {
+        let scratch = Scratch::new();
+        let path = scratch.file("slide.png");
+        std::fs::write(&path, include_bytes!("../assets/icon_256.png")).unwrap();
+        let (pdf, pages) = prepare_inner(&path).unwrap();
+        assert!(pdf.is_none());
+        assert_eq!(pages, 1);
+    }
+
+    #[test]
+    fn stage8_prepare_image_invalid_pixels_are_rejected() {
+        let scratch = Scratch::new();
+        let path = scratch.file("broken.png");
+        std::fs::write(&path, b"not an image").unwrap();
+        assert!(prepare_inner(&path).is_err());
+    }
+
+    #[test]
+    fn stage8_prepare_ppt_and_video_only_need_readable_files() {
+        let scratch = Scratch::new();
+        for name in ["legacy.ppt", "legacy.pps", "movie.mp4", "movie.webm"] {
+            let path = scratch.file(name);
+            std::fs::write(&path, b"fixture").unwrap();
+            assert!(matches!(prepare_inner(&path), Ok((None, 0))), "{name}");
+        }
+    }
+
+    #[test]
+    fn stage8_prepare_missing_video_and_unknown_extension_rejected() {
+        let scratch = Scratch::new();
+        assert!(prepare_inner(&scratch.file("missing.mp4")).is_err());
+        assert!(prepare_inner(&scratch.file("unsupported.xyz")).is_err());
+    }
+
+    #[test]
+    fn stage8_prepare_invalid_pptx_and_pdf_report_errors() {
+        let scratch = Scratch::new();
+        for name in ["invalid.pptx", "invalid.pdf"] {
+            let path = scratch.file(name);
+            std::fs::write(&path, b"not a valid document").unwrap();
+            assert!(prepare_inner(&path).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn stage8_background_preparation_reports_result_from_thread() {
+        let scratch = Scratch::new();
+        let path = scratch.file("unreadable.png");
+        let (tx, rx) = mpsc::channel();
+        prepare_in_background(47, path, tx, || {});
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Out::Prepared { id: 47, result: Err(_), linked } => assert!(linked.is_empty()),
+            _ => panic!("expected preparation error"),
+        }
+    }
+
+    #[test]
+    fn stage8_background_preparation_valid_image_returns_ready_page() {
+        let scratch = Scratch::new();
+        let path = scratch.file("valid.png");
+        std::fs::write(&path, include_bytes!("../assets/icon_256.png")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        prepare_in_background(48, path, tx, || {});
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Out::Prepared { id: 48, result: Ok((None, 1)), linked } => assert!(linked.is_empty()),
+            _ => panic!("expected ready image"),
+        }
+    }
+
+    #[test]
+    fn stage8_load_image_returns_frames_and_thumbnail() {
+        let scratch = Scratch::new();
+        let path = scratch.file("photo.png");
+        std::fs::write(&path, include_bytes!("../assets/icon_256.png")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        load_image(81, 11, path, 1024, tx, || {});
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Out::Image { gen: 11, result: Ok(frames) } => assert_eq!(frames.len(), 1),
+            _ => panic!("expected decoded image"),
+        }
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Out::Thumb { id: 81, page: 0, image, jpg } => {
+                assert!(!jpg.is_empty());
+                assert!(image.size[0] <= THUMB_W as usize);
+                assert!(image.size[1] <= THUMB_H as usize);
+            }
+            _ => panic!("expected image thumbnail"),
+        }
+    }
+
+    #[test]
+    fn stage8_load_image_failure_emits_no_thumbnail() {
+        let scratch = Scratch::new();
+        let (tx, rx) = mpsc::channel();
+        load_image(81, 12, scratch.file("missing.png"), 1024, tx, || {});
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Out::Image { gen: 12, result: Err(_), .. })));
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn stage8_load_thumb_supports_valid_bytes_without_extension_assumption() {
+        let scratch = Scratch::new();
+        let path = scratch.file("slide.jpg");
+        std::fs::write(&path, include_bytes!("../assets/icon_256.png")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        load_thumb(17, 5, path, tx, || {});
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Out::Thumb { id: 17, page: 5, image, jpg } => {
+                assert_eq!(image.size, [256, 256]);
+                assert!(!jpg.is_empty());
+            }
+            _ => panic!("expected valid thumbnail"),
+        }
+    }
+
+    #[test]
+    fn stage8_load_thumb_reports_error_for_missing_file() {
+        let scratch = Scratch::new();
+        let (tx, rx) = mpsc::channel();
+        load_thumb(17, 4, scratch.file("missing.jpg"), tx, || {});
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Out::ThumbErr { id: 17, page: 4 })));
+    }
+
+    #[test]
+    fn stage8_load_ppt_zoom_can_decode_png_image() {
+        let scratch = Scratch::new();
+        let path = scratch.file("zoom.png");
+        std::fs::write(&path, include_bytes!("../assets/icon_256.png")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        load_ppt_zoom(18, 3, path, tx, || {});
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Out::PptZoom { gen: 18, page: 3, image: Ok(img) } => assert_eq!(img.size, [256, 256]),
+            _ => panic!("expected decoded zoom image"),
+        }
+    }
+
+    #[test]
+    fn stage8_load_ppt_zoom_reports_missing_file() {
+        let scratch = Scratch::new();
+        let (tx, rx) = mpsc::channel();
+        load_ppt_zoom(19, 1, scratch.file("missing.jpg"), tx, || {});
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(5)), Ok(Out::PptZoom { gen: 19, page: 1, image: Err(_) })));
+    }
+
+    #[test]
+    fn stage8_thumbnail_encoding_and_resize_preserve_dimensions() {
+        let thumb = thumb_of(&small_img()).unwrap();
+        assert_eq!(thumb.0.size, [2, 2]);
+        assert!(!thumb.1.is_empty());
+        assert!(to_jpeg(&small_img()).unwrap().len() > 10);
+    }
+
+    #[test]
+    fn stage8_thumbnail_large_image_is_downscaled() {
+        let img = ColorImage::from_rgba_unmultiplied([1000, 500], &vec![255; 1000 * 500 * 4]);
+        let (thumb, jpg) = thumb_of(&img).unwrap();
+        assert!(thumb.size[0] <= THUMB_W as usize);
+        assert!(thumb.size[1] <= THUMB_H as usize);
+        assert!(!jpg.is_empty());
+    }
+
+    #[test]
+    fn stage8_deliver_page_event_only_for_current_epoch() {
+        let shared = Shared { queue: Mutex::new(Queue::default()), cv: Condvar::new(), hayro_doc: Mutex::new(None) };
+        let path = PathBuf::from("stage8.pdf");
+        {
+            let mut q = shared.queue.lock().unwrap();
+            q.epoch = 5;
+            q.pdf = Some(path.clone());
+        }
+        let (tx, rx) = mpsc::channel();
+        deliver(&shared, &tx, &|| {}, test_key(false), &path, 4, Ok(small_img()));
+        assert!(rx.try_recv().is_err());
+        deliver(&shared, &tx, &|| {}, test_key(false), &path, 5, Ok(small_img()));
+        assert!(matches!(rx.try_recv(), Ok(Out::Page { key, .. }) if key.page == 3));
+    }
+
+    #[test]
+    fn stage8_deliver_page_failure_keeps_key_and_message() {
+        let shared = Shared { queue: Mutex::new(Queue::default()), cv: Condvar::new(), hayro_doc: Mutex::new(None) };
+        let path = PathBuf::from("stage8.pdf");
+        shared.queue.lock().unwrap().pdf = Some(path.clone());
+        let (tx, rx) = mpsc::channel();
+        deliver(&shared, &tx, &|| {}, test_key(false), &path, 0, Err("bad page".into()));
+        assert!(matches!(rx.try_recv(), Ok(Out::PageErr { key, msg }) if key.page == 3 && msg == "bad page"));
+    }
+
+    #[test]
+    fn stage8_deliver_thumbnail_on_success_and_error() {
+        let shared = Shared { queue: Mutex::new(Queue::default()), cv: Condvar::new(), hayro_doc: Mutex::new(None) };
+        let path = PathBuf::from("stage8.pdf");
+        shared.queue.lock().unwrap().pdf = Some(path.clone());
+        let (tx, rx) = mpsc::channel();
+        deliver(&shared, &tx, &|| {}, test_key(true), &path, 0, Ok(small_img()));
+        assert!(matches!(rx.try_recv(), Ok(Out::Thumb { id: 2, page: 3, .. })));
+        deliver(&shared, &tx, &|| {}, test_key(true), &path, 0, Err("bad thumb".into()));
+        assert!(matches!(rx.try_recv(), Ok(Out::ThumbErr { id: 2, page: 3 })));
+    }
+
+    #[test]
+    fn stage8_xml_entity_decoding_handles_all_standard_escapes() {
+        assert_eq!(xml_unescape("A&amp;B &lt;C&gt; &quot;D&quot; &apos;E&apos;"), "A&B <C> \"D\" 'E'");
+    }
+
+    #[test]
+    fn stage8_relative_links_decode_utf8_while_preserving_bad_escapes() {
+        let target = link_path("../media/%D1%82%D0%B5%D1%81%D1%82%20clip.mp4", Path::new("deck/one.pptx"));
+        assert_eq!(target.file_name().unwrap().to_string_lossy(), "тест clip.mp4");
+        assert!(link_path("a%Q2.mp4", Path::new("deck/one.pptx")).to_string_lossy().contains("%Q2"));
+    }
+
+    #[test]
+    fn stage8_linked_media_missing_archive_returns_empty_list() {
+        let scratch = Scratch::new();
+        assert!(linked_media(&scratch.file("gone.pptx")).is_empty());
+        let invalid = scratch.file("invalid.pptx");
+        std::fs::write(&invalid, b"not zip").unwrap();
+        assert!(linked_media(&invalid).is_empty());
+    }
+
+    #[test]
+    fn stage8_viewport_rejects_nan_aspect_and_tiny_screens() {
+        let view = viewport(f32::NAN, (0.0, 0.0), 2.0, (0.5, 0.5));
+        assert!(view.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0));
+        let key = view_key([-1.0, 0.49999, 2.0, 1.0]);
+        assert_eq!(key, [0, 5000, 10000, 10000]);
+    }
+
+    #[test]
+    fn stage8_pdf_engine_labels_match_serialized_preference() {
+        assert_eq!(PdfEngine::Pdfium.label(), "PDFium");
+        assert_eq!(PdfEngine::Hayro.label(), "Hayro");
+        assert_eq!(PdfEngine::Hayro.as_str(), "hayro");
+    }
+}

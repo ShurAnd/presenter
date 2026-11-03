@@ -126,15 +126,42 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    /// Запись, чтение и удаление временного значения в HKCU\Software (после теста следов не остаётся).
+    // Isolated, unique HKCU value: must never overwrite a user's existing setting.
+    // Even if an assertion fails, the original value is restored by Drop.
+    #[cfg(windows)]
+    struct RestoreRegistryValue {
+        sub: &'static str,
+        name: String,
+        original: Option<String>,
+    }
+
+    #[cfg(windows)]
+    impl Drop for RestoreRegistryValue {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => { let _ = super::set(self.sub, &self.name, value); }
+                None => { let _ = super::delete(self.sub, &self.name); }
+            }
+        }
+    }
+
+    /// Real Windows registry read/write/delete with Unicode, overwrite and idempotency.
+    /// The value name is unique to this run and cleanup runs even after an assertion panic.
     #[test]
     #[cfg(windows)]
     fn roundtrip() {
-        let (sub, name) = ("Software", "Presentator тест");
-        super::set(sub, name, "\"C:\\путь с пробелом\\a.exe\" --x").unwrap();
-        assert_eq!(super::get(sub, name).as_deref(), Some("\"C:\\путь с пробелом\\a.exe\" --x"));
-        super::delete(sub, name).unwrap();
-        assert_eq!(super::get(sub, name), None);
-        super::delete(sub, name).unwrap(); // повторно — не ошибка
+        let sub = "Software";
+        let name = format!("Presentator_test_{}_{}", std::process::id(), crate::net::unique_prefix());
+        let _restore = RestoreRegistryValue {
+            sub, original: super::get(sub, &name), name: name.clone(),
+        };
+        assert_eq!(super::get(sub, &name), None);
+        super::set(sub, &name, r#""C:\путь с пробелом\a.exe" --x"#).unwrap();
+        assert_eq!(super::get(sub, &name).as_deref(), Some(r#""C:\путь с пробелом\a.exe" --x"#));
+        super::set(sub, &name, "Новая строка — 🚀").unwrap();
+        assert_eq!(super::get(sub, &name).as_deref(), Some("Новая строка — 🚀"));
+        super::delete(sub, &name).unwrap();
+        assert_eq!(super::get(sub, &name), None);
+        super::delete(sub, &name).unwrap();
     }
 }

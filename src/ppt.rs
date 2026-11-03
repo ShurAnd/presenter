@@ -686,6 +686,73 @@ mod com {
         }
         Err(Error::new(E_POINTER, "пустой объект"))
     }
+
+    // Stage 12: actual COM utility behavior, without opening PowerPoint.
+    // These tests run automatically on Windows and exercise production code.
+    #[cfg(test)]
+    mod stage12_tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[test]
+        fn stage12_com_retries_rejected_calls_and_preserves_result() {
+            let calls = AtomicUsize::new(0);
+            let result: R<usize> = retry(|| {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                if attempt < 2 { Err(Error::new(RPC_E_CALL_REJECTED, "temporary busy")) }
+                else { Ok(0xBEEF) }
+            });
+            assert_eq!(result.unwrap(), 0xBEEF);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+        }
+
+        #[test]
+        fn stage12_com_retries_server_call_later() {
+            let mut calls = 0;
+            let result: R<i32> = retry(|| {
+                calls += 1;
+                if calls == 1 { Err(Error::new(RPC_E_SERVERCALL_RETRYLATER, "retry later")) }
+                else { Ok(42) }
+            });
+            assert_eq!(result.unwrap(), 42);
+            assert_eq!(calls, 2);
+        }
+
+        #[test]
+        fn stage12_com_nonretryable_error_fails_immediately() {
+            let mut calls = 0;
+            let result: R<()> = retry(|| {
+                calls += 1;
+                Err(Error::new(E_FAIL, "permanent failure"))
+            });
+            assert_eq!(result.unwrap_err().code(), E_FAIL);
+            assert_eq!(calls, 1);
+        }
+
+        #[test]
+        fn stage12_com_rejects_null_or_scalar_as_dispatch() {
+            assert_eq!(to_disp(&VARIANT::new()).err().unwrap().code(), E_POINTER);
+            assert_eq!(to_disp(&i(17)).err().unwrap().code(), E_POINTER);
+        }
+
+        #[test]
+        fn stage12_com_unicode_names_and_variant_values_roundtrip() {
+            let text = "Слайд — тест 🦊";
+            let encoded = wide(text);
+            assert_eq!(encoded.last().copied(), Some(0));
+            assert_eq!(String::from_utf16(&encoded[..encoded.len() - 1]).unwrap(), text);
+            assert_eq!(i64::try_from(&i(-17)).unwrap(), -17);
+            assert_eq!(BSTR::try_from(&s(text)).unwrap().to_string(), text);
+        }
+
+        #[test]
+        fn stage12_com_io_error_keeps_message_and_hresult() {
+            let e = io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied-for-test"));
+            assert_eq!(e.code(), E_FAIL);
+            assert!(e.message().to_string().contains("denied-for-test"));
+            assert!(!is_busy(&e));
+        }
+    }
 }
 
 /// Поток моста: владеет объектами PowerPoint, выполняет запросы, опрашивает показ.
@@ -1216,3 +1283,7 @@ mod bridge {
 #[cfg(test)]
 #[path = "ppt_flow_tests.rs"]
 mod flow_tests;
+
+#[cfg(all(test, windows))]
+#[path = "ppt_stage12_native_tests.rs"]
+mod stage12_native_tests;

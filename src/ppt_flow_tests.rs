@@ -158,3 +158,118 @@ fn end_guard_ignores_stale_worker_after_restart() {
     assert!(host.worker.lock().unwrap().is_some());
     assert!(event_rx.try_recv().is_err());
 }
+
+// Stage 8: inspect the exact requests the host would send, without starting COM.
+#[test]
+fn stage8_host_open_sends_cursor_and_all_open_parameters() {
+    let (host, rx) = fake_host();
+    let path = PathBuf::from("C:/presentations/demo.pptx");
+    let slides = PathBuf::from("C:/presentations/slides-cache");
+    host.set_cursor(true);
+    assert!(matches!(rx.try_recv(), Ok(Req::Cursor(4))));
+    host.open(72, &path, true, "DISPLAY1", Some(&slides), 800).unwrap();
+    assert_eq!(host.current.load(Ordering::SeqCst), 72);
+    assert!(matches!(rx.try_recv(), Ok(Req::Cursor(4))));
+    match rx.try_recv().unwrap() {
+        Req::Open { sid, path: sent_path, windowed, monitor, slides: sent_slides, width } => {
+            assert_eq!(sid, 72);
+            assert_eq!(sent_path, path);
+            assert!(windowed);
+            assert_eq!(monitor, "DISPLAY1");
+            assert_eq!(sent_slides, Some(slides));
+            assert_eq!(width, 800);
+        }
+        _ => panic!("expected open request"),
+    }
+}
+
+#[test]
+fn stage8_host_open_without_slide_export_retains_none() {
+    let (host, rx) = fake_host();
+    let path = PathBuf::from("deck.pptx");
+    host.open(2, &path, false, "", None, 480).unwrap();
+    assert!(matches!(rx.try_recv(), Ok(Req::Cursor(3))));
+    assert!(matches!(rx.try_recv(), Ok(Req::Open { sid: 2, windowed: false, slides: None, .. })));
+}
+
+#[test]
+fn stage8_host_shutdown_sends_quit_and_discards_mock_worker() {
+    let (host, rx) = fake_host();
+    host.shutdown();
+    assert!(host.worker.lock().unwrap().is_none());
+    assert!(matches!(rx.try_recv(), Ok(Req::Quit)));
+    assert!(rx.try_recv().is_err());
+}
+
+
+// Stage 9: a fake channel observes the real Host request sequencing.
+#[test]
+fn stage9_host_open_forwards_all_options_and_cursor_setting() {
+    let (host, rx) = fake_host();
+    host.set_cursor(true);
+    let source = PathBuf::from("event_deck.pptx");
+    let slides = PathBuf::from("cache/slides");
+    host.open(101, &source, true, r"\\.\DISPLAY2", Some(&slides), 1280).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), Req::Cursor(4)));
+    assert!(matches!(rx.try_recv().unwrap(), Req::Cursor(4)));
+    match rx.try_recv().unwrap() {
+        Req::Open { sid, path, windowed, monitor, slides: cache, width } => {
+            assert_eq!(sid, 101);
+            assert_eq!(path, source);
+            assert!(windowed);
+            assert_eq!(monitor, r"\\.\DISPLAY2");
+            assert_eq!(cache.as_deref(), Some(slides.as_path()));
+            assert_eq!(width, 1280);
+        }
+        _ => panic!("expected Open request"),
+    }
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn stage9_host_open_default_cursor_and_no_slide_cache() {
+    let (host, rx) = fake_host();
+    host.open(202, Path::new("no_cache.pptx"), false, "", None, 900).unwrap();
+    assert!(matches!(rx.try_recv().unwrap(), Req::Cursor(3)));
+    match rx.try_recv().unwrap() {
+        Req::Open { sid, path, windowed, monitor, slides, width } => {
+            assert_eq!(sid, 202);
+            assert_eq!(path, PathBuf::from("no_cache.pptx"));
+            assert!(!windowed);
+            assert!(monitor.is_empty());
+            assert!(slides.is_none());
+            assert_eq!(width, 900);
+        }
+        _ => panic!("expected Open request"),
+    }
+}
+
+#[test]
+fn stage9_host_shutdown_sends_quit_and_clears_worker() {
+    let (host, rx) = fake_host();
+    host.shutdown();
+    assert!(host.worker.lock().unwrap().is_none());
+    assert!(matches!(rx.try_recv().unwrap(), Req::Quit));
+    host.shutdown(); // idempotent
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn stage9_host_show_close_then_open_reuses_fake_worker() {
+    let (host, rx) = fake_host();
+    host.current.store(12, Ordering::SeqCst);
+    host.close();
+    host.open(13, Path::new("second.pptx"), false, "", None, 640).unwrap();
+    assert_eq!(host.current.load(Ordering::SeqCst), 13);
+    assert!(matches!(rx.try_recv().unwrap(), Req::Close));
+    assert!(matches!(rx.try_recv().unwrap(), Req::Cursor(3)));
+    assert!(matches!(rx.try_recv().unwrap(), Req::Open { sid: 13, .. }));
+}
+
+#[test]
+fn stage9_host_monotonic_clock_is_nonzero() {
+    let first = now_ms();
+    let second = now_ms();
+    assert!(first >= 1);
+    assert!(second >= first);
+}

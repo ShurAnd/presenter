@@ -119,6 +119,14 @@ impl Drop for Video {
     }
 }
 
+// The unit-test video has only an in-memory command sender; it never starts mpv,
+// Media Foundation, a Windows message loop, or a native window.
+#[cfg(test)]
+pub(crate) fn mock_for_tests() -> Video {
+    let (tx, _rx) = channel::<VCmd>();
+    Video { tx, #[cfg(windows)] thread: 0 }
+}
+
 #[cfg(windows)]
 mod win {
     use super::{VCmd, VideoEvent, SHOW_CURSOR};
@@ -664,3 +672,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "video_flow_tests.rs"]
+mod flow_tests;
+
+#[cfg(all(test, windows))]
+#[path = "video_stage12_native_tests.rs"]
+mod stage12_native_tests;

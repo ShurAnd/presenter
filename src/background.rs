@@ -246,3 +246,66 @@ mod tests {
         assert_eq!(f[0].0.size, [256, 256]);
     }
 }
+
+#[cfg(test)]
+mod stage8_tests {
+    use super::*;
+
+    fn frame(c: egui::Color32) -> Arc<ColorImage> {
+        Arc::new(ColorImage::from_rgba_unmultiplied([1, 1], &c.to_array()))
+    }
+
+    #[test]
+    fn stage8_invalid_background_bytes_return_decode_error() {
+        assert!(decode(b"broken image data", 1024).is_err());
+    }
+
+    #[test]
+    fn stage8_static_background_respects_small_texture_limit() {
+        let frames = decode(include_bytes!("../assets/icon_256.png"), 32).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].0.size[0] <= 32);
+        assert!(frames[0].0.size[1] <= 32);
+    }
+
+    #[test]
+    fn stage8_missing_background_file_reports_readable_error() {
+        let path = std::env::temp_dir().join(format!("presentator_stage8_no_image_{}.png", crate::net::unique_prefix()));
+        assert!(load_file(&path, 1024).err().unwrap().contains("не удалось прочитать"));
+    }
+
+    #[test]
+    fn stage8_static_background_stays_on_single_texture() {
+        let ctx = egui::Context::default();
+        let mut bg = Background::new(&ctx, vec![(frame(egui::Color32::RED), Duration::ZERO)]);
+        assert!(!bg.animated());
+        assert!(bg.tick().is_none());
+        assert_eq!(bg.shown, 0);
+        assert!(bg.texture().id() == bg.frames[0].1.as_ref().unwrap().id());
+    }
+
+    #[test]
+    fn stage8_background_animation_selects_next_frame_on_tick() {
+        let ctx = egui::Context::default();
+        let mut bg = Background::new(&ctx, vec![
+            (frame(egui::Color32::RED), Duration::from_secs(5)),
+            (frame(egui::Color32::BLUE), Duration::from_secs(5)),
+        ]);
+        assert!(bg.animated());
+        bg.start = Instant::now() - Duration::from_secs(6);
+        assert!(bg.tick().is_some());
+        assert_eq!(bg.shown, 1);
+        assert!(bg.frames[1].1.is_some());
+    }
+
+    #[test]
+    fn stage8_background_anim_with_zero_duration_does_not_spin() {
+        let ctx = egui::Context::default();
+        let mut bg = Background::new(&ctx, vec![
+            (frame(egui::Color32::RED), Duration::ZERO),
+            (frame(egui::Color32::BLUE), Duration::ZERO),
+        ]);
+        assert!(bg.animated());
+        assert!(bg.tick().is_none());
+    }
+}

@@ -191,3 +191,119 @@ impl Drop for Mpv {
         unsafe { (self.api.terminate_destroy)(self.h) };
     }
 }
+
+
+// Stage 9: test libmpv's Rust adapter with an in-memory C function table.
+// No DLL is loaded, no video is decoded, and no graphics device is created.
+#[cfg(test)]
+mod stage9_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SET_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CMD_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static WAIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    static mut END_DETAILS: EventEndFile = EventEndFile { reason: END_FILE_REASON_ERROR, error: -42 };
+    static mut END_EVENT: Event = Event {
+        event_id: EVENT_END_FILE, error: -7, reply_userdata: 0, data: std::ptr::null_mut(),
+    };
+    static mut SHUTDOWN_EVENT: Event = Event {
+        event_id: EVENT_SHUTDOWN, error: 0, reply_userdata: 0, data: std::ptr::null_mut(),
+    };
+    static mut NO_EVENT: Event = Event {
+        event_id: EVENT_NONE, error: 0, reply_userdata: 0, data: std::ptr::null_mut(),
+    };
+
+    unsafe extern "C" fn fake_create() -> Handle { 1usize as Handle }
+    unsafe extern "C" fn fake_initialize(_: Handle) -> i32 { 0 }
+    unsafe extern "C" fn fake_option(_: Handle, _: *const c_char, _: *const c_char) -> i32 { 0 }
+    unsafe extern "C" fn fake_set(_: Handle, name: *const c_char, value: *const c_char) -> i32 {
+        assert_eq!(CStr::from_ptr(name).to_bytes(), b"pause");
+        assert_eq!(CStr::from_ptr(value).to_bytes(), b"yes");
+        SET_COUNT.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn fake_get(_: Handle, name: *const c_char, format: i32, dst: *mut c_void) -> i32 {
+        let property = CStr::from_ptr(name).to_bytes();
+        if property == b"duration" && format == FORMAT_DOUBLE {
+            *(dst as *mut f64) = 17.5;
+            0
+        } else if property == b"pause" && format == FORMAT_FLAG {
+            *(dst as *mut i32) = 1;
+            0
+        } else {
+            -2
+        }
+    }
+    unsafe extern "C" fn fake_command(_: Handle, args: *const *const c_char) -> i32 {
+        assert_eq!(CStr::from_ptr(*args).to_bytes(), b"seek");
+        assert_eq!(CStr::from_ptr(*args.add(1)).to_bytes(), b"3.5");
+        assert!((*args.add(2)).is_null());
+        CMD_COUNT.fetch_add(1, Ordering::SeqCst);
+        0
+    }
+    unsafe extern "C" fn fake_wait(_: Handle, _: f64) -> *mut Event {
+        match WAIT_COUNT.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                (*std::ptr::addr_of_mut!(END_EVENT)).data =
+                    std::ptr::addr_of_mut!(END_DETAILS).cast::<c_void>();
+                std::ptr::addr_of_mut!(END_EVENT)
+            }
+            1 => std::ptr::addr_of_mut!(SHUTDOWN_EVENT),
+            _ => std::ptr::addr_of_mut!(NO_EVENT),
+        }
+    }
+    unsafe extern "C" fn fake_destroy(_: Handle) {
+        DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
+    }
+    unsafe extern "C" fn fake_error(_: i32) -> *const c_char {
+        b"fake mpv error\0".as_ptr().cast::<c_char>()
+    }
+    static FAKE_API: Api = Api {
+        create: fake_create,
+        initialize: fake_initialize,
+        set_option_string: fake_option,
+        set_property_string: fake_set,
+        get_property: fake_get,
+        command: fake_command,
+        wait_event: fake_wait,
+        terminate_destroy: fake_destroy,
+        error_string: fake_error,
+    };
+
+    #[test]
+    fn stage9_mpv_properties_commands_events_errors_and_drop() {
+        SET_COUNT.store(0, Ordering::SeqCst);
+        CMD_COUNT.store(0, Ordering::SeqCst);
+        DESTROY_COUNT.store(0, Ordering::SeqCst);
+        WAIT_COUNT.store(0, Ordering::SeqCst);
+        let player = Mpv { api: &FAKE_API, h: 1usize as Handle };
+        assert!(player.check(0).is_ok());
+        assert_eq!(player.check(-1).unwrap_err(), "fake mpv error");
+        assert_eq!(player.error(-9), "fake mpv error");
+        player.set("pause", "yes").unwrap();
+        player.command(&["seek", "3.5"]).unwrap();
+        assert_eq!(player.get_f64("duration"), Some(17.5));
+        assert_eq!(player.get_f64("missing"), None);
+        assert_eq!(player.get_flag("pause"), Some(true));
+        assert_eq!(player.get_flag("missing"), None);
+        assert_eq!(player.events(), vec![
+            (EVENT_END_FILE, -7, Some((END_FILE_REASON_ERROR, -42))),
+            (EVENT_SHUTDOWN, 0, None),
+        ]);
+        assert!(player.events().is_empty());
+        assert_eq!(SET_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(CMD_COUNT.load(Ordering::SeqCst), 1);
+        drop(player);
+        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stage9_mpv_cstring_removes_embedded_nul_bytes() {
+        let text = cstr("a\0b\0c");
+        assert_eq!(text.to_bytes(), b"abc");
+        assert_eq!(cstr("").to_bytes(), b"");
+    }
+}

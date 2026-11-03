@@ -554,3 +554,183 @@ mod cost {
         println!("поиск PowerPoint: {:.1} мс", t.elapsed().as_secs_f64() * 100.0);
     }
 }
+
+#[cfg(test)]
+mod stage8_tests {
+    use super::*;
+
+    fn row_level(rows: &[Row], name: &str) -> Level {
+        rows.iter().find(|r| r.name == name).unwrap().level
+    }
+
+    fn healthy() -> HealthInfo {
+        HealthInfo {
+            ui_ok: true, cpu: 12.0,
+            ram_used_mb: 8192, ram_total_mb: 32768,
+            disk_free_mb: 50000, disk_total_mb: 100000,
+            monitors: vec!["display".into()], monitors_max: 1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stage8_health_without_snapshot_only_shows_connection_when_supplied() {
+        assert!(assess(None, None, None).is_empty());
+        let rows = assess(None, Some(30), Some(Duration::from_secs(1)));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Связь с сервером");
+        assert_eq!(rows[0].level, Level::Ok);
+    }
+
+    #[test]
+    fn stage8_health_slow_and_lost_connection_have_different_levels() {
+        let mut rows = assess(None, Some(301), Some(Duration::from_secs(1)));
+        assert_eq!(overall(&rows), Level::Warn);
+        rows = assess(None, Some(1001), Some(Duration::from_secs(1)));
+        assert_eq!(overall(&rows), Level::Bad);
+        rows = assess(None, None, Some(Duration::from_secs(7)));
+        assert_eq!(overall(&rows), Level::Bad);
+        assert!(rows[0].value.contains("нет ответа"));
+    }
+
+    #[test]
+    fn stage8_health_cpu_and_ram_thresholds_are_independent() {
+        let mut h = healthy();
+        h.cpu = 86.0;
+        assert_eq!(row_level(&assess(Some(&h), None, None), "Процессор (за 10 с)"), Level::Warn);
+        h.cpu = 97.0;
+        assert_eq!(row_level(&assess(Some(&h), None, None), "Процессор (за 10 с)"), Level::Bad);
+        h.cpu = 0.0; h.ram_used_mb = 32_000;
+        assert_eq!(row_level(&assess(Some(&h), None, None), "Оперативная память"), Level::Bad);
+    }
+
+    #[test]
+    fn stage8_health_zero_ram_total_never_divides_by_zero() {
+        let mut h = healthy();
+        h.ram_total_mb = 0;
+        h.ram_used_mb = 1;
+        let rows = assess(Some(&h), None, None);
+        let ram = rows.iter().find(|r| r.name == "Оперативная память").unwrap();
+        assert!(ram.value.starts_with("0 %"));
+        assert_eq!(ram.level, Level::Ok);
+    }
+
+    #[test]
+    fn stage8_health_ppt_lag_boundaries_change_alarm_level() {
+        let mut h = healthy();
+        for (lag, level) in [(100u64, Level::Ok), (3000, Level::Warn), (8000, Level::Bad)] {
+            h.ppt_lag_ms = Some(lag);
+            assert_eq!(row_level(&assess(Some(&h), None, None), "PowerPoint"), level);
+        }
+    }
+
+    #[test]
+    fn stage8_health_gpu_and_vram_separate_shared_and_dedicated() {
+        let mut h = healthy();
+        h.gpu = Some(91.0);
+        h.vram_used_mb = Some(98);
+        h.vram_total_mb = Some(100);
+        h.vram_shared = false;
+        let rows = assess(Some(&h), None, None);
+        assert_eq!(row_level(&rows, "Видеокарта (за 10 с)"), Level::Warn);
+        assert_eq!(row_level(&rows, "Видеопамять"), Level::Bad);
+        h.vram_shared = true;
+        assert_eq!(row_level(&assess(Some(&h), None, None), "Видеопамять (общая с ОЗУ)"), Level::Bad);
+    }
+
+    #[test]
+    fn stage8_health_missing_vram_data_omits_vram_row() {
+        let mut h = healthy();
+        h.vram_used_mb = Some(900);
+        h.vram_total_mb = Some(0);
+        assert!(!assess(Some(&h), None, None).iter().any(|r| r.name.starts_with("Видеопамять")));
+    }
+
+    #[test]
+    fn stage8_health_disk_thresholds_are_absolute_free_space() {
+        let mut h = healthy();
+        for (free, level) in [(7000, Level::Ok), (4096, Level::Warn), (1023, Level::Bad)] {
+            h.disk_free_mb = free;
+            assert_eq!(row_level(&assess(Some(&h), None, None), "Свободно на диске"), level);
+        }
+    }
+
+    #[test]
+    fn stage8_health_disconnected_monitor_is_a_bad_alarm() {
+        let mut h = healthy();
+        h.monitors_max = 2;
+        let rows = assess(Some(&h), None, None);
+        assert_eq!(row_level(&rows, "Мониторы"), Level::Bad);
+        assert!(rows.iter().any(|r| r.value.contains("ОТКЛЮЧИЛСЯ")));
+        h.monitors.clear(); h.monitors_max = 0;
+        assert_eq!(row_level(&assess(Some(&h), None, None), "Мониторы"), Level::Bad);
+    }
+
+    #[test]
+    fn stage8_health_unresponsive_ui_is_bad_even_with_healthy_hardware() {
+        let mut h = healthy(); h.ui_ok = false;
+        assert_eq!(row_level(&assess(Some(&h), None, None), "Программа на сервере"), Level::Bad);
+    }
+
+    #[test]
+    fn stage8_health_duration_and_memory_formatting() {
+        assert_eq!(dur(59), "0 мин");
+        assert_eq!(dur(3600), "1 ч 0 мин");
+        assert_eq!(dur(86400 + 3600), "1 д 1 ч");
+        assert_eq!(mb(512), "512 МБ");
+        assert!(gb(2048).contains("2.0 ГБ"));
+    }
+}
+
+#[cfg(test)]
+mod stage9_tests {
+    use super::*;
+    use std::sync::mpsc::channel;
+
+    #[test]
+    fn collector_emits_sample_and_stops_when_handle_is_dropped() {
+        let (tx, rx) = channel::<HealthInfo>();
+        let frames = Arc::new(AtomicU64::new(1));
+        let collector = start(
+            std::env::temp_dir(), frames,
+            || Some(123),
+            move |sample| { let _ = tx.send(sample); },
+            || {},
+        );
+        // First sample is produced after one 2-second health collection tick.
+        let sample = rx.recv_timeout(Duration::from_secs(8)).expect("health collector did not publish a sample");
+        assert!(sample.cpu.is_finite());
+        assert_eq!(sample.ppt_lag_ms, Some(123));
+        assert_eq!(sample.monitors_max, sample.monitors.len() as u32);
+        assert!(sample.ui_ok);
+        drop(collector);
+    }
+
+    #[test]
+    fn unresponsive_and_missing_gpu_data_are_independent() {
+        let h = HealthInfo {
+            cpu: 0.0, ui_ok: false, ram_total_mb: 8000,
+            disk_free_mb: 8000, disk_total_mb: 16000,
+            monitors: vec!["monitor".into()], monitors_max: 1,
+            ..Default::default()
+        };
+        let rows = assess(Some(&h), None, None);
+        assert_eq!(overall(&rows), Level::Bad);
+        assert!(!rows.iter().any(|r| r.name.starts_with("Видеокарта")));
+        assert!(rows.iter().any(|r| r.name == "Программа на сервере" && r.level == Level::Bad));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_sampler_handles_real_counters_and_two_consecutive_samples() {
+        let mut sampler = win::Sampler::new();
+        let first = sampler.sample(&std::env::temp_dir());
+        std::thread::sleep(Duration::from_millis(30));
+        let second = sampler.sample(&std::env::temp_dir());
+        assert!(first.cpu.is_finite() && second.cpu.is_finite());
+        assert!((0.0..=100.0).contains(&second.cpu));
+        assert!(second.ram_used_mb <= second.ram_total_mb || second.ram_total_mb == 0);
+        // These probes are safe even on PCs without an active PowerPoint or GPU counter.
+        let _ = powerpoint_pid();
+    }
+}

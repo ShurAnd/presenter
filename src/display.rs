@@ -126,3 +126,50 @@ mod win {
         }
     }
 }
+
+#[cfg(test)]
+mod stage9_tests {
+    use super::*;
+
+    #[test]
+    fn labels_preserve_dimensions_names_and_primary_marker() {
+        let m = Monitor {
+            device: r"\\.\DISPLAY2".into(), rect: (-1920, 0, 1920, 1080), primary: false,
+        };
+        assert_eq!(m.label(2), r"2: 1920×1080 (\\.\DISPLAY2)");
+        assert!(!m.label(2).contains("основной"));
+        let primary = Monitor { primary: true, ..m };
+        assert!(primary.label(1).contains("основной"));
+    }
+
+    #[test]
+    fn live_list_places_primary_before_secondary_displays() {
+        let monitors = list();
+        if let Some(first) = monitors.first() {
+            if monitors.iter().any(|m| m.primary) {
+                assert!(first.primary);
+            }
+        }
+        for monitor in &monitors {
+            assert!(monitor.rect.2 > 0 && monitor.rect.3 > 0);
+        }
+    }
+
+    #[test]
+    fn target_falls_back_to_first_or_none_for_missing_display() {
+        let monitors = list();
+        let default = target("");
+        assert_eq!(default, monitors.first().cloned());
+        assert_eq!(target("__missing_display_stage9__"), default);
+        if let Some(first) = monitors.first() {
+            assert_eq!(target(&first.device), Some(first.clone()));
+        }
+    }
+
+    #[test]
+    fn absent_window_handle_is_never_reported_on_monitor() {
+        assert!(!window_on(0, (0, 0, 1920, 1080)));
+        fit_hwnd(0, (0, 0, 1920, 1080));
+        fit_window("__missing_presentator_stage9__", (0, 0, 1280, 720), 1);
+    }
+}

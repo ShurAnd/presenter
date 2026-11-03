@@ -161,19 +161,37 @@ mod win {
 
 #[cfg(test)]
 mod tests {
-    /// Включает и выключает автозапуск (запись в реестре текущего пользователя):
-    /// cargo test --release autostart_roundtrip -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn autostart_roundtrip() {
-        let was = super::autostart_enabled();
-        super::set_autostart(true).unwrap();
-        assert!(super::autostart_enabled());
-        println!("{}", crate::registry::get(super::RUN_KEY, super::RUN_VALUE).unwrap_or_default());
-        super::set_autostart(false).unwrap();
-        assert!(!super::autostart_enabled());
-        if was {
-            super::set_autostart(true).unwrap();
+    // This test is deliberately opt-in: it temporarily changes the current user's
+    // real Run key. Preserve the exact original value, not just whether it existed.
+    #[cfg(windows)]
+    struct RestoreAutostart(Option<String>);
+
+    #[cfg(windows)]
+    impl Drop for RestoreAutostart {
+        fn drop(&mut self) {
+            let result = match &self.0 {
+                Some(original) => crate::registry::set(super::RUN_KEY, super::RUN_VALUE, original),
+                None => crate::registry::delete(super::RUN_KEY, super::RUN_VALUE),
+            };
+            if let Err(error) = result {
+                eprintln!("WARNING: failed to restore Presentator autostart: {error}");
+            }
         }
+    }
+
+    /// Integration check of the actual Run key. Run ONLY on a disposable test user:
+    /// cargo test autostart_roundtrip -- --ignored --nocapture
+    #[test]
+    #[ignore = "modifies real HKCU Run key: run explicitly on a test account"]
+    #[cfg(windows)]
+    fn autostart_roundtrip() {
+        let _restore = RestoreAutostart(crate::registry::get(super::RUN_KEY, super::RUN_VALUE));
+        super::set_autostart(true).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let expected = format!("\"{}\" --watchdog --server", exe.display());
+        assert_eq!(crate::registry::get(super::RUN_KEY, super::RUN_VALUE).as_deref(), Some(expected.as_str()));
+        super::set_autostart(false).unwrap();
+        assert_eq!(crate::registry::get(super::RUN_KEY, super::RUN_VALUE), None);
+        // The guard restores the exact previous string even on a panic.
     }
 }

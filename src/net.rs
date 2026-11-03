@@ -545,36 +545,75 @@ async fn serve_client(
                             if ws.send(js(&S2C::Pong { ts })).await.is_err() { break; }
                         }
                         Ok(C2S::UploadBegin { name, size, background }) => {
+                            // A second UploadBegin cancels the first transfer. Dropping the old
+                            // file before deletion is important on Windows (sharing/locking).
+                            if let Some((old_name, old_path, old_file, _, _, _)) = upload.take() {
+                                drop(old_file);
+                                let _ = tokio::fs::remove_file(&old_path).await;
+                                if ws.send(js(&S2C::UploadErr {
+                                    name: old_name,
+                                    msg: "загрузка прервана новым UploadBegin".into(),
+                                })).await.is_err() { break; }
+                            }
                             let name = safe_name(&name);
                             let path = dir.join(format!("{}_{}", unique_prefix(), name));
                             let _ = tokio::fs::create_dir_all(&dir).await;
                             match tokio::fs::File::create(&path).await {
                                 Ok(f) => upload = Some((name, path, f, size, 0, background)),
                                 Err(e) => {
-                                    let _ = ws.send(js(&S2C::UploadErr { name, msg: e.to_string() })).await;
+                                    if ws.send(js(&S2C::UploadErr { name, msg: e.to_string() })).await.is_err() { break; }
                                 }
                             }
                         }
                         Ok(C2S::UploadEnd) => {
                             if let Some((name, path, mut f, size, got, background)) = upload.take() {
-                                let _ = f.flush().await;
+                                let flush_result = f.flush().await;
                                 drop(f);
-                                if got == size {
+                                if let Err(e) = flush_result {
+                                    let _ = tokio::fs::remove_file(&path).await;
+                                    if ws.send(js(&S2C::UploadErr {
+                                        name, msg: format!("ошибка сохранения файла: {e}"),
+                                    })).await.is_err() { break; }
+                                } else if got == size {
                                     let _ = ev.send(if background { SrvEvent::Background { name: name.clone(), path } } else { SrvEvent::File { name: name.clone(), path } });
                                     wake();
-                                    let _ = ws.send(js(&S2C::UploadOk { name })).await;
+                                    if ws.send(js(&S2C::UploadOk { name })).await.is_err() { break; }
                                 } else {
                                     let _ = tokio::fs::remove_file(&path).await;
                                     let msg = format!("получено {got} из {size} байт");
-                                    let _ = ws.send(js(&S2C::UploadErr { name, msg })).await;
+                                    if ws.send(js(&S2C::UploadErr { name, msg })).await.is_err() { break; }
                                 }
                             }
                         }
                         _ => {}
                     },
                     Message::Binary(b) => {
-                        if let Some((_, _, f, _, got, _)) = upload.as_mut() {
-                            if f.write_all(&b).await.is_ok() { *got += b.len() as u64; }
+                        if let Some((name, path, mut f, size, mut got, background)) = upload.take() {
+                            let len = b.len() as u64;
+                            // Check BEFORE write_all: never put even temporary excess bytes
+                            // on disk. Subtraction also avoids integer overflow at u64::MAX.
+                            if len > size.saturating_sub(got) {
+                                drop(f);
+                                let _ = tokio::fs::remove_file(&path).await;
+                                let msg = format!(
+                                    "превышен размер загрузки: получено {got}, блок {len}, ожидается {size} байт"
+                                );
+                                if ws.send(js(&S2C::UploadErr { name, msg })).await.is_err() { break; }
+                            } else {
+                                match f.write_all(&b).await {
+                                    Ok(()) => {
+                                        got += len;
+                                        upload = Some((name, path, f, size, got, background));
+                                    }
+                                    Err(e) => {
+                                        drop(f);
+                                        let _ = tokio::fs::remove_file(&path).await;
+                                        if ws.send(js(&S2C::UploadErr {
+                                            name, msg: format!("ошибка записи файла: {e}"),
+                                        })).await.is_err() { break; }
+                                    }
+                                }
+                            }
                         }
                     }
                     Message::Close(_) => break,
@@ -935,3 +974,11 @@ mod tests {
 #[cfg(test)]
 #[path = "net_loopback_tests.rs"]
 mod loopback_tests;
+
+// Stage 6 test seam: an in-memory client channel, never a socket or worker thread.
+// This is not compiled into release builds.
+#[cfg(test)]
+pub(crate) fn mock_client_for_tests() -> (ClientHandle, tmpsc::UnboundedReceiver<CliReq>) {
+    let (tx, rx) = tmpsc::unbounded_channel();
+    (ClientHandle { tx }, rx)
+}

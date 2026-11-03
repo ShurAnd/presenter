@@ -327,3 +327,7 @@ impl Player {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "player_flow_tests.rs"]
+mod flow_tests;

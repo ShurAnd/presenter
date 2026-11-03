@@ -704,11 +704,9 @@ async fn stress_loopback_repeated_connect_and_ping() {
     }
 }
 
-/// TODO security: do not allow a temporary file to grow beyond the declared
-/// byte count, even before UploadEnd. This is a known limitation and the test
-/// is ignored until the corresponding production-side fix is approved.
+/// Regression: rejected oversized frames must never be stored or published.
+/// Uses the real WebSocket server and inspects the actual upload directory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "known limitation: file may grow beyond declared size before UploadEnd"]
 async fn known_issue_upload_must_not_exceed_declared_size_on_disk() {
     let server = Sandbox::new().await;
     let mut ws = server.connect(true).await;
@@ -716,15 +714,235 @@ async fn known_issue_upload_must_not_exceed_declared_size_on_disk() {
         name: "extra.pdf".into(), size: 2, background: false,
     })).await.unwrap();
     ws.send(Message::binary(b"too-many-bytes".to_vec())).await.unwrap();
-    let mut size_on_disk = None;
-    for _ in 0..500 {
-        if let Some(entry) = std::fs::read_dir(&server.dir).unwrap().next() {
-            let entry = entry.unwrap();
-            let size = std::fs::metadata(entry.path()).unwrap().len();
-            if size > 0 { size_on_disk = Some(size); break; }
+    match next_reply(&mut ws).await {
+        S2C::UploadErr { name, msg } => {
+            assert_eq!(name, "extra.pdf");
+            assert!(msg.contains("2") && msg.contains("размер"), "reason: {msg}");
         }
-        sleep(Duration::from_millis(10)).await;
+        other => panic!("overlong frame must be rejected before writing: {other:?}"),
     }
-    assert!(size_on_disk.is_some_and(|size| size <= 2),
-        "temporary upload must not grow beyond declared size before UploadEnd");
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 0,
+        "oversized upload must leave no file on disk");
+    assert!(server.events.try_recv().is_err(), "rejected upload must not be published");
+    ws.close(None).await.unwrap();
+}
+
+// ---------------------------------------------------------------- stage 10: real protocol/failure-recovery regression checks.
+// All tests use an actual TCP WebSocket connection on a random localhost port.
+// No fake server responses, presentation files or running Presentator instance.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage10_failed_upload_does_not_poison_next_upload_on_same_connection() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(true).await;
+
+    // First transaction is malformed (shorter than declared). Must fail and clean up.
+    ws.send(js(&C2S::UploadBegin {
+        name: "incomplete.pdf".into(), size: 9, background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(b"bad".to_vec())).await.unwrap();
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    match next_reply(&mut ws).await {
+        S2C::UploadErr { name, .. } => assert_eq!(name, "incomplete.pdf"),
+        other => panic!("expected upload rejection, got {other:?}"),
+    }
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 0,
+        "failed upload must be removed before the next transaction");
+    assert!(server.events.try_recv().is_err(), "failed upload must not be published");
+
+    // Recover without disconnecting. This uses the same live WebSocket server.
+    let valid_bytes = b"recovered document payload";
+    ws.send(js(&C2S::UploadBegin {
+        name: "recovered.pdf".into(), size: valid_bytes.len() as u64, background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(valid_bytes.to_vec())).await.unwrap();
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    match next_reply(&mut ws).await {
+        S2C::UploadOk { name } => assert_eq!(name, "recovered.pdf"),
+        other => panic!("expected recovery to succeed, got {other:?}"),
+    }
+    match server.event().await {
+        SrvEvent::File { name, path } => {
+            assert_eq!(name, "recovered.pdf");
+            assert!(path.starts_with(&server.dir));
+            assert_eq!(std::fs::read(path).unwrap(), valid_bytes);
+        }
+        _ => panic!("recovered upload must publish a real file event"),
+    }
+    assert!(server.events.try_recv().is_err(), "unexpected extra file event");
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 1,
+        "only the successfully uploaded file should remain");
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage10_path_traversal_upload_is_sanitized_and_confined_to_test_directory() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(true).await;
+    let payload = b"inside sandbox only";
+    ws.send(js(&C2S::UploadBegin {
+        name: r"..\..\../../external.pdf".into(), size: payload.len() as u64,
+        background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(payload.to_vec())).await.unwrap();
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    let sanitized = match next_reply(&mut ws).await {
+        S2C::UploadOk { name } => name,
+        other => panic!("expected sanitized upload, got {other:?}"),
+    };
+    assert!(!sanitized.contains('/') && !sanitized.contains('\\') && !sanitized.contains(':'),
+        "server must strip path separators: {sanitized:?}");
+    assert!(std::path::Path::new(&sanitized).components().count() == 1,
+        "sanitized name must be one file component");
+    match server.event().await {
+        SrvEvent::File { name, path } => {
+            assert_eq!(name, sanitized);
+            assert_eq!(path.parent(), Some(server.dir.as_path()),
+                "upload must remain immediately under the isolated server directory");
+            assert_eq!(std::fs::read(path).unwrap(), payload);
+        }
+        _ => panic!("successful upload must publish the actual file location"),
+    }
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 1);
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage10_wrong_password_cannot_create_files_or_publish_events() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect_raw().await;
+    ws.send(js(&C2S::Hello {
+        password: "incorrect-password".into(), upload: true, version: "stage10".into(),
+    })).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await, S2C::Denied { .. }));
+    // Deliberately do not send another frame after Denied: the server has closed
+    // the authenticated session; the observable security guarantee is no file/event.
+    assert!(server.events.try_recv().is_err(), "wrong password must not produce events");
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 0,
+        "wrong password must not touch the uploads directory");
+}
+
+// ---------------------------------------------------------------- stage 11: real protocol regression tests for upload quotas.
+// Each test runs against the production serve_client over a real localhost socket.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage11_overrun_on_second_chunk_aborts_and_recovers_on_same_socket() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(true).await;
+
+    ws.send(js(&C2S::UploadBegin {
+        name: "multi.pdf".into(), size: 5, background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(b"1234".to_vec())).await.unwrap();
+    ws.send(Message::binary(b"56".to_vec())).await.unwrap();
+    match next_reply(&mut ws).await {
+        S2C::UploadErr { name, msg } => {
+            assert_eq!(name, "multi.pdf");
+            assert!(msg.contains("размер"), "unexpected error: {msg}");
+        }
+        other => panic!("second chunk exceeded declared quota: {other:?}"),
+    }
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 0);
+    assert!(server.events.try_recv().is_err());
+
+    // UploadEnd from the rejected transaction must not affect the next one.
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    let payload = b"working again";
+    ws.send(js(&C2S::UploadBegin {
+        name: "valid.pdf".into(), size: payload.len() as u64, background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(payload.to_vec())).await.unwrap();
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await,
+        S2C::UploadOk { name } if name == "valid.pdf"));
+    match server.event().await {
+        SrvEvent::File { name, path } => {
+            assert_eq!(name, "valid.pdf");
+            assert_eq!(std::fs::read(path).unwrap(), payload);
+        }
+        _ => panic!("expected only valid upload event"),
+    }
+    assert!(server.events.try_recv().is_err());
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage11_repeated_upload_begin_deletes_old_partial_file() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(true).await;
+
+    ws.send(js(&C2S::UploadBegin {
+        name: "abandoned.pdf".into(), size: 8, background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(b"123".to_vec())).await.unwrap();
+    ws.send(js(&C2S::UploadBegin {
+        name: "replacement.pdf".into(), size: 4, background: false,
+    })).await.unwrap();
+    match next_reply(&mut ws).await {
+        S2C::UploadErr { name, msg } => {
+            assert_eq!(name, "abandoned.pdf");
+            assert!(msg.contains("UploadBegin"), "cancellation reason: {msg}");
+        }
+        other => panic!("replacing transfer must cancel old one: {other:?}"),
+    }
+    ws.send(Message::binary(b"done".to_vec())).await.unwrap();
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await,
+        S2C::UploadOk { name } if name == "replacement.pdf"));
+    match server.event().await {
+        SrvEvent::File { name, path } => {
+            assert_eq!(name, "replacement.pdf");
+            assert_eq!(path.parent(), Some(server.dir.as_path()));
+            assert_eq!(std::fs::read(path).unwrap(), b"done");
+        }
+        _ => panic!("replacement must be the only published file"),
+    }
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 1,
+        "repeated UploadBegin must not leak the abandoned file");
+    assert!(server.events.try_recv().is_err());
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage11_zero_length_upload_rejects_bytes_but_accepts_real_empty_file() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(true).await;
+    ws.send(js(&C2S::UploadBegin {
+        name: "not_empty.bin".into(), size: 0, background: false,
+    })).await.unwrap();
+    ws.send(Message::binary(b"x".to_vec())).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await,
+        S2C::UploadErr { name, .. } if name == "not_empty.bin"));
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 0);
+    assert!(server.events.try_recv().is_err());
+
+    ws.send(js(&C2S::UploadBegin {
+        name: "empty.bin".into(), size: 0, background: false,
+    })).await.unwrap();
+    ws.send(js(&C2S::UploadEnd)).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await,
+        S2C::UploadOk { name } if name == "empty.bin"));
+    match server.event().await {
+        SrvEvent::File { name, path } => {
+            assert_eq!(name, "empty.bin");
+            assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        }
+        _ => panic!("empty file should be successfully published"),
+    }
+    ws.close(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage11_oversize_background_upload_does_not_publish_background_event() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(true).await;
+    ws.send(js(&C2S::UploadBegin {
+        name: "background.png".into(), size: 1, background: true,
+    })).await.unwrap();
+    ws.send(Message::binary(b"PNG".to_vec())).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await,
+        S2C::UploadErr { name, .. } if name == "background.png"));
+    assert_eq!(std::fs::read_dir(&server.dir).unwrap().count(), 0);
+    assert!(server.events.try_recv().is_err(), "bad background must not be applied");
+    ws.close(None).await.unwrap();
 }
