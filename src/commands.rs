@@ -158,6 +158,15 @@ impl App {
                     }
                 };
                 self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5) });
+                // При переходе с PPTX окно PowerPoint может остаться поверх сцены.
+                // Новая PDF-сцена должна повторно запросить фокус у своего viewport,
+                // даже если окно сцены уже существовало до переключения.
+                if self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Pdf(_))) {
+                    self.stage_sent = None;
+                    self.ppt_focus = PptFocus::Unknown;
+                    self.ppt_focus_candidate = None;
+                    self.ppt_focus_restore_deadline = None;
+                }
                 if let Some(w) = linked_warn {
                     self.status = w;
                 }
@@ -311,6 +320,16 @@ impl App {
                     self.status = "Фокус недоступен: слайд-шоу PowerPoint не готово или увеличено".into();
                 }
             }
+            Cmd::RestoreStageFocus => {
+                let stage_active = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Pdf(_) | ShowKind::Image(_) | ShowKind::Video(_)));
+                if stage_active {
+                    self.ppt_focus = PptFocus::Restoring { window: "окно показа".into() };
+                    self.ppt_focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
+                    self.stage_sent = None; // next stage frame requests native viewport focus
+                } else {
+                    self.status = "Фокус окна показа недоступен".into();
+                }
+            }
             Cmd::PptMedia { id, action } => {
                 if self.show.as_ref().is_some_and(Show::is_ppt) {
                     let a = match action {
@@ -381,6 +400,9 @@ impl App {
         if self.show.take().is_some_and(|s| s.is_ppt()) {
             // Сцена лежит прямо под слайд-шоу, поэтому при его закрытии сразу виден фон.
             self.ppt_host.close();
+            // The stage must issue Focus again after the slideshow window is gone.
+            self.stage_sent = None;
+            self.ctx.request_repaint();
         }
         self.goto_buf.clear();
         self.thumb_failed.clear();
@@ -457,6 +479,11 @@ impl App {
                     _ => "другое окно".into(),
                 };
                 self.update_ppt_focus(PptFocus::RestoreFailed { window });
+            } else {
+                // Activation can be denied while PowerPoint is starting. Retry during the
+                // short verification window instead of spending the operator's click once.
+                ppt::request_focus(hwnd);
+                self.ppt_host.activate();
             }
         } else {
             match probe {

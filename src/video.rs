@@ -384,7 +384,9 @@ mod win {
                 return;
             }
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            let _ = SetWindowPos(video, HWND_TOP, 0, 0, 0, 0, flags);
+            // Keep playback in the topmost band, with the stage directly beneath it.
+            let _ = SetWindowPos(video, HWND_TOPMOST, 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(stage, HWND_TOPMOST, 0, 0, 0, 0, flags);
             let _ = SetWindowPos(stage, video, 0, 0, 0, 0, flags);
         }
     }

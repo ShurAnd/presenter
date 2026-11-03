@@ -1095,4 +1095,129 @@ mod stage8_tests {
         assert_eq!(PdfEngine::Hayro.label(), "Hayro");
         assert_eq!(PdfEngine::Hayro.as_str(), "hayro");
     }
+
+    fn minimal_test_pdf() -> Vec<u8> {
+        use std::fmt::Write as _;
+
+        let stream = b"0.2 0.4 0.8 rg 0 0 72 54 re f";
+        let objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 54] /Resources << >> /Contents 4 0 R >>".to_vec(),
+            [format!("<< /Length {} >>\nstream\n", stream.len()).into_bytes(), stream.to_vec(), b"\nendstream".to_vec()].concat(),
+        ];
+
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::with_capacity(objects.len());
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+            pdf.extend_from_slice(object);
+            pdf.extend_from_slice(b"\nendobj\n");
+        }
+
+        let xref = pdf.len();
+        let mut tail = String::new();
+        writeln!(&mut tail, "xref\n0 {}", objects.len() + 1).unwrap();
+        tail.push_str("0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(&mut tail, "{offset:010} 00000 n ").unwrap();
+        }
+        write!(&mut tail, "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", objects.len() + 1).unwrap();
+        pdf.extend_from_slice(tail.as_bytes());
+        pdf
+    }
+
+    #[test]
+    fn stage14_hayro_render_recovers_after_corrupt_pdf() {
+        use std::sync::mpsc;
+
+        let scratch = Scratch::new();
+        let broken = scratch.file("broken.pdf");
+        let valid = scratch.file("valid.pdf");
+        std::fs::write(&broken, b"not a PDF document").unwrap();
+        std::fs::write(&valid, minimal_test_pdf()).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let renderer = Renderer::new(tx.clone(), || {}, "hayro");
+        assert_eq!(renderer.engine(), PdfEngine::Hayro);
+
+        let bad_key = PageKey { id: 1401, page: 0, w: 144, h: 108, thumb: false, view: FULL_VIEW };
+        renderer.want(&broken, vec![bad_key]);
+        match rx.recv_timeout(Duration::from_secs(15)).expect("corrupt PDF render timeout") {
+            Out::PageErr { key, msg } => {
+                assert_eq!(key, bad_key);
+                assert!(!msg.trim().is_empty());
+            }
+            _ => panic!("corrupt PDF must report PageErr"),
+        }
+
+        let good_key = PageKey { id: 1402, page: 0, w: 144, h: 108, thumb: false, view: FULL_VIEW };
+        renderer.want(&valid, vec![good_key]);
+        match rx.recv_timeout(Duration::from_secs(15)).expect("render recovery timeout") {
+            Out::Page { key, image } => {
+                assert_eq!(key, good_key);
+                assert!(image.size[0] > 0 && image.size[1] > 0);
+                assert!(image.pixels.iter().any(|pixel| pixel.r() != 255 || pixel.g() != 255 || pixel.b() != 255));
+            }
+            Out::PageErr { msg, .. } => panic!("valid PDF failed after recovery: {msg}"),
+            _ => panic!("valid PDF must produce a rendered page"),
+        }
+        renderer.cancel();
+    }
+    #[test]
+    fn stage15_hayro_bad_page_then_crop_and_full_render_on_same_renderer() {
+        let scratch = Scratch::new();
+        let path = scratch.file("recovery.pdf");
+        std::fs::write(&path, minimal_test_pdf()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let renderer = Renderer::new(tx, || {}, "hayro");
+        for cycle in 0..3 {
+            let bad = PageKey { id: 1500 + cycle, page: 99, w: 144, h: 108, thumb: false, view: FULL_VIEW };
+            renderer.want(&path, vec![bad]);
+            match rx.recv_timeout(Duration::from_secs(15)).expect("bad-page timeout") {
+                Out::PageErr { key, msg } => { assert_eq!(key, bad); assert!(!msg.trim().is_empty()); }
+                _ => panic!("out-of-range page must fail"),
+            }
+            for view in [[2500, 2500, 7500, 7500], FULL_VIEW] {
+                let good = PageKey { page: 0, view, ..bad };
+                renderer.want(&path, vec![good]);
+                match rx.recv_timeout(Duration::from_secs(15)).expect("recovery render timeout") {
+                    Out::Page { key, image } => {
+                        assert_eq!(key, good);
+                        assert_eq!(image.size, [144, 108]);
+                        assert_eq!(image.pixels.len(), 144 * 108);
+                        let center = image.pixels[54 * 144 + 72];
+                        assert!(center.b() > center.r(), "expected blue fixture content");
+                    }
+                    _ => panic!("worker must render crop and full page after page error"),
+                }
+            }
+        }
+        renderer.cancel();
+    }
+
+    #[test]
+    fn stage15_hayro_thumbnail_error_then_jpeg_delivery() {
+        let scratch = Scratch::new();
+        let path = scratch.file("thumbnail.pdf");
+        std::fs::write(&path, minimal_test_pdf()).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let renderer = Renderer::new(tx, || {}, "hayro");
+        let bad = PageKey { id: 1550, page: 99, w: 144, h: 108, thumb: true, view: FULL_VIEW };
+        renderer.want(&path, vec![bad]);
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(15)), Ok(Out::ThumbErr { id: 1550, page: 99 })));
+        renderer.want(&path, vec![PageKey { page: 0, ..bad }]);
+        match rx.recv_timeout(Duration::from_secs(15)).expect("thumbnail recovery timeout") {
+            Out::Thumb { id, page, image, jpg } => {
+                assert_eq!((id, page), (1550, 0));
+                assert_eq!(image.size, [144, 108]);
+                let decoded = image::load_from_memory(&jpg).expect("thumbnail must be valid JPEG");
+                assert_eq!((decoded.width(), decoded.height()), (144, 108));
+            }
+            _ => panic!("worker must deliver a JPEG thumbnail after ThumbErr"),
+        }
+        renderer.cancel();
+    }
+
 }

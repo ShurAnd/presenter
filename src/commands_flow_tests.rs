@@ -146,6 +146,32 @@ fn command_open_pdf_initializes_stage_and_replaces_show() {
 }
 
 #[test]
+fn opening_pdf_after_powerpoint_reissues_stage_focus_and_clears_stale_focus_state() {
+    let mut a = test_app();
+    a.show = Some(Show {
+        id: 900, page: 0, pages: 4,
+        kind: ShowKind::Ppt(PptShow {
+            phase: PptPhase::Shown, hwnd: 123, zoom_img: None,
+            zoom_busy: None, zoom_up: false, media: (0, Vec::new()),
+        }),
+        gen: 1, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5),
+    });
+    a.stage_sent = Some((false, true));
+    a.ppt_focus = PptFocus::Lost { window: "PowerPoint".into() };
+    a.ppt_focus_candidate = Some(123);
+    a.ppt_focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
+    a.items.push(pdf_item(901, 3));
+
+    a.apply(Cmd::Open { id: 901 });
+
+    assert!(matches!(a.show.as_ref().map(|s| &s.kind), Some(ShowKind::Pdf(_))));
+    assert_eq!(a.stage_sent, None, "the existing stage viewport must issue Focus again");
+    assert_eq!(a.ppt_focus, PptFocus::Unknown, "old PowerPoint warning must not leak into PDF state");
+    assert_eq!(a.ppt_focus_candidate, None);
+    assert_eq!(a.ppt_focus_restore_deadline, None);
+}
+
+#[test]
 fn command_rejects_unknown_or_not_ready_items_without_interrupting_show() {
     let mut a = test_app();
     open_pdf(&mut a, 1, 4);
@@ -279,6 +305,31 @@ fn command_restore_focus_without_active_slideshow_is_safe() {
     assert!(a.status.contains("Фокус недоступен"));
     assert_eq!(a.ppt_focus, PptFocus::Unknown);
     assert!(a.ppt_focus_restore_deadline.is_none());
+}
+
+#[test]
+fn command_restore_stage_focus_requests_focus_for_active_pdf_without_reopening_it() {
+    let mut a = test_app();
+    open_pdf(&mut a, 901, 4);
+    a.stage_sent = Some((true, true));
+    let generation = a.show_gen;
+    a.apply(Cmd::RestoreStageFocus);
+    assert!(matches!(&a.ppt_focus, PptFocus::Restoring { .. }));
+    assert!(a.ppt_focus_restore_deadline.is_some());
+    assert!(a.stage_sent.is_none(), "next stage frame must issue a native Focus command");
+    assert_eq!(a.show_gen, generation);
+    assert_eq!(a.show.as_ref().unwrap().id, 901);
+}
+
+#[test]
+fn command_restore_stage_focus_rejects_non_pdf_show() {
+    let mut a = test_app();
+    stage8_video(&mut a, 902);
+    a.stage_sent = Some((true, true));
+    a.apply(Cmd::RestoreStageFocus);
+    assert!(a.status.contains("PDF не готов"));
+    assert_eq!(a.stage_sent, Some((true, true)));
+    assert_eq!(a.ppt_focus, PptFocus::Unknown);
 }
 
 #[test]

@@ -465,25 +465,28 @@ impl App {
         });
     }
 
-    /// Предупреждение видно оператору и при удалённом управлении; показ не трогаем.
+    /// Статус и команда восстановления фокуса видны оператору для удалённого показа.
     pub(crate) fn ppt_focus_bar(&mut self, ctx: &egui::Context, view: &StateMsg) {
-        let (notice, window, can_restore) = match &view.ppt_focus {
-            PptFocus::Lost { window } => ("ВНИМАНИЕ: PowerPoint потерял фокус. USB-кликер может не работать.", window.as_str(), true),
-            PptFocus::Restoring { window } => ("Пробуем вернуть фокус PowerPoint…", window.as_str(), false),
-            PptFocus::RestoreFailed { window } => ("Не удалось вернуть фокус: Windows может блокировать активацию. Показ продолжается.", window.as_str(), true),
-            _ => return,
+        // Когда презентация закрыта, эта строка не занимает место.
+        if view.active.is_none() { return; }
+        let stage_active = view.active.and_then(|id| view.items.iter().find(|item| item.id == id))
+            .is_some_and(|item| item.kind.eq_ignore_ascii_case("PDF") || item.kind == KIND_IMAGE || item.kind == "ВИДЕО");
+        let (notice, window, can_restore, color) = match &view.ppt_focus {
+            PptFocus::Lost { window } => ("Фокус сменился", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
+            PptFocus::Restoring { window } => ("Возвращаем фокус…", Some(window.as_str()), false, Color32::from_rgb(255, 240, 210)),
+            PptFocus::RestoreFailed { window } => ("Фокус не восстановлен", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
+            _ => ("С фокусом всё в порядке", None, false, Color32::from_rgb(220, 242, 220)),
         };
-        egui::TopBottomPanel::top("ppt_focus_warning")
-            .frame(egui::Frame::new().fill(Color32::from_rgb(255, 240, 210)).inner_margin(6.0))
+        egui::TopBottomPanel::top("ppt_focus_status")
+            .frame(egui::Frame::new().fill(color).inner_margin(egui::Margin::symmetric(8, 3)))
             .show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new(notice).strong().color(Color32::from_rgb(125, 65, 0)));
-                    ui.label(RichText::new(format!("Активно: {window}")).color(Color32::DARK_GRAY));
-                    if ui.add_enabled(can_restore, cbutton("Вернуть фокус PowerPoint", BLUE))
-                        .on_hover_text("Только активировать существующее слайд-шоу. Не закрывает окна и не перезапускает показ.")
-                        .clicked()
-                    {
-                        self.act(Cmd::RestorePptFocus);
+                ui.horizontal_centered(|ui| {
+                    ui.label(RichText::new(notice).size(15.0).strong());
+                    if let Some(window) = window {
+                        ui.label(RichText::new(format!("Активно: {window}")).size(15.0));
+                        if ui.add_enabled(can_restore, cbutton("Фокус", BLUE)).clicked() {
+                            self.act(if stage_active { Cmd::RestoreStageFocus } else { Cmd::RestorePptFocus });
+                        }
                     }
                 });
             });

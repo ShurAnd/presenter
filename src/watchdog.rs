@@ -12,6 +12,26 @@ const HANG_LIMIT: Duration = Duration::from_secs(20);
 /// Падений подряд, после которых делаем длинную паузу (чтобы не крутиться в цикле).
 const FAST_CRASHES: u32 = 5;
 
+/// Bounded backoff for consecutive failures of the supervised server process.
+/// A server that has run for >=30s breaks the rapid-crash sequence.
+/// Pure policy function so the real restart thresholds can be regression-tested
+/// without spawning the application or modifying the user's autostart registry.
+fn restart_backoff(previous_crashes: u32, ran_for: Duration) -> (u32, Duration) {
+    let crashes = if ran_for < Duration::from_secs(30) {
+        previous_crashes.saturating_add(1)
+    } else {
+        1
+    };
+    let pause = if crashes >= FAST_CRASHES { Duration::from_secs(60) } else { Duration::from_secs(2) };
+    (crashes, pause)
+}
+
+/// Exact command stored under HKCU\...\Run. Keep the real registry write separate
+/// from the pure formatting code, so tests never affect autostart settings.
+fn autostart_command(exe: &std::path::Path) -> String {
+    format!("\"{}\" --watchdog --server", exe.display())
+}
+
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Presentator";
 
@@ -91,8 +111,8 @@ pub fn run(args: Vec<String>) {
             None => {}
         }
         // Падает сразу после запуска раз за разом — длинная пауза, чтобы не крутиться в цикле.
-        crashes = if started.elapsed() < Duration::from_secs(30) { crashes + 1 } else { 1 };
-        let pause = if crashes >= FAST_CRASHES { Duration::from_secs(60) } else { Duration::from_secs(2) };
+        let (next_crashes, pause) = restart_backoff(crashes, started.elapsed());
+        crashes = next_crashes;
         if crashes >= FAST_CRASHES {
             log(&format!("{crashes} падений подряд — пауза {} с", pause.as_secs()));
         }
@@ -112,7 +132,7 @@ pub fn autostart_enabled() -> bool {
 pub fn set_autostart(on: bool) -> Result<(), String> {
     if on {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        crate::registry::set(RUN_KEY, RUN_VALUE, &format!("\"{}\" --watchdog --server", exe.display()))
+        crate::registry::set(RUN_KEY, RUN_VALUE, &autostart_command(&exe))
     } else {
         crate::registry::delete(RUN_KEY, RUN_VALUE)
     }
@@ -161,6 +181,57 @@ mod win {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn stage13_fast_crash_restart_uses_two_seconds_until_threshold() {
+        for previous in 0..(FAST_CRASHES - 1) {
+            let (next, wait) = restart_backoff(previous, Duration::from_secs(5));
+            assert_eq!(next, previous + 1);
+            assert_eq!(wait, Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn stage13_fifth_fast_crash_causes_long_pause() {
+        assert_eq!(restart_backoff(4, Duration::from_secs(29)),
+            (5, Duration::from_secs(60)));
+        assert_eq!(restart_backoff(5, Duration::ZERO),
+            (6, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn stage13_long_running_server_breaks_crash_streak_at_boundary() {
+        assert_eq!(restart_backoff(17, Duration::from_secs(30)),
+            (1, Duration::from_secs(2)));
+        assert_eq!(restart_backoff(17, Duration::from_secs(3600)),
+            (1, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn stage13_crash_counter_cannot_overflow_or_disable_throttling() {
+        assert_eq!(restart_backoff(u32::MAX, Duration::ZERO),
+            (u32::MAX, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn stage13_autostart_command_quotes_executable_with_spaces_and_unicode() {
+        let exe = std::path::Path::new(r"C:\Test Files\Презентатор\presentator.exe");
+        assert_eq!(autostart_command(exe),
+            r#""C:\Test Files\Презентатор\presentator.exe" --watchdog --server"#);
+    }
+
+    #[test]
+    fn stage13_log_location_is_under_presenter_directory() {
+        assert!(log_path().ends_with(std::path::Path::new("presenter").join("watchdog.log")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stage13_unknown_process_cannot_be_mistaken_for_hung_server() {
+        // Enumerates real windows but does not modify or message any known process.
+        assert!(!win::is_hung(u32::MAX));
+    }
     // This test is deliberately opt-in: it temporarily changes the current user's
     // real Run key. Preserve the exact original value, not just whether it existed.
     #[cfg(windows)]

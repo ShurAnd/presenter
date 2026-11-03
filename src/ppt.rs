@@ -78,6 +78,170 @@ extern "system" {
     fn GetWindowTextW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
     fn GetClassNameW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
     fn SetForegroundWindow(hwnd: isize) -> i32;
+    fn EnumWindows(callback: unsafe extern "system" fn(isize, isize) -> i32, data: isize) -> i32;
+    fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+    fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
+    fn BringWindowToTop(hwnd: isize) -> i32;
+    fn ShowWindow(hwnd: isize, command: i32) -> i32;
+    fn SetActiveWindow(hwnd: isize) -> isize;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" { fn GetCurrentThreadId() -> u32; }
+
+#[cfg(windows)]
+unsafe fn activate_existing_window(hwnd: isize) {
+    if hwnd == 0 || IsWindow(hwnd) == 0 { return; }
+    let foreground = GetForegroundWindow();
+    let current_thread = GetCurrentThreadId();
+    let foreground_thread = if foreground != 0 { GetWindowThreadProcessId(foreground, std::ptr::null_mut()) } else { 0 };
+    let attached = foreground_thread != 0 && foreground_thread != current_thread
+        && AttachThreadInput(current_thread, foreground_thread, 1) != 0;
+    const SW_RESTORE: i32 = 9;
+    ShowWindow(hwnd, SW_RESTORE);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetActiveWindow(hwnd);
+    if attached { AttachThreadInput(current_thread, foreground_thread, 0); }
+}
+
+// COM HWND is not available through IDispatch in some PowerPoint installations.
+// Windowed shows can use PPTFrameClass, which is also used by the editor.
+// Require an explicit slideshow caption and the current presentation filename.
+#[cfg(any(windows, test))]
+fn windowed_slideshow_title(title: &str, filename: &str) -> bool {
+    if filename.is_empty() { return false; }
+    let title = title.to_lowercase();
+    let filename = filename.to_lowercase();
+    ["Демонстрация PowerPoint - [", "PowerPoint Slide Show - ["].iter().any(|prefix| {
+        let prefix = prefix.to_lowercase();
+        title.strip_prefix(prefix.as_str())
+            .and_then(|rest| rest.strip_prefix(filename.as_str()))
+            .is_some_and(|suffix| suffix.starts_with(']') || suffix.starts_with(" ["))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn unique_slideshow_window(pid: u32, filename: &str, windows: &[(isize, u32, String, String)]) -> isize {
+    if pid == 0 { return 0; }
+    let mut matching = windows.iter().filter(|(hwnd, owner, class, title)|
+        *hwnd != 0 && *owner == pid && (
+            class == "screenClass" ||
+            (class == "PPTFrameClass" && windowed_slideshow_title(title, filename))
+        ));
+    let first = matching.next().map_or(0, |w| w.0);
+    if matching.next().is_some() { 0 } else { first }
+}
+
+#[cfg(windows)]
+fn slideshow_window_for_process(pid: u32, filename: &str) -> isize {
+    if pid == 0 { return 0; }
+    struct Search { pid: u32, windows: Vec<(isize, u32, String, String)> }
+    unsafe extern "system" fn collect(hwnd: isize, data: isize) -> i32 {
+        let search = &mut *(data as *mut Search);
+        let mut owner = 0;
+        if GetWindowThreadProcessId(hwnd, &mut owner) != 0 && owner == search.pid {
+            let mut class = [0u16; 128];
+            let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+            if n > 0 {
+                let class = String::from_utf16_lossy(&class[..n as usize]);
+                // Do not read captions of helper windows that cannot be slideshows.
+                if class == "screenClass" || class == "PPTFrameClass" {
+                    let mut title = [0u16; 1024];
+                    let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
+                    search.windows.push((hwnd, owner, class, String::from_utf16_lossy(&title[..n])));
+                }
+            }
+        }
+        1
+    }
+    let mut search = Search { pid, windows: Vec::new() };
+    unsafe {
+        if EnumWindows(collect, &mut search as *mut Search as isize) == 0 { return 0; }
+        let hwnd = unique_slideshow_window(pid, filename, &search.windows);
+        if hwnd != 0 && IsWindow(hwnd) != 0 { hwnd } else { 0 }
+    }
+}
+
+// Only used by explicit native tests when HWND resolution fails.
+#[cfg(all(test, windows))]
+fn diagnose_slideshow_windows(expected_pid: u32) {
+    struct Dump { expected_pid: u32, lines: Vec<String> }
+    unsafe extern "system" fn collect(hwnd: isize, data: isize) -> i32 {
+        let dump = &mut *(data as *mut Dump);
+        let mut pid = 0;
+        if GetWindowThreadProcessId(hwnd, &mut pid) == 0 { return 1; }
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if n <= 0 { return 1; }
+        let class = String::from_utf16_lossy(&buf[..n as usize]);
+        // Include the recorded process plus PowerPoint frames of other PIDs:
+        // this distinguishes an incorrect recorded PID from a class mismatch.
+        if pid == dump.expected_pid || class == "screenClass" || class == "PPTFrameClass" {
+            let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+            let title = if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() };
+            dump.lines.push(format!("HWND={hwnd} PID={pid} CLASS={class:?} TITLE={title:?}"));
+        }
+        1
+    }
+    let mut dump = Dump { expected_pid, lines: Vec::new() };
+    let ok = unsafe { EnumWindows(collect, &mut dump as *mut Dump as isize) };
+    eprintln!("PPT HWND DIAGNOSTICS: recorded PID={expected_pid}, EnumWindows={ok}, matching windows={}", dump.lines.len());
+    for line in dump.lines { eprintln!("PPT WINDOW: {line}"); }
+}
+
+#[cfg(test)]
+mod slideshow_handle_tests {
+    use super::unique_slideshow_window;
+
+    fn window(hwnd: isize, pid: u32, class: &str, title: &str) -> (isize, u32, String, String) {
+        (hwnd, pid, class.into(), title.into())
+    }
+
+    #[test]
+    fn stage17_hwnd_fallback_excludes_editor_and_other_processes() {
+        let windows = vec![
+            window(10, 42, "PPTFrameClass", "deck.pptx - PowerPoint"),
+            window(20, 99, "screenClass", ""),
+            window(30, 42, "screenClass", ""),
+        ];
+        assert_eq!(unique_slideshow_window(42, "deck.pptx", &windows), 30);
+        assert_eq!(unique_slideshow_window(0, "deck.pptx", &windows), 0);
+        assert_eq!(unique_slideshow_window(123, "deck.pptx", &windows), 0);
+    }
+
+    #[test]
+    fn stage17_hwnd_fallback_rejects_ambiguous_or_invalid_windows() {
+        assert_eq!(unique_slideshow_window(42, "deck.pptx", &[
+            window(30, 42, "screenClass", ""), window(31, 42, "screenClass", "")
+        ]), 0);
+        assert_eq!(unique_slideshow_window(42, "deck.pptx", &[window(0, 42, "screenClass", "")]), 0);
+        assert_eq!(unique_slideshow_window(42, "deck.pptx", &[]), 0);
+    }
+
+    #[test]
+    fn stage17_hwnd_fallback_finds_russian_windowed_show_from_real_diagnostic() {
+        let windows = vec![
+            window(1640224, 16636, "HardwareMonitorWindowClass", "HardwareMonitorWindow"),
+            window(2688882, 16636, "PPTFrameClass", "Демонстрация PowerPoint - [stage12_three_slides.pptx [Нередактируемый]] - PowerPoint"),
+            window(5179106, 16636, "PPT16ProcessClass", ""),
+            window(999, 16636, "PPTFrameClass", "stage12_three_slides.pptx - PowerPoint"),
+        ];
+        assert_eq!(unique_slideshow_window(16636, "stage12_three_slides.pptx", &windows), 2688882);
+    }
+
+    #[test]
+    fn stage17_hwnd_fallback_checks_windowed_show_filename_and_ambiguity() {
+        let show = window(30, 42, "PPTFrameClass", "PowerPoint Slide Show - [DECK.PPTX] - PowerPoint");
+        assert_eq!(unique_slideshow_window(42, "deck.pptx", &[show.clone()]), 30);
+        assert_eq!(unique_slideshow_window(42, "other.pptx", &[show.clone()]), 0);
+        assert_eq!(unique_slideshow_window(42, "deck.ppt", &[show.clone()]), 0);
+        assert_eq!(unique_slideshow_window(42, "", &[show.clone()]), 0);
+        assert_eq!(unique_slideshow_window(42, "deck.pptx", &[
+            show, window(31, 42, "PPTFrameClass", "Демонстрация PowerPoint - [deck.pptx] - PowerPoint")
+        ]), 0);
+    }
 }
 
 /// Снимок фокуса активной Windows-сессии (никаких действий с окнами).
@@ -128,9 +292,7 @@ pub fn probe_focus(slideshow: isize) -> FocusProbe {
 pub fn request_focus(slideshow: isize) {
     #[cfg(windows)]
     unsafe {
-        if slideshow != 0 && IsWindow(slideshow) != 0 {
-            let _ = SetForegroundWindow(slideshow);
-        }
+        activate_existing_window(slideshow);
     }
     #[cfg(not(windows))]
     let _ = slideshow;
@@ -444,12 +606,15 @@ impl Host {
                 if let Some(r) = target {
                     crate::display::fit_hwnd(slideshow, r);
                 }
-                SetWindowPos(slideshow, 0, 0, 0, 0, 0, SWP); // HWND_TOP
+                SetWindowPos(slideshow, -1, 0, 0, 0, 0, SWP); // HWND_TOPMOST
                 let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
                 let stage = FindWindowW(std::ptr::null(), title.as_ptr());
                 if stage != 0 {
                     SetWindowPos(stage, slideshow, 0, 0, 0, 0, SWP);
                 }
+                // HWND_TOP only changes z-order; explicitly activate the slideshow so it
+                // appears above the operator/server windows when a new show is launched.
+                activate_existing_window(slideshow);
             }
         }
         #[cfg(not(windows))]
@@ -730,6 +895,24 @@ mod com {
         }
 
         #[test]
+        fn stage16_com_busy_retry_stops_at_time_limit_and_returns_last_error() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let calls = AtomicUsize::new(0);
+            let started = Instant::now();
+            let result: R<()> = retry(|| {
+                let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                Err(Error::new(RPC_E_CALL_REJECTED, format!("still busy {attempt}")))
+            });
+            let elapsed = started.elapsed();
+            let error = result.expect_err("a permanently busy server must return an error");
+            assert!(is_busy(&error));
+            assert!(error.message().to_string().contains("still busy"));
+            assert!(elapsed >= Duration::from_secs(5), "retry ended too early: {elapsed:?}");
+            assert!(elapsed < Duration::from_secs(7), "retry exceeded its five-second budget: {elapsed:?}");
+            assert!(calls.load(Ordering::SeqCst) > 1);
+        }
+
+        #[test]
         fn stage12_com_rejects_null_or_scalar_as_dispatch() {
             assert_eq!(to_disp(&VARIANT::new()).err().unwrap().code(), E_POINTER);
             assert_eq!(to_disp(&i(17)).err().unwrap().code(), E_POINTER);
@@ -759,7 +942,7 @@ mod com {
 #[cfg(windows)]
 mod bridge {
     use super::com::{self, i, s, Disp, R};
-    use super::{now_ms, Ctx, Media, PptEvent, Req};
+    use super::{now_ms, slideshow_window_for_process, IsWindow, Ctx, Media, PptEvent, Req};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::Ordering;
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
@@ -942,8 +1125,33 @@ mod bridge {
                 self.app = None;
                 self.open_show(path, windowed, monitor)?;
             }
-            let hwnd = self.win.as_ref().and_then(|w| w.int("HWND").ok()).unwrap_or(0);
-            self.emit(PptEvent::Ready(self.total, hwnd as isize));
+            let mut hwnd = match self.win.as_ref().map(|w| w.int("HWND")) {
+                Some(Ok(hwnd)) => hwnd as isize,
+                Some(Err(e)) => {
+                    crate::jlog!("PowerPoint HWND через COM недоступен: {}", e.message());
+                    #[cfg(test)]
+                    eprintln!("PPT HWND COM ERROR: {}", e.message());
+                    0
+                }
+                None => 0,
+            };
+            if hwnd != 0 && unsafe { IsWindow(hwnd) } == 0 { hwnd = 0; }
+            if hwnd == 0 {
+                let pid = self.ctx.pid.load(Ordering::SeqCst);
+                // Run may return before the native slideshow window has been created.
+                for attempt in 0..20 {
+                    hwnd = slideshow_window_for_process(pid, path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
+                    if hwnd != 0 { break; }
+                    if attempt < 19 { std::thread::sleep(Duration::from_millis(50)); }
+                }
+                crate::jlog!("PowerPoint HWND через Windows: PID={pid}, HWND={hwnd}");
+                #[cfg(test)]
+                {
+                    eprintln!("PPT HWND FALLBACK: recorded PID={pid}, HWND={hwnd}");
+                    if hwnd == 0 { super::diagnose_slideshow_windows(pid); }
+                }
+            }
+            self.emit(PptEvent::Ready(self.total, hwnd));
             self.sdir = slides;
             if let Some(dir) = self.sdir.clone() {
                 let _ = self.plan_slides(&dir, width);

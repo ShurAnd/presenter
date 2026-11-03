@@ -80,13 +80,15 @@ pub enum Cmd {
     /// Ручное восстановление фокуса слайд-шоу PowerPoint на компьютере показа.
     /// Не открывает презентацию заново, не переключает слайды и не закрывает окна.
     RestorePptFocus,
+    /// Remote focus restoration for a PDF stage window; kept separate for older clients.
+    RestoreStageFocus,
 }
 
-/// Наблюдение за фокусом именно окна слайд-шоу (не за видимостью презентации).
+/// Наблюдение за фокусом окна показа: окна слайд-шоу PowerPoint или сцены PDF.
 /// Новое необязательное поле — старые серверы/клиенты могут его не передавать.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 pub enum PptFocus {
-    /// PPTX не показывается, идёт загрузка/увеличение или HWND неизвестен.
+    /// Нет активного окна показа или фокус пока неизвестен.
     #[default]
     Unknown,
     Ok,

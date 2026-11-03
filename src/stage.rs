@@ -53,7 +53,9 @@ impl App {
         };
         let view = self.local_state();
         let windowed = self.cfg.windowed;
-        let top = !windowed && self.show.as_ref().is_none_or(Show::stage_on_top);
+        // Keep the stage above ordinary desktop windows, but let an active PPTX
+        // slideshow sit above it. Video is reordered immediately below its player.
+        let top = self.show.as_ref().is_none_or(Show::stage_on_top);
         let level = |top: bool| if top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
         // «Полный экран» делаем сами: окно без рамки ровно по монитору. Режим fullscreen
         // у дочернего окна eframe на Windows оставляет окно прежнего размера.
@@ -77,6 +79,7 @@ impl App {
         let scr = if self.show.is_none() { self.screen } else { Screen::Background };
         let timer = self.timer.info();
         let mut repaint: Option<Duration> = None;
+        let mut stage_focused = false;
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
         let sent = self.stage_sent;
         let bg = self.bg.as_ref().map(background::Background::texture);
@@ -99,6 +102,7 @@ impl App {
         let (textures, last_tex, error, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.failed);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
+            stage_focused = ctx.input(|i| i.viewport().focused == Some(true));
             if sent.is_none_or(|(_, fs)| fs == windowed) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(windowed));
                 // В оконном режиме размер задаёт egui; на весь экран — подгоняем ниже под монитор показа.
@@ -110,7 +114,8 @@ impl App {
             if sent.is_none_or(|(t, _)| t != top) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level(top)));
                 // Сцена появилась или снова поднялась после PowerPoint — забирает клавиатуру.
-                if top {
+                // A fresh stage viewport (including a remote PDF restore request) must also get focus.
+                if top || sent.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
             }
@@ -238,6 +243,27 @@ impl App {
                 }
             });
         });
+        // PDF, images and video use the stage viewport; PPTX is observed by its own HWND.
+        if self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Pdf(_) | ShowKind::Image(_) | ShowKind::Video(_))) {
+            let next = if stage_focused {
+                self.ppt_focus_restore_deadline = None;
+                PptFocus::Ok
+            } else if self.ppt_focus_restore_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.ppt_focus_restore_deadline = None;
+                PptFocus::RestoreFailed { window: "окно показа".into() }
+            } else if matches!(&self.ppt_focus, PptFocus::Restoring { .. }) {
+                PptFocus::Restoring { window: "окно показа".into() }
+            } else {
+                PptFocus::Lost { window: "другое окно Windows".into() }
+            };
+            if self.ppt_focus != next {
+                self.ppt_focus = next;
+                self.dirty = true;
+            }
+            if self.ppt_focus_restore_deadline.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
         self.cursor_moved = cursor_moved;
         if (stage_px, slide_aspect) != (self.stage_px, self.slide_aspect) {
             (self.stage_px, self.slide_aspect) = (stage_px, slide_aspect);
@@ -265,9 +291,7 @@ impl App {
         let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
         // Проверяем на каждой перерисовке: после показа PowerPoint сцена теряла «поверх всех»
         // и не получала его обратно — тогда подготовленное видео оказывалось над фоном.
-        if !windowed {
-            ppt::stage_topmost(top);
-        }
+        ppt::stage_topmost(top);
         if self.show.as_ref().is_some_and(Show::video_on_screen) {
             video::stage_under_video(ppt::STAGE_TITLE);
         }

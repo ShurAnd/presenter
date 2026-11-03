@@ -308,6 +308,8 @@ async fn loopback_real_client_sends_command_and_receives_state() {
 
     client.send(CliReq::Cmd(Cmd::RestorePptFocus));
     assert!(matches!(server.event().await, SrvEvent::Cmd(Cmd::RestorePptFocus)));
+    client.send(CliReq::Cmd(Cmd::RestoreStageFocus));
+    assert!(matches!(server.event().await, SrvEvent::Cmd(Cmd::RestoreStageFocus)));
     let mut state = StateMsg::default();
     state.pages = 4;
     state.ppt_focus = PptFocus::Lost { window: "Office".into() };
