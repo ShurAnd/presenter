@@ -1,0 +1,372 @@
+﻿file,line,test,ignored,ignore_reason,scope,review_status
+audio.rs,283,stage9_audio_worker_routes_empty_deck_commands_without_audio_device,False,,real audio worker but no audio hardware/media file,source-catalogued; not yet behaviorally validated
+audio_flow_tests.rs,11,audio_load_forwards_deck_generation_path_and_repeat,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+audio_flow_tests.rs,36,audio_pause_and_resume_target_the_requested_deck,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+audio_flow_tests.rs,45,audio_stop_preserves_fade_selection_and_order,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+audio_flow_tests.rs,56,audio_seek_repeat_and_volume_keep_values,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+audio_flow_tests.rs,73,audio_dropping_control_handle_closes_command_channel,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,219,gif_frames,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,243,static_png_is_one_frame,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,259,stage8_invalid_background_bytes_return_decode_error,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,264,stage8_static_background_respects_small_texture_limit,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,272,stage8_missing_background_file_reports_readable_error,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,278,stage8_static_background_stays_on_single_texture,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,288,stage8_background_animation_selects_next_frame_on_tick,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+background.rs,302,stage8_background_anim_with_zero_duration_does_not_spin,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,130,command_open_pdf_initializes_stage_and_replaces_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,149,command_rejects_unknown_or_not_ready_items_without_interrupting_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,163,command_pdf_navigation_clamps_boundaries_and_resets_zoom,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,184,command_zoom_and_pan_never_expose_area_outside_pdf,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,200,command_background_clock_timer_close_show_but_keep_stage,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,215,command_open_warns_about_missing_linked_media_without_changing_pages,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,227,command_local_state_marks_ready_preparing_and_failed_items,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,243,command_switches_to_remote_state_when_connected,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,255,command_ppt_media_is_visible_only_on_matching_slide,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,276,command_restore_focus_without_active_slideshow_is_safe,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,285,command_ppt_navigation_keeps_position_until_bridge_reports_it,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,305,command_stage_layering_follows_powerpoint_phase,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,327,command_video_repeat_changes_only_named_item,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,339,command_linked_text_reports_all_missing_media,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,348,stage_single_escape_only_arms_double_escape,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,358,stage_double_escape_hides_empty_background,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,368,stage_double_escape_returns_clock_to_background_first,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,380,stage_double_escape_returns_timer_to_background_first,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,391,stage_double_escape_closes_show_but_preserves_stage,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,401,stage_expired_first_escape_requires_new_double_press,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,444,network_port_accepts_trimmed_numbers_and_maximum_port,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,455,network_port_rejects_zero_overflow_and_invalid_input,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,466,network_reserve_requires_an_exact_selected_key,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,475,network_reserve_excludes_the_current_connection_even_with_whitespace,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,485,network_reserve_selects_other_host_and_preserves_credentials,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,498,network_reserve_distinguishes_servers_with_identical_labels,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,507,network_disconnect_clears_remote_state_and_pending_reconnect,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,525,network_toggle_client_disconnects_existing_handle_without_dialing,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,536,network_toggle_client_does_not_connect_with_invalid_port,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,546,network_resume_waits_for_a_matching_remote_filename,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,560,network_resume_does_not_open_a_remote_file_still_preparing,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,574,network_resume_open_command_is_issued_once_while_awaiting_activation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,585,network_resume_ignores_unrelated_active_presentation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,595,network_resume_restores_slide_only_after_expected_presentation_appears,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,608,network_resume_does_not_seek_when_remote_active_item_is_video,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,619,network_resume_at_first_slide_needs_no_navigation_command,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,630,network_resume_expires_and_reports_the_missing_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,643,network_old_remote_without_live_pings_does_not_report_communication_alarm,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,654,network_live_remote_connection_reports_stale_heartbeat,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,665,network_remote_health_becomes_bad_when_metrics_stop_arriving,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,678,network_disconnected_uses_local_health_without_fake_network_row,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,691,stage_hidden_resets_sent_window_state_without_loading_background,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,705,stage_minimize_releases_main_window_when_scene_is_gone,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,717,stage_remote_client_does_not_minimize_local_main_window,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,728,stage_windowed_mode_releases_previous_minimization,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,740,stage_double_escape_first_restores_background_then_hides_scene,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,756,stage_double_escape_closes_pdf_before_allowing_scene_to_hide,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,804,ui_time_renders_unknown_duration_and_hours_without_truncating,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,812,ui_now_playing_silent_and_paused_have_distinct_labels,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,824,ui_now_playing_music_and_fade_have_expected_presentation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,841,ui_now_playing_insertion_overrides_music_only_while_active,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,861,ui_now_playing_unknown_track_does_not_panic,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,869,ui_video_label_covers_all_playback_states,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,883,ui_health_level_colors_distinguish_all_severities,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,891,ui_versions_compare_numerically_not_lexicographically,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,901,ui_thumbnail_window_includes_previous_current_two_ahead,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,911,ui_thumbnail_window_handles_page_zero,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,919,ui_goto_number_uses_one_based_slide_numbers,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,932,ui_goto_number_rejects_zero_oversized_and_nonnumeric_input,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,947,ui_goto_typed_buffers_digits_until_enter_and_clears_them,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,961,ui_goto_typed_refuses_video_and_inactive_presentations,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,977,ui_goto_typed_limits_length_and_discards_expired_buffer,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,988,ui_timer_extra_zero_locally_and_elapsed_on_remote,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,997,ui_goto_number_forwards_remote_command_without_changing_local_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1007,ui_draw_empty_list_and_basic_controls_without_native_window,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1019,ui_draw_local_presentations_with_badges_and_selection,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1034,ui_draw_remote_video_list_for_loading_ready_playing_paused,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1049,ui_draw_player_empty_and_nonempty_playlists,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1068,ui_draw_player_with_insertion_paused_and_fading_states,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1088,ui_draw_network_panel_with_and_without_saved_servers,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1101,ui_draw_network_panel_when_remote_client_is_connected,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1109,ui_draw_preview_pdf_first_middle_and_last_pages,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1122,ui_draw_preview_ignores_inactive_presentation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1129,ui_draw_preview_media_icons_and_zoom_panel,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1147,ui_draw_bottom_bar_countdown_running_and_stopped,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1162,ui_draw_bottom_bar_stopwatch_overtime_and_clock,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1178,ui_draw_top_bar_on_client_and_local_server,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1193,ui_draw_health_window_empty_and_real_samples,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1205,ui_draw_health_window_closes_when_neither_server_nor_client,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1213,ui_draw_alarm_on_connection_loss_and_reconnect_countdown,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1224,ui_draw_reserve_editor_with_invalid_and_valid_port,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1235,ui_draw_help_window_and_version_mismatch_banners,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1250,ui_draw_confirmation_dialog_without_clicking_buttons,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1258,ui_draw_media_labels_for_playing_paused_stopped_and_unstarted,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1272,ui_draw_zoom_panel_when_zooming_is_and_is_not_possible,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1284,ui_draw_background_menu_when_default_or_custom_is_selected,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1293,ui_draw_ppt_focus_info_for_unknown_lost_restoring_failed,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1323,ui_keyboard_navigation_next_prev_zoom_and_home_end,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1341,ui_keyboard_ctrl_arrows_pan_instead_of_changing_slides,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1357,ui_keyboard_shift_number_opens_only_ready_item_and_shift_zero_closes,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1370,ui_keyboard_timer_space_toggles_only_when_not_showing_slides,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1383,ui_keyboard_without_active_show_ignores_slide_arrows_and_esc,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1393,ui_typing_digits_ignores_modifiers_and_detects_enter,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1415,ui_draw_settings_panel_without_changing_persistent_configuration,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1423,ui_draw_settings_with_missing_selected_monitor_and_keyboard_enabled,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1432,ui_draw_health_warning_when_remote_server_is_overloaded,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1445,ui_monitor_label_marks_primary_display_and_dimensions,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1459,command_move_reorders_without_losing_items_or_ids,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1469,command_move_ignores_first_last_and_missing_items,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1479,command_removing_active_item_closes_show_but_keeps_other_items,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1491,command_removing_unrelated_item_preserves_active_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1502,command_clear_empties_list_and_active_show_without_hiding_stage,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1513,command_audio_volume_clamps_without_needing_audio_engine,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1524,command_audio_playlist_reordering_and_removal_work_without_device,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1537,command_audio_transport_is_harmless_with_empty_playlist,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1551,command_timer_set_run_stop_reset_and_clamp_are_consistent,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1566,command_timer_switching_modes_resets_elapsed_and_keeps_duration,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1639,stage8_ppt_ready_updates_phase_handle_and_slide_count,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1652,stage8_ppt_ready_sanitizes_zero_slide_count,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1660,stage8_ppt_position_resets_zoom_only_on_page_change,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1674,stage8_ppt_zero_based_position_never_underflows,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1682,stage8_ppt_stale_generation_does_not_change_newer_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1691,stage8_ppt_slide_event_clears_only_matching_failed_thumbnail,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1701,stage8_ppt_media_event_reaches_current_slide,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1714,stage8_ppt_zoom_failure_clears_busy_and_reports_reason,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1724,stage8_ppt_zoom_texture_matches_generation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1734,stage8_ppt_zoom_read_error_keeps_show_open,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1745,stage8_ppt_error_closes_show_and_preserves_error_message,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1754,stage8_ppt_ended_closes_show_without_touching_items,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1763,stage8_video_ready_transitions_to_armed,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1773,stage8_video_loading_ignores_playing_flag_until_armed,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1781,stage8_video_playing_and_paused_follow_position_events,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1796,stage8_video_end_arms_again_without_closing_file,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1810,stage8_video_error_closes_only_current_generation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1821,stage8_video_events_do_not_turn_pdf_into_video,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1830,stage8_image_event_uploads_only_current_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1844,stage8_image_failure_preserves_show_and_reports_error,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1856,stage8_background_accepts_current_generation_and_ignores_old,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1868,stage8_page_event_populates_only_current_pdf_cache,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1879,stage8_page_error_reports_only_active_page,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1891,stage8_thumbnail_near_current_slide_is_retained,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1901,stage8_thumbnail_far_from_current_slide_is_not_cached,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1908,stage8_thumbnail_failure_clears_pending_but_remembers_error,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1916,stage8_health_event_replaces_local_snapshot,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1924,stage8_prepared_event_marks_file_ready_and_keeps_page_count,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1933,stage8_prepared_failure_and_missing_links_produce_visible_errors,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1941,stage8_prepared_event_for_deleted_file_is_ignored,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1948,stage8_ppt_tick_times_out_stuck_loading_without_opening_com,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1957,stage8_ppt_tick_waits_for_settle_then_lowers_scene,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1968,stage8_ppt_focus_poll_without_valid_window_resets_focus_state,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1979,stage8_ppt_zoom_filename_uses_one_based_slide_and_subfolder,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1986,stage8_ppt_zoom_requests_image_only_once_while_busy,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,1998,stage8_client_rtt_and_health_restore_live_telemetry,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2008,stage8_client_replies_update_status_for_upload_success_and_error,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2017,stage8_client_upload_progress_handles_empty_and_nonempty_totals,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2027,stage8_client_state_updates_active_item_and_last_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2041,stage8_client_close_after_connection_schedules_reconnect,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2052,stage8_client_bad_password_disables_retries,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2060,stage8_client_voluntary_disconnect_leaves_no_alarm,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2069,stage8_client_thumbnail_is_accepted_only_for_current_remote_show,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2079,stage8_server_failed_and_client_count_are_reported,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2089,stage8_server_detects_old_protocol_client,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2099,stage8_server_does_not_execute_commands_without_server,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2106,stage8_mirror_upload_success_and_error_have_distinct_messages,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2117,stage8_trim_pages_retains_only_adjacent_cached_pages,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2130,stage8_reset_pages_clears_cache_failures_and_render_error,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2140,stage8_add_local_routes_music_and_rejects_unsupported_formats,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2151,stage8_file_paths_include_normalized_port_and_hash_slides,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2161,stage8_previews_prunes_far_thumbnail_entries_even_when_connected,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2176,stage8_ppt_zoom_not_requested_until_show_is_visible,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2198,stage8_save_list_only_writes_when_server_is_online,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2214,stage8_load_list_restores_tracks_and_reports_missing_files,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2232,stage8_load_list_removes_unreferenced_file_only_in_owned_workdir,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2242,stage8_delete_files_never_removes_non_owned_source,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2254,stage8_delete_files_removes_owned_copy_and_unused_slide_directory,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2268,stage8_add_files_local_iterates_music_and_unsupported_entries,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2276,stage8_video_navigation_commands_keep_video_item_open,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2286,stage8_video_transport_toggles_armed_playing_and_paused,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2299,stage8_video_repeat_updates_open_player_and_item,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2310,stage8_ppt_media_commands_keep_show_active,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2319,stage8_ppt_position_only_changes_after_bridge_event,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2329,stage8_ppt_focus_state_does_not_reset_on_identical_update,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2341,stage8_out_show_escape_arms_double_press_without_hiding_stage,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2349,stage8_prepared_background_failed_generation_does_not_change_current_background,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2373,stage9_scene_windowed_background_keeps_scene_alive_without_native_window,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2383,stage9_scene_draws_clock_and_timer_as_separate_modes,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2395,stage9_scene_pdf_handles_unrendered_page_without_blank_window_crash,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2404,stage9_scene_pdf_zoom_handles_missing_zoom_texture,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2414,stage9_scene_ppt_loading_keeps_show_while_stage_is_drawn,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2423,stage9_scene_video_armed_does_not_start_native_decoder,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2433,stage9_scene_renders_static_background_texture,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2443,stage9_scene_pdf_can_display_previous_texture_while_page_is_prepared,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2456,stage9_scene_ppt_zoom_draws_a_prepared_zoom_texture,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+commands_flow_tests.rs,2476,stage9_scene_displays_loaded_image_presentation,False,,in-memory App state/egui; mocks for external dependencies,source-catalogued; not yet behaviorally validated
+display.rs,135,labels_preserve_dimensions_names_and_primary_marker,False,,Windows display enumeration / safe handle inspection,source-catalogued; not yet behaviorally validated
+display.rs,146,live_list_places_primary_before_secondary_displays,False,,Windows display enumeration / safe handle inspection,source-catalogued; not yet behaviorally validated
+display.rs,159,target_falls_back_to_first_or_none_for_missing_display,False,,Windows display enumeration / safe handle inspection,source-catalogued; not yet behaviorally validated
+display.rs,170,absent_window_handle_is_never_reported_on_monitor,False,,Windows display enumeration / safe handle inspection,source-catalogued; not yet behaviorally validated
+health.rs,501,health_sample,True,manual opt-in; see source,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,515,assess_levels,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,535,health_cost,True,manual opt-in; see source,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,577,stage8_health_without_snapshot_only_shows_connection_when_supplied,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,586,stage8_health_slow_and_lost_connection_have_different_levels,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,597,stage8_health_cpu_and_ram_thresholds_are_independent,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,608,stage8_health_zero_ram_total_never_divides_by_zero,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,619,stage8_health_ppt_lag_boundaries_change_alarm_level,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,628,stage8_health_gpu_and_vram_separate_shared_and_dedicated,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,642,stage8_health_missing_vram_data_omits_vram_row,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,650,stage8_health_disk_thresholds_are_absolute_free_space,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,659,stage8_health_disconnected_monitor_is_a_bad_alarm,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,670,stage8_health_unresponsive_ui_is_bad_even_with_healthy_hardware,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,676,stage8_health_duration_and_memory_formatting,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,691,collector_emits_sample_and_stops_when_handle_is_dropped,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,710,unresponsive_and_missing_gpu_data_are_independent,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+health.rs,725,windows_sampler_handles_real_counters_and_two_consecutive_samples,False,,assessment logic; Windows metrics collector; opt-in sampling,source-catalogued; not yet behaviorally validated
+mpv.rs,277,stage9_mpv_properties_commands_events_errors_and_drop,False,,mock native libmpv C-API (no real video),source-catalogued; not yet behaviorally validated
+mpv.rs,304,stage9_mpv_cstring_removes_embedded_nul_bytes,False,,mock native libmpv C-API (no real video),source-catalogued; not yet behaviorally validated
+net.rs,898,filename_sanitizer_rejects_windows_forbidden_characters,False,,wire protocol serialization and helpers,source-catalogued; not yet behaviorally validated
+net.rs,907,thumbnail_frames_reject_incomplete_headers,False,,wire protocol serialization and helpers,source-catalogued; not yet behaviorally validated
+net.rs,918,image_decoder_rejects_garbage_and_reads_png,False,,wire protocol serialization and helpers,source-catalogued; not yet behaviorally validated
+net.rs,928,thumb_frame_roundtrip,False,,wire protocol serialization and helpers,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,114,loopback_rejects_wrong_password_without_counting_client,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,128,loopback_rejects_command_before_authentication,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,137,loopback_accepts_legacy_hello_and_forwards_commands,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,164,loopback_publishes_state_and_binary_thumbnails,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,194,loopback_upload_only_sanitizes_name_and_preserves_bytes,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,220,loopback_rejects_short_upload_and_deletes_partial_file,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,241,loopback_background_upload_uses_background_event,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,261,loopback_reconnect_updates_client_count,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,275,loopback_invalid_json_does_not_disconnect_authorized_client,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,289,loopback_real_client_sends_command_and_receives_state,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,337,loopback_new_client_gets_prepublished_state_and_thumbnails,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,362,loopback_three_clients_receive_independent_replies,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,400,loopback_aborted_upload_removes_partial_file,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,433,loopback_multichunk_upload_preserves_full_content,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,456,loopback_empty_upload_is_accepted_without_fake_bytes,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,472,loopback_bad_commands_and_unsolicited_binary_are_ignored,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,488,loopback_concurrent_uploads_use_unique_paths,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,538,publisher_does_not_notify_on_identical_state,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,554,publisher_thumbnails_notify_only_when_keys_change,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,566,publisher_health_updates_are_serialized,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,582,loopback_real_client_reports_server_disconnect,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,627,loopback_real_uploader_reports_missing_file,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,653,loopback_real_uploader_sends_file_and_progress,False,,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,694,stress_loopback_repeated_connect_and_ping,True,run explicitly with cargo test stress_loopback_ -- --ignored --nocapture,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+net_loopback_tests.rs,712,known_issue_upload_must_not_exceed_declared_size_on_disk,True,known limitation: file may grow beyond declared size before UploadEnd,real TCP/WebSocket localhost; publisher tests use in-memory watch channels,source-catalogued; not yet behaviorally validated
+pdfium_bundle.rs,87,pdfium_is_embedded_and_can_be_extracted,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,14,player_add_assigns_distinct_ids_and_preserves_order,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,27,player_volume_clamps_and_mode_changes_without_starting_engine,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,41,player_moves_tracks_and_ignores_out_of_range_moves,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,57,player_remove_returns_only_removed_file_and_retains_other_tracks,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,68,player_remove_active_track_invalidates_late_events,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,82,player_clear_returns_paths_and_resets_both_decks,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,104,player_ignores_stale_position_and_error_events,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,118,player_updates_only_the_matching_deck_on_position_events,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,132,player_single_track_end_stops_and_rewinds,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,147,player_insert_end_clears_insertion_without_resuming_unpaused_main,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,164,player_insert_stop_resets_state_without_affecting_music,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,177,player_error_reports_track_name_and_stops_main,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,191,player_stop_does_not_spawn_audio_device_when_no_engine_exists,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+player_flow_tests.rs,204,player_no_tracks_navigation_and_seek_are_harmless,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,16,host_queues_navigation_in_order_without_com,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,27,host_sends_media_cursor_and_zoom_parameters_unmodified,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,51,host_close_is_idempotent_and_does_not_quit_worker,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,62,host_close_with_no_presentation_sends_nothing,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,69,host_lag_probe_is_none_until_show_is_active,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,82,host_restart_discards_stale_queue_without_killing_process,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,96,host_does_not_reopen_worker_for_commands_without_open,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,104,end_guard_emits_error_for_current_live_presentation,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,125,end_guard_does_not_send_false_alarm_after_show_closed,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,143,end_guard_ignores_stale_worker_after_restart,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,164,stage8_host_open_sends_cursor_and_all_open_parameters,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,187,stage8_host_open_without_slide_export_retains_none,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,196,stage8_host_shutdown_sends_quit_and_discards_mock_worker,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,207,stage9_host_open_forwards_all_options_and_cursor_setting,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,230,stage9_host_open_default_cursor_and_no_slide_cache,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,248,stage9_host_shutdown_sends_quit_and_clears_worker,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,258,stage9_host_show_close_then_open_reuses_fake_worker,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+ppt_flow_tests.rs,270,stage9_host_monotonic_clock_is_nonzero,False,,"PowerPoint Host request channel (no COM, no PowerPoint)",source-catalogued; not yet behaviorally validated
+registry.rs,132,roundtrip,False,,real Windows HKCU registry read/write to isolated value,source-catalogued; not yet behaviorally validated
+regression_tests.rs,9,config_defaults_match_portable_client_expectations,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,20,config_empty_json_keeps_defaults,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,28,config_roundtrip_preserves_pdf_engine_and_reserve,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,47,config_ignores_unknown_fields_from_newer_version,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,54,saved_server_key_and_label_trim_whitespace,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,68,upsert_server_updates_same_address_without_changing_order,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,80,merge_servers_skips_duplicates_and_respects_limit,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,96,state_msg_reads_old_minimal_protocol,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,107,state_msg_roundtrip_preserves_media_timer_and_pdf_view,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,132,protocol_commands_roundtrip_through_json,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,148,protocol_rejects_unknown_command,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,153,pdf_preference_falls_back_to_pdfium_for_unknown_values,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,161,pdf_zoom_centered_uses_expected_fraction,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,169,pdf_zoom_cannot_pan_outside_page,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,179,pdf_view_key_clamps_and_rounds,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,185,pdf_page_keys_distinguish_page_size_and_view,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,197,timer_duration_is_clamped_and_mode_switch_resets,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,212,timer_text_handles_minute_boundary_and_overtime,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,224,timer_repaint_tick_aligns_to_next_second,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,244,health_good_sample_is_not_false_alarm,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,250,health_network_latency_warning_and_failure_thresholds,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,260,health_powerpoint_lag_warning_and_failure_thresholds,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,269,health_detects_disconnected_monitor_and_hung_ui,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,279,player_playlist_reorder_and_remove_without_audio_device,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+regression_tests.rs,294,player_modes_volume_and_clear_do_not_require_audio_device,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+render.rs,634,pptx_slide_count_ignores_related_files_and_notes,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,658,pptx_slide_count_reports_invalid_archives,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,667,media_link_path_decodes_percent_encoding,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,676,pdf_engine_preference,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,688,pdfium_smoke,True,manual opt-in; see source,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,711,finds_linked_media,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,744,soak_render,True,manual opt-in; see source,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,761,viewport_math,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,778,zoom_region_matches,True,manual opt-in; see source,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,810,bench_render,True,manual opt-in; see source,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,864,stage8_prepare_image_reports_one_page,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,874,stage8_prepare_image_invalid_pixels_are_rejected,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,882,stage8_prepare_ppt_and_video_only_need_readable_files,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,892,stage8_prepare_missing_video_and_unknown_extension_rejected,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,899,stage8_prepare_invalid_pptx_and_pdf_report_errors,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,909,stage8_background_preparation_reports_result_from_thread,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,921,stage8_background_preparation_valid_image_returns_ready_page,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,934,stage8_load_image_returns_frames_and_thumbnail,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,955,stage8_load_image_failure_emits_no_thumbnail,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,964,stage8_load_thumb_supports_valid_bytes_without_extension_assumption,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,980,stage8_load_thumb_reports_error_for_missing_file,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,988,stage8_load_ppt_zoom_can_decode_png_image,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1001,stage8_load_ppt_zoom_reports_missing_file,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1009,stage8_thumbnail_encoding_and_resize_preserve_dimensions,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1017,stage8_thumbnail_large_image_is_downscaled,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1026,stage8_deliver_page_event_only_for_current_epoch,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1042,stage8_deliver_page_failure_keeps_key_and_message,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1052,stage8_deliver_thumbnail_on_success_and_error,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1064,stage8_xml_entity_decoding_handles_all_standard_escapes,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1069,stage8_relative_links_decode_utf8_while_preserving_bad_escapes,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1076,stage8_linked_media_missing_archive_returns_empty_list,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1085,stage8_viewport_rejects_nan_aspect_and_tiny_screens,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+render.rs,1093,stage8_pdf_engine_labels_match_serialized_preference,False,,PDF/image rendering and memory fixtures; opt-in real PDFs,source-catalogued; not yet behaviorally validated
+screen.rs,251,countdown_text,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+screen.rs,266,stopwatch_text,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+screen.rs,273,timer_logic,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+tests.rs,13,e2e,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,77,merge_servers_keeps_ours_first_and_skips_forgotten,False,,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,87,upsert_server_adds_updates_and_trims,False,,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,104,config_reads_null_servers_without_losing_other_settings,False,,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,117,e2e_switch,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,189,e2e_list,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,216,e2e_cmd,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,245,e2e_audio,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,345,e2e_background,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,378,e2e_media,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,437,e2e_send,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,457,e2e_upload_cmd,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,520,e2e_preview,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,622,e2e_video,True,manual opt-in; see source,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,672,ppt_focus_backward_compatible,False,,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+tests.rs,680,ppt_focus_roundtrip_and_command,False,,manually parameterized E2E with real files/server,source-catalogued; not yet behaviorally validated
+video.rs,646,loop_offscreen,True,manual opt-in; see source,video mock; opt-in native media scenario,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,12,video_play_and_toggle_are_sent_in_order,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,24,video_repeat_switches_are_forwarded,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,33,video_relative_and_absolute_seek_remain_distinct,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,48,video_drop_requests_quit_after_queued_commands,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,61,video_unused_player_drop_still_queues_quit,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,69,video_seeks_are_delivered_individually_and_in_order,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,81,video_repeat_update_does_not_reorder_play_and_seek_commands,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+video_flow_tests.rs,96,video_command_sender_survives_closed_receiver_without_panicking,False,,pure/in-memory/GUI unit tests; external dependencies not verified,source-catalogued; not yet behaviorally validated
+watchdog.rs,168,autostart_roundtrip,True,manual opt-in; see source,Windows HKCU autostart (read-only / opt-in real write),source-catalogued; not yet behaviorally validated
