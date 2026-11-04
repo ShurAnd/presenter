@@ -82,6 +82,10 @@ pub enum Cmd {
     RestorePptFocus,
     /// Remote focus restoration for a PDF stage window; kept separate for older clients.
     RestoreStageFocus,
+    /// Server chooses the current presentation window, including zoomed PPTX.
+    RestoreFocus,
+    /// Change the PDF renderer on the presentation computer.
+    SetPdfEngine { engine: String },
 }
 
 /// Наблюдение за фокусом окна показа: окна слайд-шоу PowerPoint или сцены PDF.
@@ -268,6 +272,11 @@ pub struct StateMsg {
     /// Состояние фокуса PowerPoint на компьютере показа.
     #[serde(default)]
     pub ppt_focus: PptFocus,
+    /// Actual server renderer. None means a server without remote PDF settings.
+    #[serde(default)]
+    pub pdf_engine: Option<String>,
+    #[serde(default)]
+    pub pdf_engine_error: Option<String>,
     /// Версия программы сервера (пусто — старый сервер, без сверки версий): клиент предупреждает о расхождении.
     #[serde(default)]
     pub version: String,

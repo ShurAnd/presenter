@@ -37,8 +37,41 @@ impl App {
             view: self.slide_view(),
             media: self.slide_media(),
             ppt_focus: self.ppt_focus.clone(),
+            pdf_engine: Some(self.renderer.engine().as_str().into()),
+            pdf_engine_error: self.renderer.pdfium_error().map(str::to_owned),
             version: env!("CARGO_PKG_VERSION").into(),
             cursor: self.show_cursor,
+        }
+    }
+
+    fn change_pdf_engine(&mut self, engine: &str) {
+        let choice = match engine {
+            "pdfium" => render::PdfEngine::Pdfium,
+            "hayro" => render::PdfEngine::Hayro,
+            _ => {
+                self.status = format!("Неизвестный PDF-движок: {engine}");
+                return;
+            }
+        };
+        match self.renderer.set_engine(choice) {
+            Ok(()) => {
+                self.cfg.pdf_engine = choice.as_str().into();
+                self.save_cfg();
+                // Новое содержимое должно рендериться выбранным движком; старые
+                // картинки и статусы неудачи больше не соответствуют PDF.
+                self.textures.clear();
+                self.failed.clear();
+                self.last_tex = None;
+                self.render_error = None;
+                let pdf_ids: std::collections::HashSet<u64> = self.items.iter()
+                    .filter(|it| it.kind == "PDF").map(|it| it.id).collect();
+                self.previews.retain(|(id, _), _| !pdf_ids.contains(id));
+                self.thumb_jpg.retain(|(id, _), _| !pdf_ids.contains(id));
+                self.thumb_busy.retain(|(id, _)| !pdf_ids.contains(id));
+                self.thumb_failed.retain(|(id, _)| !pdf_ids.contains(id));
+                self.status = format!("PDF-движок переключён: {}", choice.label());
+            }
+            Err(e) => self.status = e,
         }
     }
 
@@ -296,6 +329,10 @@ impl App {
                 self.ppt_host.set_cursor(on);
                 video::set_cursor(on);
             }
+            Cmd::SetPdfEngine { engine } => self.change_pdf_engine(&engine),
+            Cmd::RestoreFocus => {
+                self.apply(if self.show_uses_stage_focus() { Cmd::RestoreStageFocus } else { Cmd::RestorePptFocus });
+            }
             Cmd::RestorePptFocus => {
                 // Работает только в режиме обычного показа: при увеличении сцена
                 // намеренно перекрывает PowerPoint, поэтому восстанавливать нечего.
@@ -321,11 +358,17 @@ impl App {
                 }
             }
             Cmd::RestoreStageFocus => {
-                let stage_active = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Pdf(_) | ShowKind::Image(_) | ShowKind::Video(_)));
+                let stage_active = self.show_uses_stage_focus();
                 if stage_active {
                     self.ppt_focus = PptFocus::Restoring { window: "окно показа".into() };
                     self.ppt_focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
-                    self.stage_sent = None; // next stage frame requests native viewport focus
+                    self.stage_sent = None;
+                    self.ppt_focus_candidate = None;
+                    self.ppt_focus_polled = Instant::now() - Duration::from_secs(1);
+                    ppt::request_focus(ppt::own_stage_window());
+                    if let Some(video) = self.show.as_ref().and_then(Show::video) {
+                        video.player.raise();
+                    }
                 } else {
                     self.status = "Фокус окна показа недоступен".into();
                 }
@@ -445,14 +488,18 @@ impl App {
         self.tick_ppt_zoom();
     }
 
-    /// Сравниваем фокус в Windows только для готового обычного показа PPTX.
-    /// Не меняем положение окна и не управляем PowerPoint при опросе.
+    /// The keyboard target for PDF/images/video is the stage. Video itself is NOACTIVATE.
+    fn show_uses_stage_focus(&self) -> bool {
+        self.show.as_ref().is_some_and(|show| match &show.kind {
+            ShowKind::Ppt(_) => show.ppt_zoom_on(),
+            ShowKind::Pdf(_) | ShowKind::Image(_) | ShowKind::Video(_) => true,
+        })
+    }
+
+    /// Poll the presentation computer's real foreground HWND for every format.
     pub(crate) fn tick_ppt_focus(&mut self, ctx: &egui::Context) {
-        let hwnd = self.show.as_ref().and_then(|s| match &s.kind {
-            ShowKind::Ppt(p) if p.phase == PptPhase::Shown && s.zoom <= 1.0 => Some(p.hwnd),
-            _ => None,
-        }).unwrap_or(0);
-        if hwnd == 0 {
+        if self.connected { return; }
+        if self.show.is_none() {
             self.ppt_focus_candidate = None;
             self.ppt_focus_restore_deadline = None;
             self.update_ppt_focus(PptFocus::Unknown);
@@ -466,7 +513,21 @@ impl App {
             return;
         }
         self.ppt_focus_polled = now;
+        let stage_target = self.show_uses_stage_focus();
+        let hwnd = if stage_target {
+            ppt::own_stage_window()
+        } else {
+            self.show.as_ref().and_then(|show| match &show.kind {
+                ShowKind::Ppt(p) if p.phase == PptPhase::Shown => Some(p.hwnd),
+                _ => None,
+            }).unwrap_or(0)
+        };
         let probe = ppt::probe_focus(hwnd);
+        self.handle_focus_probe(probe, now, hwnd, stage_target);
+        ctx.request_repaint_after(interval);
+    }
+
+    fn handle_focus_probe(&mut self, probe: ppt::FocusProbe, now: Instant, hwnd: isize, stage_target: bool) {
         if matches!(&probe, ppt::FocusProbe::Focused) {
             self.ppt_focus_candidate = None;
             self.ppt_focus_restore_deadline = None;
@@ -483,7 +544,13 @@ impl App {
                 // Activation can be denied while PowerPoint is starting. Retry during the
                 // short verification window instead of spending the operator's click once.
                 ppt::request_focus(hwnd);
-                self.ppt_host.activate();
+                if stage_target {
+                    if let Some(video) = self.show.as_ref().and_then(Show::video) {
+                        video.player.raise();
+                    }
+                } else {
+                    self.ppt_host.activate();
+                }
             }
         } else {
             match probe {
@@ -504,16 +571,15 @@ impl App {
                 ppt::FocusProbe::Focused => {}
             }
         }
-        ctx.request_repaint_after(interval);
     }
 
     fn update_ppt_focus(&mut self, state: PptFocus) {
         if self.ppt_focus != state {
             match &state {
-                PptFocus::Lost { window } => jlog!("PowerPoint потерял фокус: {window}"),
-                PptFocus::RestoreFailed { .. } => jlog!("Не удалось восстановить фокус PowerPoint"),
+                PptFocus::Lost { window } => jlog!("Окно показа потеряло фокус: {window}"),
+                PptFocus::RestoreFailed { .. } => jlog!("Не удалось восстановить фокус окна показа"),
                 PptFocus::Ok if matches!(&self.ppt_focus, PptFocus::Lost { .. } | PptFocus::Restoring { .. } | PptFocus::RestoreFailed { .. }) => {
-                    jlog!("Фокус слайд-шоу PowerPoint восстановлен");
+                    jlog!("Фокус окна показа восстановлен");
                 }
                 _ => {}
             }
@@ -1145,6 +1211,9 @@ impl App {
                         if s.version != ours {
                             jlog!("Версия сервера {} не совпадает с этой ({ours})", if s.version.is_empty() { "старая (без номера)" } else { &s.version });
                         }
+                    }
+                    if self.remote.pdf_engine != s.pdf_engine {
+                        self.previews.clear();
                     }
                     self.remote = s;
                     self.last_show = self.remote.active.and_then(|id| self.remote.items.iter().find(|i| i.id == id)).map(|it| (it.name.clone(), self.remote.page));

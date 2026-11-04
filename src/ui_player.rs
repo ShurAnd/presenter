@@ -35,7 +35,7 @@ impl App {
                 ui.set_min_size(ui.available_size());
                 if a.tracks.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        let t = "Список плеера пуст.\nНажмите «Добавить» или перетащите сюда музыку (mp3, wav, flac, ogg, m4a, wma…) — например, фоновую музыку и фанфары.";
+                        let t = "Добавьте музыку или звуковую отбивку\nНажмите «Добавить» или перетащите аудиофайлы сюда.";
                         ui.label(RichText::new(t).color(GRAY).size(14.0));
                     });
                     return;
@@ -59,7 +59,6 @@ impl App {
                         p.rect_filled(rect, 3.0, bg);
                         p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0_f32, Color32::from_gray(0xee)));
                         let mark = if is_cur || is_ins { "▶ " } else { "" };
-                        p.text(rect.left_center() + egui::vec2(8.0, 0.0), egui::Align2::LEFT_CENTER, format!("{mark}{}. {}", n + 1, t.name), egui::FontId::proportional(14.0), Color32::from_gray(0x22));
                         let info = if is_ins {
                             Some((format!("вставка {}", audio_time(a.insert_pos, a.insert_dur)), INSERT))
                         } else if is_cur {
@@ -73,9 +72,18 @@ impl App {
                         } else {
                             None
                         };
+                        let status_width = if info.is_some() { (rect.width() * 0.38).min(260.0) } else { 0.0 };
+                        let title_rect = egui::Rect::from_min_max(
+                            rect.left_top() + egui::vec2(8.0, 0.0),
+                            egui::pos2(rect.right() - status_width - 18.0, rect.bottom()));
+                        row_label(p, title_rect, &format!("{mark}{}. {}", n + 1, t.name), 14.0, Color32::from_gray(0x22), false);
                         if let Some((text, color)) = info {
-                            p.text(rect.right_center() - egui::vec2(8.0, 0.0), egui::Align2::RIGHT_CENTER, text, egui::FontId::proportional(12.0), color);
+                            let status_rect = egui::Rect::from_min_max(
+                                egui::pos2(rect.right() - status_width - 8.0, rect.top()),
+                                rect.right_bottom() - egui::vec2(8.0, 0.0));
+                            row_label(p, status_rect, &text, 12.0, color, true);
                         }
+                        let resp = resp.on_hover_text(&t.name);
                         if resp.clicked() {
                             self.audio_selected = Some(t.id);
                         }

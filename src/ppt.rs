@@ -193,7 +193,7 @@ fn diagnose_slideshow_windows(expected_pid: u32) {
 
 #[cfg(test)]
 mod slideshow_handle_tests {
-    use super::unique_slideshow_window;
+    use super::{unique_slideshow_window, unique_stage_window, STAGE_TITLE};
 
     fn window(hwnd: isize, pid: u32, class: &str, title: &str) -> (isize, u32, String, String) {
         (hwnd, pid, class.into(), title.into())
@@ -241,6 +241,29 @@ mod slideshow_handle_tests {
         assert_eq!(unique_slideshow_window(42, "deck.pptx", &[
             show, window(31, 42, "PPTFrameClass", "Демонстрация PowerPoint - [deck.pptx] - PowerPoint")
         ]), 0);
+    }
+
+    #[test]
+    fn stage17_stage_z_order_targets_only_the_current_process() {
+        let windows = vec![
+            (11, 100, STAGE_TITLE.into()),
+            (22, 200, STAGE_TITLE.into()),
+            (33, 100, "Presentator v2.5.1".into()),
+        ];
+        assert_eq!(unique_stage_window(200, &windows), 22);
+        assert_eq!(unique_stage_window(100, &windows), 11);
+        assert_eq!(unique_stage_window(300, &windows), 0);
+        assert_eq!(unique_stage_window(0, &windows), 0);
+    }
+
+    #[test]
+    fn stage17_stage_z_order_ignores_ambiguous_duplicate_windows() {
+        let windows = vec![
+            (11, 100, STAGE_TITLE.into()),
+            (12, 100, STAGE_TITLE.into()),
+        ];
+        assert_eq!(unique_stage_window(100, &windows), 0);
+        assert_eq!(unique_stage_window(100, &[(0, 100, STAGE_TITLE.into())]), 0);
     }
 }
 
@@ -302,14 +325,23 @@ pub fn request_focus(slideshow: isize) {
 /// Заголовок окна сцены — по нему мост находит её, чтобы положить прямо под слайд-шоу.
 pub const STAGE_TITLE: &str = "Presentator — сцена";
 
+#[cfg(any(windows, test))]
+fn unique_stage_window(pid: u32, windows: &[(isize, u32, String)]) -> isize {
+    if pid == 0 { return 0; }
+    let mut matching = windows.iter().filter(|(hwnd, owner, title)|
+        *hwnd != 0 && *owner == pid && title == STAGE_TITLE
+    );
+    let first = matching.next().map_or(0, |window| window.0);
+    if matching.next().is_some() { 0 } else { first }
+}
+
 /// Сцена «поверх всех окон» или обычное окно — напрямую через Windows. Команда уровня окна
 /// через egui/winit после первого показа PowerPoint повторно не срабатывала, и следующее
 /// слайд-шоу появлялось поверх фона ещё во время загрузки.
 pub fn stage_topmost(on: bool) {
     #[cfg(windows)]
     unsafe {
-        let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
-        let stage = FindWindowW(std::ptr::null(), title.as_ptr());
+        let stage = own_stage_window();
         // Уже в нужном состоянии — ничего не делаем (вызывается на каждой перерисовке сцены).
         let topmost = stage != 0 && GetWindowLongW(stage, -20) & 0x8 != 0; // GWL_EXSTYLE, WS_EX_TOPMOST
         if stage != 0 && topmost != on {
@@ -1495,3 +1527,32 @@ mod flow_tests;
 #[cfg(all(test, windows))]
 #[path = "ppt_stage12_native_tests.rs"]
 mod stage12_native_tests;
+
+/// HWND сцены только текущего экземпляра приложения.
+#[cfg(windows)]
+pub(crate) fn own_stage_window() -> isize {
+    unsafe {
+        // Несколько экземпляров Presentator на одном ПК создают окна с одинаковым заголовком.
+        // FindWindowW может вернуть сцену другой копии и оставить нашу поверх видео.
+        struct Search { pid: u32, windows: Vec<(isize, u32, String)> }
+        unsafe extern "system" fn collect(hwnd: isize, data: isize) -> i32 {
+            let search = &mut *(data as *mut Search);
+            let mut owner = 0;
+            if GetWindowThreadProcessId(hwnd, &mut owner) != 0 && owner == search.pid {
+                let mut title = [0u16; 256];
+                let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32);
+                if n > 0 {
+                    search.windows.push((hwnd, owner, String::from_utf16_lossy(&title[..n as usize])));
+                }
+            }
+            1
+        }
+        let mut search = Search { pid: std::process::id(), windows: Vec::new() };
+        if EnumWindows(collect, &mut search as *mut Search as isize) == 0 { return 0; }
+        unique_stage_window(search.pid, &search.windows)
+
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn own_stage_window() -> isize { 0 }

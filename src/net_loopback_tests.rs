@@ -948,3 +948,48 @@ async fn stage11_oversize_background_upload_does_not_publish_background_event() 
     assert!(server.events.try_recv().is_err(), "bad background must not be applied");
     ws.close(None).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage19_loopback_focus_and_pdf_settings_roundtrip() {
+    let server = Sandbox::new().await;
+    let mut ws = server.connect(false).await;
+    assert!(matches!(server.event().await, SrvEvent::Hello { .. }));
+    expect_clients(server.event().await, 1);
+
+    for focus in [
+        PptFocus::Lost { window: "Server Office".into() },
+        PptFocus::Restoring { window: "Server Office".into() },
+        PptFocus::RestoreFailed { window: "Server Office".into() },
+        PptFocus::Ok,
+    ] {
+        let state = StateMsg {
+            active: Some(55), ppt_focus: focus.clone(),
+            pdf_engine: Some("hayro".into()),
+            pdf_engine_error: Some("server PDFium unavailable".into()),
+            ..Default::default()
+        };
+        server.state.send_replace(serde_json::to_string(&S2C::State { state }).unwrap());
+        match next_reply(&mut ws).await {
+            S2C::State { state } => {
+                assert_eq!(state.ppt_focus, focus);
+                assert_eq!(state.pdf_engine.as_deref(), Some("hayro"));
+                assert_eq!(state.pdf_engine_error.as_deref(), Some("server PDFium unavailable"));
+            }
+            _ => panic!("expected server state"),
+        }
+    }
+    ws.send(js(&C2S::Cmd { cmd: Cmd::RestoreFocus })).await.unwrap();
+    assert!(matches!(server.event().await, SrvEvent::Cmd(Cmd::RestoreFocus)));
+    ws.send(js(&C2S::Cmd { cmd: Cmd::SetPdfEngine { engine: "pdfium".into() } })).await.unwrap();
+    assert!(matches!(server.event().await,
+        SrvEvent::Cmd(Cmd::SetPdfEngine { engine }) if engine == "pdfium"));
+    ws.close(None).await.unwrap();
+}
+
+#[test]
+fn stage19_older_server_state_has_no_remote_pdf_capability() {
+    let state: StateMsg = serde_json::from_str(r#"{"active":7}"#).unwrap();
+    assert_eq!(state.pdf_engine, None);
+    assert_eq!(state.pdf_engine_error, None);
+    assert_eq!(state.ppt_focus, PptFocus::Unknown);
+}

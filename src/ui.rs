@@ -160,12 +160,24 @@ pub(crate) fn now_playing(a: &AudioInfo) -> Option<(String, Color32)> {
     }
 }
 
+/// Single-line row text with ellipsis and a strict clipping boundary.
+pub(crate) fn row_label(painter: &egui::Painter, rect: egui::Rect, text: &str, size: f32, color: Color32, right: bool) {
+    if rect.width() <= 0.0 { return; }
+    let mut job = egui::text::LayoutJob::simple(text.into(), egui::FontId::proportional(size), color, rect.width());
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    let galley = painter.layout_job(job);
+    let x = if right { rect.right() - galley.size().x } else { rect.left() };
+    let position = egui::pos2(x, rect.center().y - galley.size().y / 2.0);
+    painter.with_clip_rect(painter.clip_rect().intersect(rect)).galley(position, galley, color);
+}
+
 /// Состояние видео для строки списка и нижней панели.
 pub(crate) fn video_label(v: &VideoInfo) -> (String, Color32) {
     let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
     match v.state {
         VideoState::Loading => ("видео загружается…".into(), GRAY),
-        VideoState::Armed => ("готово к запуску — пробел или «Старт»".into(), GREEN),
+        VideoState::Armed => ("готово к запуску".into(), GREEN),
         VideoState::Playing => (format!("▶ {} / {}", t(v.pos), t(v.dur)), GREEN),
         VideoState::Paused => (format!("пауза {} / {}", t(v.pos), t(v.dur)), BLUE),
     }
@@ -415,9 +427,9 @@ impl App {
                 let (level, rows) = self.health_rows();
                 let who = if self.connected {
                     let name = self.cfg.name.trim();
-                    if name.is_empty() { format!("Сервер {}", self.cfg.ip.trim()) } else { format!("Сервер «{name}»") }
+                    if name.is_empty() { format!("Оператор → {}", self.cfg.ip.trim()) } else { format!("Оператор → {name}") }
                 } else {
-                    format!("Этот сервер ({} кл.)", self.clients)
+                    format!("Сервер показа ({} кл.)", self.clients)
                 };
                 let state = match (level, rows.is_empty()) {
                     (_, true) => "нет данных",
@@ -438,6 +450,7 @@ impl App {
                 indicator(ui, OFF, "Клиент: не подключен");
             }
 
+            if !matches!(self.tab, Tab::List | Tab::Player) { return; }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // На вкладке «Плеер» кнопки работают со списком плеера.
                 let player = self.tab == Tab::Player;
@@ -467,25 +480,27 @@ impl App {
 
     /// Статус и команда восстановления фокуса видны оператору для удалённого показа.
     pub(crate) fn ppt_focus_bar(&mut self, ctx: &egui::Context, view: &StateMsg) {
-        // Когда презентация закрыта, эта строка не занимает место.
-        if view.active.is_none() { return; }
-        let stage_active = view.active.and_then(|id| view.items.iter().find(|item| item.id == id))
-            .is_some_and(|item| item.kind.eq_ignore_ascii_case("PDF") || item.kind == KIND_IMAGE || item.kind == "ВИДЕО");
+        if !self.connected || view.active.is_none() { return; }
         let (notice, window, can_restore, color) = match &view.ppt_focus {
             PptFocus::Lost { window } => ("Фокус сменился", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
             PptFocus::Restoring { window } => ("Возвращаем фокус…", Some(window.as_str()), false, Color32::from_rgb(255, 240, 210)),
             PptFocus::RestoreFailed { window } => ("Фокус не восстановлен", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
-            _ => ("С фокусом всё в порядке", None, false, Color32::from_rgb(220, 242, 220)),
+            PptFocus::Ok => ("С фокусом всё в порядке", None, false, Color32::from_rgb(220, 242, 220)),
+            PptFocus::Unknown => ("Фокус пока не определён", None, true, Color32::from_gray(235)),
         };
         egui::TopBottomPanel::top("ppt_focus_status")
+            .exact_height(36.0)
             .frame(egui::Frame::new().fill(color).inner_margin(egui::Margin::symmetric(8, 3)))
             .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new(notice).size(15.0).strong());
-                    if let Some(window) = window {
-                        ui.label(RichText::new(format!("Активно: {window}")).size(15.0));
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center)
+                    .with_main_align(egui::Align::Center), |ui| {
+                    let response = ui.label(notice);
+                    response.on_hover_text(window.map_or_else(
+                        || "Состояние фокуса на презентационном компьютере".to_owned(),
+                        |title| format!("Активное окно на презентационном компьютере: {title}")));
+                    if can_restore || matches!(view.ppt_focus, PptFocus::Restoring { .. }) {
                         if ui.add_enabled(can_restore, cbutton("Фокус", BLUE)).clicked() {
-                            self.act(if stage_active { Cmd::RestoreStageFocus } else { Cmd::RestorePptFocus });
+                            self.act(Cmd::RestoreFocus);
                         }
                     }
                 });
@@ -494,7 +509,26 @@ impl App {
 
     pub(crate) fn bottom_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         let active = view.active.is_some();
-        ui.horizontal(|ui| {
+        // Status gets its own full-width row; it cannot grow backwards into buttons.
+        let (summary, color) = if let Some(video) = &view.video {
+            let (text, color) = video_label(video);
+            (format!("Видео · {text}"), color)
+        } else if view.active.and_then(|id| view.items.iter().find(|item| item.id == id))
+            .is_some_and(|item| item.kind == KIND_IMAGE) {
+            ("Изображение на экране".into(), GREEN)
+        } else if active {
+            if !self.goto_buf.is_empty() {
+                (format!("К слайду {} — Enter", self.goto_buf), GREEN)
+            } else {
+                let zoom = if view.zoom > 1.0 { format!(" · {:.0} %", view.zoom * 100.0) } else { String::new() };
+                (format!("Слайд {} из {}{zoom}", view.page + 1, view.pages), Color32::from_gray(0x33))
+            }
+        } else {
+            ("Показ не запущен".into(), GRAY)
+        };
+        ui.add(egui::Label::new(RichText::new(&summary).color(color)).truncate())
+            .on_hover_text(format!("{summary}\nПробел — старт или пауза видео; стрелки — управление показом."));
+        ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(active, cbutton("◀ Назад", BLUE)).clicked() {
                 self.act(Cmd::Prev);
             }
@@ -508,9 +542,9 @@ impl App {
             if let Some(v) = &view.video {
                 let (t, c) = match v.state {
                     VideoState::Loading => ("Подготовка…", GRAY),
-                    VideoState::Armed => ("▶ Старт", GREEN),
-                    VideoState::Playing => ("⏸ Пауза", BLUE),
-                    VideoState::Paused => ("▶ Продолжить", GREEN),
+                    VideoState::Armed => ("▶ Старт видео", GREEN),
+                    VideoState::Playing => ("⏸ Пауза видео", BLUE),
+                    VideoState::Paused => ("▶ Продолжить видео", GREEN),
                 };
                 if ui.add_enabled(v.state != VideoState::Loading, cbutton(t, c)).on_hover_text("Пробел").clicked() {
                     self.act(Cmd::Play);
@@ -525,75 +559,47 @@ impl App {
                     self.confirm = Some((format!("Удалить «{name}» из списка? Файл удалится и на сервере."), "Удалить", Cmd::Remove { id }));
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if let Some(v) = &view.video {
-                    let (t, c) = video_label(v);
-                    ui.label(RichText::new(t).strong().size(15.0).color(c));
-                } else if active {
-                    if !self.goto_buf.is_empty() {
-                        // Номер, набранный с клавиатуры, — подсказка оператору (на экране показа его не видно).
-                        ui.label(RichText::new(format!("К слайду {} — Enter", self.goto_buf)).strong().size(15.0).color(GREEN));
-                    } else {
-                        let zoom = if view.zoom > 1.0 { format!(" · {:.0} %", view.zoom * 100.0) } else { String::new() };
-                        ui.label(RichText::new(format!("Слайд {} из {}{zoom}", view.page + 1, view.pages)).strong().size(15.0));
-                    }
-                } else {
-                    ui.label(RichText::new("Показ не запущен").color(GRAY));
-                }
-            });
         });
-        let text = self.status.clone();
-        // Справа экран сервера (фон, часы, таймер) и переход к слайду по номеру, слева — «Справка»
-        // и строка состояния в оставшееся место (обрезается, а не наезжает на кнопки).
-        ui.horizontal(|ui| ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            // Справа налево. Текущий экран сервера (когда показа нет) подсвечен.
-            let screens = [
-                (Screen::Timer, Cmd::Timer, "Таймер", "Закрыть показ и вывести на экран сервера таймер"),
-                (Screen::Clock, Cmd::Clock, "Часы", "Закрыть показ и вывести на экран сервера часы"),
-                (Screen::Background, Cmd::Background, "Фон", "Закрыть показ и вывести на экран сервера фон"),
-            ];
-            for (scr, cmd, label, tip) in screens {
-                let on = !active && view.screen == scr;
-                let tip = if scr == Screen::Background { format!("{tip}. Правый щелчок — выбрать картинку фона") } else { tip.to_string() };
-                let r = btn(ui, label, if on { BLUE } else { GRAY }).on_hover_text(tip);
-                if r.clicked() {
-                    self.act(cmd);
-                }
-                if scr == Screen::Background {
-                    r.context_menu(|ui| self.background_menu(ui, &view.background));
+        ui.horizontal_wrapped(|ui| {
+            for (screen, command, label) in [
+                (Screen::Background, Cmd::Background, "Фон"),
+                (Screen::Clock, Cmd::Clock, "Часы"),
+                (Screen::Timer, Cmd::Timer, "Таймер"),
+            ] {
+                let selected = !active && view.screen == screen;
+                let response = btn(ui, label, if selected { BLUE } else { GRAY })
+                    .on_hover_text("Закрыть текущий показ и вывести выбранный экран на компьютере показа");
+                if response.clicked() { self.act(command); }
+                if screen == Screen::Background {
+                    response.context_menu(|ui| self.background_menu(ui, &view.background));
                 }
             }
             if active && view.video.is_none() {
-                ui.add_space(10.0);
-                let go = btn(ui, "Перейти", BLUE).on_hover_text("Перейти к слайду с этим номером");
-                let field = ui.add(egui::TextEdit::singleline(&mut self.goto_field).hint_text("№").desired_width(44.0));
-                ui.label("Слайд №");
-                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                self.goto_field.retain(|c| c.is_ascii_digit());
-                if go.clicked() || enter {
-                    let n = std::mem::take(&mut self.goto_field);
-                    self.goto_number(&n, view);
-                }
+                ui.horizontal(|ui| {
+                    ui.label("Слайд №");
+                    let field = ui.add(egui::TextEdit::singleline(&mut self.goto_field).hint_text("№").desired_width(44.0));
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    self.goto_field.retain(|c| c.is_ascii_digit());
+                    if btn(ui, "Перейти", BLUE).clicked() || enter {
+                        let number = std::mem::take(&mut self.goto_field);
+                        self.goto_number(&number, view);
+                    }
+                });
             }
-            ui.add_space(6.0);
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                if btn(ui, "Справка", GRAY).on_hover_text("Что где нажимать: клавиши, экраны сервера, превью, сеть").clicked() {
-                    self.help_open = !self.help_open;
-                }
-                let mut cursor = view.cursor;
-                if ui
-                    .checkbox(&mut cursor, "Показать курсор")
-                    .on_hover_text("Курсор мыши на экране показа виден, пока мышь двигают (через 3 с покоя прячется). Например, чтобы щёлкнуть по видео в слайде PowerPoint. После перезапуска программы — снова выключено")
-                    .changed()
-                {
-                    self.act(Cmd::Cursor { on: cursor });
-                }
-                ui.add(egui::Label::new(RichText::new(&text).size(11.5).color(Color32::from_gray(0x66))).truncate());
-            });
-        }));
-        if !active && view.screen == Screen::Timer {
-            self.timer_bar(ui, view);
+            let mut cursor = view.cursor;
+            if ui.checkbox(&mut cursor, "Показать курсор")
+                .on_hover_text("Показывать курсор при движении мыши на экране показа")
+                .changed() {
+                self.act(Cmd::Cursor { on: cursor });
+            }
+            if btn(ui, "Справка", GRAY).clicked() { self.help_open = !self.help_open; }
+        });
+        // Keep server errors and transfer progress visible without squeezing controls.
+        if !self.status.is_empty() {
+            ui.add(egui::Label::new(RichText::new(&self.status).size(11.5).color(Color32::from_gray(0x66))).truncate())
+                .on_hover_text(&self.status);
         }
+        if !active && view.screen == Screen::Timer { self.timer_bar(ui, view); }
     }
 
     /// Управление таймером — пока на экране сервера таймер.
@@ -733,9 +739,9 @@ impl App {
                 if view.items.is_empty() {
                     ui.centered_and_justified(|ui| {
                         let t = if self.connected {
-                            "Список сервера пуст.\nНажмите «Добавить» или перетащите сюда PDF / PPTX — файлы уйдут на сервер."
+                            "Список сервера пуст.\nНажмите «Добавить» или перетащите сюда PDF, PowerPoint, видео или изображения — файлы уйдут на сервер."
                         } else {
-                            "Список пуст.\nНажмите «Добавить» или перетащите сюда файлы PDF / PPTX."
+                            "Список пуст.\nНажмите «Добавить» или перетащите сюда PDF, PowerPoint, видео или изображения."
                         };
                         ui.label(RichText::new(t).color(GRAY).size(14.0));
                     });
@@ -759,13 +765,6 @@ impl App {
                         p.rect_filled(rect, 3.0, bg);
                         p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0_f32, Color32::from_gray(0xee)));
                         let mark = if is_active { "▶ " } else { "" };
-                        p.text(
-                            rect.left_center() + egui::vec2(8.0, 0.0),
-                            egui::Align2::LEFT_CENTER,
-                            format!("{mark}{}. {}", n + 1, it.name),
-                            egui::FontId::proportional(14.0),
-                            Color32::from_gray(0x22),
-                        );
                         let (info, col) = if !it.status.is_empty() {
                             (it.status.clone(), if it.ready || it.status.starts_with("обработка") { GRAY } else { RED })
                         } else if let Some(v) = view.video.as_ref().filter(|_| is_active) {
@@ -784,11 +783,17 @@ impl App {
                         } else {
                             (format!("{info} · видео по ссылке: {}", it.linked.len()), INSERT)
                         };
-                        let info: String = if info.chars().count() > 60 { info.chars().take(60).chain("…".chars()).collect() } else { info };
-                        // У видео справа — значок повтора; текст состояния сдвигается левее.
                         let is_video = it.kind == "ВИДЕО";
                         let right = if is_video { 44.0 } else { 8.0 };
-                        p.text(rect.right_center() - egui::vec2(right, 0.0), egui::Align2::RIGHT_CENTER, info, egui::FontId::proportional(12.0), col);
+                        let status_width = (rect.width() * 0.38).min(260.0);
+                        let status_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.right() - right - status_width, rect.top()),
+                            egui::pos2(rect.right() - right, rect.bottom()));
+                        let title_rect = egui::Rect::from_min_max(
+                            rect.left_top() + egui::vec2(8.0, 0.0),
+                            egui::pos2(status_rect.left() - 10.0, rect.bottom()));
+                        row_label(p, title_rect, &format!("{mark}{}. {}", n + 1, it.name), 14.0, Color32::from_gray(0x22), false);
+                        row_label(p, status_rect, &info, 12.0, col, true);
                         if is_video {
                             let r = egui::Rect::from_center_size(rect.right_center() - egui::vec2(22.0, 0.0), egui::vec2(28.0, 22.0));
                             let icon = ui.interact(r, ui.id().with(("repeat", it.id)), egui::Sense::click());
@@ -798,6 +803,7 @@ impl App {
                                 self.act(Cmd::VideoRepeat { id: it.id, on: !it.repeat });
                             }
                         }
+                        let resp = resp.on_hover_text(&it.name);
                         let resp = if !it.status.is_empty() {
                             resp.on_hover_text(&it.status)
                         } else if !it.linked.is_empty() {

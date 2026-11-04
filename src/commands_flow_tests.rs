@@ -322,14 +322,16 @@ fn command_restore_stage_focus_requests_focus_for_active_pdf_without_reopening_i
 }
 
 #[test]
-fn command_restore_stage_focus_rejects_non_pdf_show() {
+fn command_restore_stage_focus_accepts_video_without_restarting_playback() {
     let mut a = test_app();
     stage8_video(&mut a, 902);
     a.stage_sent = Some((true, true));
+    let generation = a.show_gen;
     a.apply(Cmd::RestoreStageFocus);
-    assert!(a.status.contains("PDF не готов"));
-    assert_eq!(a.stage_sent, Some((true, true)));
-    assert_eq!(a.ppt_focus, PptFocus::Unknown);
+    assert!(a.stage_sent.is_none());
+    assert!(matches!(a.ppt_focus, PptFocus::Restoring { .. }));
+    assert_eq!(a.show_gen, generation);
+    assert_eq!(a.show.as_ref().unwrap().id, 902);
 }
 
 #[test]
@@ -2538,4 +2540,160 @@ fn stage9_scene_displays_loaded_image_presentation() {
     });
     stage9_scene_frame(&mut a);
     assert_eq!(a.show.as_ref().map(|s| s.id), Some(913));
+}
+
+
+#[test]
+fn stage19_focus_loss_and_recovery_cover_pdf_video_and_image() {
+    for kind in ["PDF", "VIDEO", "IMAGE"] {
+        let mut a = test_app();
+        open_pdf(&mut a, 991, 4);
+        if kind == "VIDEO" { stage8_video(&mut a, 991); }
+        if kind == "IMAGE" { a.show.as_mut().unwrap().kind = ShowKind::Image(None); }
+        assert!(a.show_uses_stage_focus());
+        let now = Instant::now();
+        a.handle_focus_probe(ppt::FocusProbe::Focused, now, 0, true);
+        assert_eq!(a.local_state().ppt_focus, PptFocus::Ok);
+        for _ in 0..2 {
+            a.handle_focus_probe(ppt::FocusProbe::Away { hwnd: 123, title: "Office".into() }, now, 0, true);
+        }
+        assert_eq!(a.local_state().ppt_focus, PptFocus::Lost { window: "Office".into() });
+        a.apply(Cmd::RestoreFocus);
+        assert!(matches!(a.local_state().ppt_focus, PptFocus::Restoring { .. }));
+        a.handle_focus_probe(ppt::FocusProbe::Focused, now, 0, true);
+        assert_eq!(a.local_state().ppt_focus, PptFocus::Ok);
+        assert!(a.ppt_focus_restore_deadline.is_none());
+    }
+}
+
+#[test]
+fn stage19_restore_timeout_is_reported_and_unknown_is_not_ok() {
+    let mut a = test_app();
+    open_pdf(&mut a, 992, 3);
+    a.apply(Cmd::RestoreFocus);
+    a.handle_focus_probe(ppt::FocusProbe::Unknown, Instant::now() + Duration::from_secs(3), 0, true);
+    assert!(matches!(a.local_state().ppt_focus, PptFocus::RestoreFailed { .. }));
+    a.handle_focus_probe(ppt::FocusProbe::Unknown, Instant::now(), 0, true);
+    assert_eq!(a.local_state().ppt_focus, PptFocus::Unknown);
+}
+
+#[test]
+fn stage19_operator_focus_poll_preserves_remote_server_state() {
+    let mut a = test_app();
+    a.connected = true;
+    a.remote.active = Some(993);
+    a.remote.ppt_focus = PptFocus::Lost { window: "Server Office".into() };
+    a.ppt_focus = PptFocus::Ok;
+    let ctx = a.ctx.clone();
+    a.tick_ppt_focus(&ctx);
+    assert_eq!(a.view().ppt_focus, PptFocus::Lost { window: "Server Office".into() });
+    a.act(Cmd::RestoreFocus); // absent client must never dispatch locally
+    assert_eq!(a.ppt_focus, PptFocus::Ok);
+}
+
+#[test]
+fn stage19_pdf_engine_invalid_request_keeps_server_renderer() {
+    let mut a = test_app();
+    let before = a.local_state().pdf_engine;
+    a.apply(Cmd::SetPdfEngine { engine: "invalid".into() });
+    assert_eq!(a.local_state().pdf_engine, before);
+    assert!(a.local_state().message.contains("Неизвестный PDF-движок"));
+    assert!(a.dirty);
+}
+
+#[test]
+fn stage19_operator_pdf_setting_does_not_change_local_renderer() {
+    let mut a = test_app();
+    a.connected = true;
+    a.remote.pdf_engine = Some("pdfium".into());
+    a.act(Cmd::SetPdfEngine { engine: "pdfium".into() });
+    assert_eq!(a.renderer.engine(), render::PdfEngine::Hayro);
+    assert_eq!(a.cfg.pdf_engine, "hayro");
+    assert_eq!(a.view().pdf_engine.as_deref(), Some("pdfium"));
+}
+
+#[test]
+fn stage19_pdf_engine_change_publishes_actual_result_and_preserves_show() {
+    let mut a = test_app();
+    open_pdf(&mut a, 994, 4);
+    let generation = a.show_gen;
+    a.apply(Cmd::SetPdfEngine { engine: "pdfium".into() });
+    let state = a.local_state();
+    assert_eq!(state.pdf_engine.as_deref(), Some(a.renderer.engine().as_str()));
+    assert_eq!(state.active, Some(994));
+    assert_eq!(a.show_gen, generation);
+    if a.renderer.pdfium_error().is_some() {
+        assert_eq!(a.renderer.engine(), render::PdfEngine::Hayro);
+        assert_eq!(a.cfg.pdf_engine, "hayro");
+        assert!(state.message.contains("PDFium недоступен"));
+    } else {
+        assert_eq!(a.renderer.engine(), render::PdfEngine::Pdfium);
+        assert_eq!(a.cfg.pdf_engine, "pdfium");
+    }
+}
+
+fn stage20_text_rects(shape: &egui::epaint::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    match shape {
+        egui::epaint::Shape::Text(text) => out.push((
+            text.galley.job.text.clone(),
+            egui::Rect::from_min_size(text.pos, text.galley.size()),
+        )),
+        egui::epaint::Shape::Vec(shapes) => {
+            for shape in shapes { stage20_text_rects(shape, out); }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn stage20_video_status_never_overlaps_controls_at_narrow_widths() {
+    for width in [520.0, 750.0, 1000.0] {
+        for state in [VideoState::Loading, VideoState::Armed, VideoState::Playing, VideoState::Paused] {
+            let mut app = test_app();
+            let ctx = app.ctx.clone();
+            let mut view = stage7_remote_pdf(0, 1);
+            view.video = Some(VideoInfo { state, pos: 61, dur: 125 });
+            app.status = "Длинное сообщение о состоянии сервера ".repeat(10);
+            app.selected = Some(10);
+            let mut output = Vec::new();
+            for _ in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 650.0))),
+                    ..Default::default()
+                };
+                let frame = ctx.run(input, |ctx| {
+                    egui::TopBottomPanel::bottom("stage20_bottom").show(ctx, |ui| {
+                        app.bottom_bar(ui, &view);
+                    });
+                });
+                output.clear();
+                for shape in &frame.shapes { stage20_text_rects(&shape.shape, &mut output); }
+            }
+            let (_, status_rect) = output.iter().find(|(text, _)| text.starts_with("Видео · "))
+                .expect("video status must remain visible");
+            for label in ["◀ Назад", "Вперёд ▶", "▶ Показать", "■ Закрыть показ", "Удалить"] {
+                let (_, button_rect) = output.iter().find(|(text, _)| text == label)
+                    .expect("show control must remain visible");
+                assert!(!status_rect.intersects(*button_rect), "overlap at width {width}: {label}");
+                assert!(button_rect.left() >= 0.0 && button_rect.right() <= width + 1.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn stage20_long_row_text_is_single_line_and_clipped_to_its_column() {
+    let ctx = egui::Context::default();
+    let target = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(160.0, 34.0));
+    let frame = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            row_label(ui.painter(), target, &"Длинное название презентации ".repeat(20), 14.0, GRAY, false);
+        });
+    });
+    let text = frame.shapes.iter().find_map(|shape| match &shape.shape {
+        egui::epaint::Shape::Text(text) if text.galley.job.text.starts_with("Длинное") => Some((shape.clip_rect, text)),
+        _ => None,
+    }).expect("row text rendered");
+    assert_eq!(text.1.galley.rows.len(), 1);
+    assert!(text.0.left() >= target.left() && text.0.right() <= target.right());
 }

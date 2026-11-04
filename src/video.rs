@@ -5,13 +5,9 @@
 //! Видео играет в собственном окне на весь экран. При открытии окно лежит под сценой с фоном,
 //! а видео загружено и стоит на паузе — поэтому по команде «старт» оно начинается сразу.
 //! Доиграло — окно снова под сценой, видео в начале на паузе: повторный «старт» тоже сразу.
-//! Сам «старт»:
-//! окно выходит наверх и включается воспроизведение, сцена опускается прямо под него
-//! (`stage_under_video`, как с PowerPoint). Окно не забирает фокус — клавиши по-прежнему ловит сцена.
-//!
-//! Через «поверх всех» (HWND_TOPMOST) окно видео не поднимаем: на части компьютеров Windows молча
-//! не пускает его в этот слой (найдено 11.10.2026 — звук идёт, а на экране фон; та же картина и у
-//! версии 1.0.4), хотя обычное окно с теми же стилями туда пускает. Обычный HWND_TOP работает везде.
+//! При старте и повторе поток проигрывателя поднимает окно текущего видео.
+//! Окно видео не забирает фокус: клавиатура по-прежнему управляет сценой.
+
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +33,7 @@ pub enum VideoEvent {
 
 enum VCmd {
     Start,
+    Raise,
     Repeat(bool),
     Toggle,
     Seek(f64),
@@ -85,6 +82,11 @@ impl Video {
         self.send(VCmd::Start);
     }
 
+    /// Raise the active video after the operator restores keyboard focus to the stage.
+    pub fn raise(&self) {
+        self.send(VCmd::Raise);
+    }
+
     /// Повтор по кругу: включить или выключить (можно и во время воспроизведения).
     pub fn set_repeat(&self, on: bool) {
         self.send(VCmd::Repeat(on));
@@ -103,14 +105,6 @@ impl Video {
     pub fn seek_to(&self, secs: f64) {
         self.send(VCmd::SeekTo(secs));
     }
-}
-
-/// Пока видео идёт: окно видео наверху, сцена прямо под ним (см. `win::stage_under_video`).
-pub fn stage_under_video(stage_title: &str) {
-    #[cfg(windows)]
-    win::stage_under_video(stage_title);
-    #[cfg(not(windows))]
-    let _ = stage_title;
 }
 
 impl Drop for Video {
@@ -374,20 +368,84 @@ mod win {
 
     // ------------------------------------------------------------ окно и цикл
 
-    /// Пока видео идёт: окно видео наверху, сцена прямо под ним. Вызывается из GUI на каждой
-    /// перерисовке сцены; если порядок уже такой — ничего не делает.
-    pub fn stage_under_video(stage_title: &str) {
-        unsafe {
-            let Ok(video) = FindWindowW(w!("PresentatorVideo"), PCWSTR::null()) else { return };
-            let Ok(stage) = FindWindowW(PCWSTR::null(), &HSTRING::from(stage_title)) else { return };
-            if GetWindow(video, GW_HWNDNEXT).ok() == Some(stage) {
+    /// Video uses the normal window band. TOPMOST is unreliable with the embedded renderer.
+    unsafe fn raise_playing_window(hwnd: HWND) {
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+        if let Err(error) = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags) {
+            eprintln!("VIDEO Z-ORDER: cannot raise active video: {error}");
+        }
+        keep_stage_below_video(HWND(crate::ppt::own_stage_window() as *mut _), hwnd);
+    }
+
+    /// Only repair a reversed pair. Never raise the background above the video first.
+    /// Inserting a topmost stage after a normal video also removes the stage's TOPMOST flag.
+    unsafe fn keep_stage_below_video(stage: HWND, video: HWND) {
+        if stage.is_invalid() || !IsWindow(stage).as_bool() {
+            return;
+        }
+        let mut above = GetWindow(video, GW_HWNDPREV).unwrap_or_default();
+        // Bound the walk because another process may reorder windows concurrently.
+        for _ in 0..4096 {
+            if above.is_invalid() {
                 return;
             }
-            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            // Keep playback in the topmost band, with the stage directly beneath it.
-            let _ = SetWindowPos(video, HWND_TOPMOST, 0, 0, 0, 0, flags);
-            let _ = SetWindowPos(stage, HWND_TOPMOST, 0, 0, 0, 0, flags);
-            let _ = SetWindowPos(stage, video, 0, 0, 0, 0, flags);
+            if above == stage {
+                let result = SetWindowPos(stage, video, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                if let Err(error) = result {
+                    eprintln!("VIDEO Z-ORDER: cannot place stage below video: {error}");
+                }
+                return;
+            }
+            above = GetWindow(above, GW_HWNDPREV).unwrap_or_default();
+        }
+    }
+
+    #[cfg(test)]
+    mod layer_tests {
+        use super::*;
+
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe { let _ = DestroyWindow(self.0); }
+            }
+        }
+
+        #[test]
+        #[ignore = "requires Windows interactive session and PRESENTATOR_STAGE12_NATIVE=I_UNDERSTAND"]
+        fn stage18_native_video_stays_above_stage_and_loop_spare() {
+            assert_eq!(std::env::var("PRESENTATOR_STAGE12_NATIVE").ok().as_deref(),
+                Some("I_UNDERSTAND"));
+            unsafe {
+                let rect = Some((-3500, -3500, 160, 90));
+                let stage = TestWindow(create_window(false, rect).unwrap());
+                let first = TestWindow(create_window(false, rect).unwrap());
+                let spare = TestWindow(create_window(false, rect).unwrap());
+                let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+                SetWindowPos(first.0, HWND_TOP, 0, 0, 0, 0, flags).unwrap();
+                SetWindowPos(stage.0, HWND_TOPMOST, 0, 0, 0, 0, flags).unwrap();
+                keep_stage_below_video(stage.0, first.0);
+                assert_eq!(GetWindow(stage.0, GW_HWNDPREV).unwrap(), first.0);
+                assert_eq!(GetWindowLongW(stage.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0, 0);
+
+                // Delayed GUI activation covers the video again.
+                SetWindowPos(stage.0, HWND_TOP, 0, 0, 0, 0, flags).unwrap();
+                keep_stage_below_video(stage.0, first.0);
+                assert_eq!(GetWindow(stage.0, GW_HWNDPREV).unwrap(), first.0);
+
+                // Loop switches to the prepared player; the old window goes down.
+                SetWindowPos(spare.0, HWND_TOP, 0, 0, 0, 0, flags).unwrap();
+                SetWindowPos(first.0, HWND_BOTTOM, 0, 0, 0, 0, flags).unwrap();
+                for _ in 0..20 {
+                    keep_stage_below_video(stage.0, spare.0);
+                    assert_eq!(GetWindow(stage.0, GW_HWNDPREV).unwrap(), spare.0);
+                }
+                // End: the background can take the front again.
+                SetWindowPos(stage.0, HWND_TOPMOST, 0, 0, 0, 0, flags).unwrap();
+                SetWindowPos(spare.0, HWND_BOTTOM, 0, 0, 0, 0, flags).unwrap();
+                assert_ne!(GetWindowLongW(stage.0, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0, 0);
+            }
         }
     }
 
@@ -512,6 +570,7 @@ mod win {
     unsafe fn event_loop(mut main: Player, open_spare: &dyn Fn() -> Result<Player, String>, rx: &Receiver<VCmd>, on_event: &impl Fn(VideoEvent)) {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
         let timer = SetTimer(None, 0, TICK_MS, None);
+        let mut stage_hwnd = HWND::default();
         let (mut started, mut repeat) = (false, false);
         // Режим курсора — как выбран сейчас; меняется на лету (проверяем на каждом такте).
         let mut cursor = SHOW_CURSOR.load(Ordering::SeqCst);
@@ -533,10 +592,10 @@ mod win {
                         }
                         VCmd::Start if main.ready && !started => {
                             started = true;
-                            // Наверх, не отнимая фокус, — и сразу воспроизведение (сцену под окно видео опустит GUI).
-                            let _ = SetWindowPos(main.hwnd, HWND_TOP, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+                            raise_playing_window(main.hwnd);
                             main.engine.play();
                         }
+                        VCmd::Raise if started => raise_playing_window(main.hwnd),
                         VCmd::Toggle if started => main.engine.toggle(),
                         VCmd::Seek(d) if main.ready => main.engine.seek(d, true),
                         VCmd::SeekTo(d) if main.ready => main.engine.seek(d, false),
@@ -547,6 +606,14 @@ mod win {
             }
             if msg.hwnd.is_invalid() && msg.message == WM_TIMER && msg.wParam.0 == timer {
                 ticks += 1;
+                if started {
+                    if stage_hwnd.is_invalid() || !IsWindow(stage_hwnd).as_bool() {
+                        stage_hwnd = HWND(crate::ppt::own_stage_window() as *mut _);
+                    }
+                    // GUI focus/WindowLevel changes may arrive after Start. Repair their order
+                    // using the active player, including the spare after a loop handoff.
+                    keep_stage_below_video(stage_hwnd, main.hwnd);
+                }
                 let c = SHOW_CURSOR.load(Ordering::SeqCst);
                 if c != cursor {
                     cursor = c;
@@ -604,7 +671,7 @@ mod win {
                     match spare.take().filter(|sp| sp.ready) {
                         // Второй — наверх и играть; первый — вниз, в начало, на паузу: он следующий.
                         Some(mut next) => {
-                            let _ = SetWindowPos(next.hwnd, HWND_TOP, 0, 0, 0, 0, flags | SWP_SHOWWINDOW);
+                            raise_playing_window(next.hwnd);
                             next.engine.play();
                             let _ = SetWindowPos(main.hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
                             main.engine.rearm(LOOP_START);
@@ -622,6 +689,7 @@ mod win {
                     // Доиграло: окно — под сцену (зритель видит фон), видео — в начало на паузу.
                     // Следующий «старт» запускает его сразу, без повторной загрузки.
                     started = false;
+                    crate::ppt::stage_topmost(true);
                     let _ = SetWindowPos(main.hwnd, HWND_BOTTOM, 0, 0, 0, 0, flags);
                     main.engine.rearm(0.0);
                     last_pos = None;
