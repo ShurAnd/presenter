@@ -5,27 +5,28 @@ use super::*;
 impl App {
     pub(crate) fn network_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        egui::Frame::new().fill(Color32::from_gray(0xf5)).corner_radius(5.0).inner_margin(14.0).show(ui, |ui| {
+        ui_card().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
-            ui.label(RichText::new("🌐 Сетевое взаимодействие").size(18.0).strong());
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.label(RichText::new("Подключение к экрану показа").size(18.0).strong());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let (t, c) = if self.server.is_some() { ("■ Остановить сервер", RED) } else { ("▶ Запустить сервер", BLUE) };
                 if btn(ui, t, c).on_hover_text("Запустить или остановить сервер в этом окне").clicked() {
                     self.toggle_server(&ctx);
                 }
-                let (t, c) = if self.client.is_some() { ("🔌 Отключиться", RED) } else { ("🔌 Подключиться", GREEN) };
+                let (t, c) = if self.client.is_some() { ("Отключиться", RED) } else { ("Подключиться", BLUE) };
                 if btn(ui, t, c).on_hover_text("Подключиться к серверу и управлять им").clicked() {
                     self.toggle_client(&ctx);
                 }
             });
             ui.add_space(4.0);
-            let st = if self.net_status.is_empty() { "⚫ Подключения нет" } else { self.net_status.as_str() };
+            let st = if self.net_status.is_empty() { "Подключения нет" } else { self.net_status.as_str() };
             ui.label(RichText::new(st).size(14.0).strong());
             ui.add_space(8.0);
 
             let locked = self.server.is_some() || self.client.is_some();
-            egui::Frame::new().fill(Color32::WHITE).corner_radius(5.0).inner_margin(12.0).show(ui, |ui| {
+            egui::Frame::new().fill(UI_BG).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
                 ui.add_enabled_ui(!locked, |ui| {
                     egui::Grid::new("net").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                         // Сохранённые серверы: выбор подставляет адрес, порт, пароль и название.
@@ -59,16 +60,16 @@ impl App {
                             }
                         });
                         ui.end_row();
-                        ui.label("🏷 Название (необязательно):");
+                        ui.label("Название:");
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.name).hint_text("Например: Зал 1").desired_width(220.0));
                         ui.end_row();
-                        ui.label("📡 IP адрес сервера:");
+                        ui.label("IP адрес сервера:");
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.ip).hint_text("Например: 192.168.1.100").desired_width(220.0));
                         ui.end_row();
-                        ui.label("🔌 Порт:");
+                        ui.label("Порт:");
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.port).hint_text("14999").desired_width(90.0));
                         ui.end_row();
-                        ui.label("🔑 Пароль доступа:");
+                        ui.label("Пароль доступа:");
                         ui.add(egui::TextEdit::singleline(&mut self.cfg.password).password(true).desired_width(220.0));
                         ui.end_row();
                     });
@@ -126,6 +127,7 @@ impl App {
                 .size(12.0)
                 .color(Color32::from_gray(0x55)),
             );
+            });
         });
     }
 }

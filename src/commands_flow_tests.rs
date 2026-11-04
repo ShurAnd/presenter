@@ -822,6 +822,7 @@ fn stage_double_escape_closes_pdf_before_allowing_scene_to_hide() {
 // Each test uses the same synthetic App established by test_app().
 fn stage7_frame(app: &mut App, mut draw: impl FnMut(&mut App, &mut egui::Ui, &StateMsg)) {
     let ctx = app.ctx.clone();
+    configure_operator_style(&ctx);
     let state = app.view();
     let mut input = egui::RawInput::default();
     input.screen_rect = Some(egui::Rect::from_min_size(
@@ -2022,9 +2023,22 @@ fn stage8_ppt_focus_poll_without_valid_window_resets_focus_state() {
     let mut a = test_app(); stage8_ppt(&mut a, 7);
     a.ppt_focus = PptFocus::Lost { window: "other".into() };
     a.ppt_focus_candidate = Some(123);
-    a.ppt_focus_restore_deadline = Some(Instant::now());
+    // Без ожидания интервала метод только планирует следующий опрос.
+    a.ppt_focus_polled = Instant::now() - Duration::from_secs(1);
     let ctx = a.ctx.clone(); a.tick_ppt_focus(&ctx);
     assert!(a.ppt_focus_candidate.is_none());
+    assert_eq!(a.ppt_focus, PptFocus::Unknown);
+    assert!(a.ppt_focus_restore_deadline.is_none());
+}
+
+#[test]
+fn stage8_ppt_focus_expired_restore_reports_failure_without_valid_window() {
+    let mut a = test_app(); stage8_ppt(&mut a, 7);
+    a.ppt_focus = PptFocus::Restoring { window: "other".into() };
+    a.ppt_focus_restore_deadline = Some(Instant::now() - Duration::from_secs(1));
+    a.ppt_focus_polled = Instant::now() - Duration::from_secs(1);
+    let ctx = a.ctx.clone(); a.tick_ppt_focus(&ctx);
+    assert_eq!(a.ppt_focus, PptFocus::RestoreFailed { window: "other".into() });
     assert!(a.ppt_focus_restore_deadline.is_none());
 }
 
@@ -2427,7 +2441,8 @@ fn stage9_scene_windowed_background_keeps_scene_alive_without_native_window() {
     let mut a = test_app();
     stage9_scene_frame(&mut a);
     assert!(a.stage);
-    assert_eq!(a.stage_sent, Some((false, false)));
+    // Фон и PDF остаются поверх других окон даже в оконном режиме.
+    assert_eq!(a.stage_sent, Some((true, false)));
     assert!(a.bg_checked);
     assert!(!a.bg_shown); // no background texture was loaded
 }
@@ -2460,7 +2475,8 @@ fn stage9_scene_pdf_zoom_handles_missing_zoom_texture() {
     a.show.as_mut().unwrap().zoom = 2.5;
     stage9_scene_frame(&mut a);
     assert_eq!(a.show.as_ref().unwrap().zoom, 2.5);
-    assert_eq!(a.stage_sent, Some((false, false)));
+    // Фон и PDF остаются поверх других окон даже в оконном режиме.
+    assert_eq!(a.stage_sent, Some((true, false)));
 }
 
 #[test]
@@ -2651,6 +2667,7 @@ fn stage20_video_status_never_overlaps_controls_at_narrow_widths() {
         for state in [VideoState::Loading, VideoState::Armed, VideoState::Playing, VideoState::Paused] {
             let mut app = test_app();
             let ctx = app.ctx.clone();
+            configure_operator_style(&ctx);
             let mut view = stage7_remote_pdf(0, 1);
             view.video = Some(VideoInfo { state, pos: 61, dur: 125 });
             app.status = "Длинное сообщение о состоянии сервера ".repeat(10);
@@ -2696,4 +2713,73 @@ fn stage20_long_row_text_is_single_line_and_clipped_to_its_column() {
     }).expect("row text rendered");
     assert_eq!(text.1.galley.rows.len(), 1);
     assert!(text.0.left() >= target.left() && text.0.right() <= target.right());
+}
+
+// Редизайн: проверяем настоящую отрисовку egui без создания окон Windows.
+#[test]
+fn redesign_tabs_keep_controls_inside_standard_window() {
+    for tab in [Tab::List, Tab::Player, Tab::Net, Tab::Settings] {
+        let mut app = test_app();
+        app.tab = tab;
+        app.connected = true;
+        app.remote = stage7_remote_pdf(0, 3);
+        app.remote.items[0].name = "Очень длинное название презентации ".repeat(20);
+        app.cfg.name = "Очень длинное название сервера ".repeat(20);
+        app.selected = Some(10);
+        let ctx = app.ctx.clone();
+        configure_operator_style(&ctx);
+        let before = serde_json::to_string(&app.remote).unwrap();
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let view = app.view();
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(750.0, 650.0))),
+                ..Default::default()
+            }, |ctx| {
+                egui::TopBottomPanel::top("redesign_top").show(ctx, |ui| app.top_bar(ui, &view));
+                egui::TopBottomPanel::bottom("redesign_bottom").show(ctx, |ui| app.bottom_bar(ui, &view));
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.tab_row(ui, &view);
+                    match tab {
+                        Tab::List => app.list(ui, &view),
+                        Tab::Player => app.player_panel(ui, &view),
+                        Tab::Net => app.network_panel(ui),
+                        Tab::Settings => app.settings_panel(ui),
+                    }
+                });
+            });
+            texts.clear();
+            for shape in &output.shapes { stage20_text_rects(&shape.shape, &mut texts); }
+        }
+        for label in ["▶ Показать", "■ Закрыть показ", "Фон", "Часы", "Таймер", "Презентации", "Настройки"] {
+            let (_, rect) = texts.iter().find(|(text, _)| text == label).expect(label);
+            assert!(rect.left() >= 0.0 && rect.right() <= 751.0, "{label}: {rect:?}");
+            assert!(rect.top() >= 0.0 && rect.bottom() <= 651.0, "{label}: {rect:?}");
+        }
+        assert_eq!(app.selected, Some(10));
+        assert_eq!(serde_json::to_string(&app.remote).unwrap(), before, "отрисовка не меняет удалённое состояние");
+    }
+}
+
+#[test]
+fn redesign_list_distinguishes_selection_from_current_show() {
+    let mut app = test_app();
+    let mut view = stage7_remote_pdf(0, 3);
+    let mut selected = view.items[0].clone();
+    selected.id = 11;
+    selected.name = "Следующий файл.pdf".into();
+    view.items.push(selected);
+    app.selected = Some(11);
+    let ctx = app.ctx.clone();
+    configure_operator_style(&ctx);
+    let output = ctx.run(egui::RawInput::default(), |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| app.list(ui, &view));
+    });
+    let mut texts = Vec::new();
+    for shape in &output.shapes { stage20_text_rects(&shape.shape, &mut texts); }
+    let (_, live) = texts.iter().find(|(text, _)| text.starts_with("Текущий показ · ")).unwrap();
+    let (_, next) = texts.iter().find(|(text, _)| text.starts_with("Выбрано · ")).unwrap();
+    assert!(!live.intersects(*next));
+    assert_eq!(app.selected, Some(11));
+    assert_eq!(view.active, Some(10));
 }

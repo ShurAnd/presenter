@@ -485,11 +485,7 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_theme(egui::Theme::Light);
-        cc.egui_ctx.style_mut(|s| {
-            s.spacing.button_padding = egui::vec2(12.0, 7.0);
-            s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        });
+        configure_operator_style(&cc.egui_ctx);
         // Если в %APPDATA% настроек ещё нет — берём прежний файл рядом с exe (старые версии хранили их там).
         let cfg: Config = std::fs::read_to_string(config_path())
             .or_else(|_| std::fs::read_to_string(app_dir().join(CONFIG_FILE)))
@@ -683,7 +679,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(screen::timer_tick(&view.timer, self.timer_extra()));
         }
 
-        let margin = egui::Frame::new().fill(Color32::from_gray(0xfa)).inner_margin(6.0);
+        let margin = egui::Frame::new().fill(UI_BG).inner_margin(8.0);
         egui::TopBottomPanel::top("top").frame(margin).show(ctx, |ui| self.top_bar(ui, &view));
         self.ppt_focus_bar(ctx, &view);
         self.alarm_bar(ctx);

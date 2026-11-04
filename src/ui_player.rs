@@ -27,7 +27,7 @@ impl App {
         // Позиция и кнопки — внизу, список занимает остальное.
         egui::TopBottomPanel::bottom("player_controls").frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 6))).show_inside(ui, |ui| self.player_controls(ui, &a));
         egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0_f32, Color32::from_gray(0xcc)))
+            .stroke(egui::Stroke::new(1.0_f32, UI_LINE))
             .corner_radius(5.0)
             .inner_margin(6.0)
             .fill(Color32::WHITE)
@@ -45,11 +45,11 @@ impl App {
                         let is_cur = a.current == Some(t.id) && a.state != AudioState::Stopped;
                         let is_ins = a.insert == Some(t.id);
                         let is_sel = self.audio_selected == Some(t.id);
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.0), egui::Sense::click());
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
                         let bg = if is_cur || is_ins {
-                            Color32::from_rgb(0xd4, 0xed, 0xda)
+                            UI_LIVE
                         } else if is_sel {
-                            Color32::from_rgb(0xd9, 0xee, 0xf7)
+                            UI_SELECTED
                         } else if resp.hovered() {
                             Color32::from_gray(0xf3)
                         } else {
@@ -127,8 +127,8 @@ impl App {
             }
             ui.label(t(dur));
         });
-        ui.horizontal(|ui| {
-            if ui.add_enabled(!a.tracks.is_empty(), cbutton("◀ Пред.", BLUE)).clicked() {
+        ui.horizontal_wrapped(|ui| {
+            if ui.add_enabled(!a.tracks.is_empty(), cbutton("◀ Пред.", GRAY)).clicked() {
                 self.act(Cmd::AudioPrev);
             }
             let (label, color, cmd) = match (ins, if ins { a.insert_state } else { a.state }) {
@@ -148,7 +148,7 @@ impl App {
             if ui.add_enabled(playing, cbutton("■ Стоп", RED)).on_hover_text(tip).clicked() {
                 self.act(Cmd::AudioStop);
             }
-            if ui.add_enabled(!a.tracks.is_empty(), cbutton("След. ▶", BLUE)).clicked() {
+            if ui.add_enabled(!a.tracks.is_empty(), cbutton("След. ▶", GRAY)).clicked() {
                 self.act(Cmd::AudioNext);
             }
             ui.add_space(10.0);

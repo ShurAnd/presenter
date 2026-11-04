@@ -5,7 +5,7 @@ use super::*;
 
 impl App {
     pub(crate) fn settings_panel(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new().fill(Color32::from_gray(0xf5)).corner_radius(5.0).inner_margin(14.0).show(ui, |ui| {
+        ui_card().show(ui, |ui| {
             ui.set_min_size(ui.available_size());
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.label(RichText::new("Настройки").size(18.0).strong());
@@ -14,7 +14,7 @@ impl App {
                 ui.label(RichText::new("Монитор и «в окне» — для этого компьютера, когда он сервер; фон у клиента меняется на сервере.").size(11.5).color(GRAY));
                 // Монитор для показа — на сервере: основной или любой из подключённых.
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Монитор для показа:");
                     let monitors = display::list();
                     let current = monitors.iter().position(|m| m.device == self.cfg.monitor);
@@ -45,7 +45,7 @@ impl App {
                 // Фон экрана показа — у клиента меняется на сервере.
                 ui.add_space(4.0);
                 let current = self.view().background;
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Фон экрана показа:");
                     ui.label(RichText::new(if current.is_empty() { "стандартный" } else { current.as_str() }).strong());
                     self.background_menu(ui, &current);
@@ -64,7 +64,7 @@ impl App {
                 if let Some(engine) = state.pdf_engine.as_deref() {
                     let current_engine = render::PdfEngine::from_config(engine);
                     let mut choice = current_engine;
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.radio_value(&mut choice, render::PdfEngine::Pdfium, "PDFium (рекомендуется)");
                         ui.radio_value(&mut choice, render::PdfEngine::Hayro, "Hayro (совместимость)");
                     });
@@ -108,7 +108,7 @@ impl App {
                 section(ui, "Журнал событий");
                 let log = journal::path();
                 ui.label(RichText::new("Что открывали, ответы PowerPoint, ошибки, обрывы связи — если что-то не сработало, пришлите этот файл.").size(12.0).color(Color32::from_gray(0x55)));
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Открыть папку журнала").clicked() {
                         let _ = std::process::Command::new("explorer").arg(format!("/select,{}", log.display())).spawn();
                     }
@@ -125,6 +125,6 @@ impl App {
 /// Заголовок раздела настроек.
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(12.0);
-    ui.label(RichText::new(title).strong().size(15.0));
+    ui.label(RichText::new(title).strong().size(15.0).color(UI_ACCENT));
     ui.separator();
 }

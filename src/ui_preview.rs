@@ -26,9 +26,9 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, size: egui::Vec2, enabled: bool, ic
     let (rect, resp) = ui.allocate_exact_size(size, sense);
     let (bg, fg) = match (enabled, resp.hovered(), resp.is_pointer_button_down_on()) {
         (false, ..) => (Color32::from_gray(0xee), Color32::from_gray(0xbb)),
-        (true, _, true) => (Color32::from_rgb(0x2f, 0x8f, 0xad), Color32::WHITE),
-        (true, true, false) => (Color32::from_rgb(0x46, 0xa8, 0xc6), Color32::WHITE),
-        (true, false, false) => (BLUE, Color32::WHITE),
+        (true, _, true) => (Color32::from_rgb(28, 73, 145), Color32::WHITE),
+        (true, true, false) => (Color32::from_rgb(48, 111, 203), Color32::WHITE),
+        (true, false, false) => (UI_ACCENT, Color32::WHITE),
     };
     let p = ui.painter();
     p.rect_filled(rect, 4.0, bg);
@@ -77,7 +77,7 @@ impl App {
                 let frame = egui::vec2(h * 16.0 / 9.0, h);
                 let (rect, _) = ui.allocate_exact_size(frame, egui::Sense::hover());
                 let p = ui.painter();
-                p.rect_filled(rect, 3.0, Color32::from_gray(0xe8));
+                p.rect_filled(rect, 3.0, UI_BG);
                 let rect = tex.map_or(rect, |t| {
                     let s = t.size_vec2();
                     let k = (frame.x / s.x.max(1.0)).min(frame.y / s.y.max(1.0));

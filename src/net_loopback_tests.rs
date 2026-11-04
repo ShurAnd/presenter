@@ -988,7 +988,7 @@ async fn stage19_loopback_focus_and_pdf_settings_roundtrip() {
 
 #[test]
 fn stage19_older_server_state_has_no_remote_pdf_capability() {
-    let state: StateMsg = serde_json::from_str(r#"{"active":7}"#).unwrap();
+    let state: StateMsg = serde_json::from_str(r#"{"items":[],"active":7,"page":0,"pages":1}"#).unwrap();
     assert_eq!(state.pdf_engine, None);
     assert_eq!(state.pdf_engine_error, None);
     assert_eq!(state.ppt_focus, PptFocus::Unknown);
