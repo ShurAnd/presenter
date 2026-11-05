@@ -563,7 +563,7 @@ impl App {
                 let (level, rows) = self.health_rows();
                 let who = if self.net.connected {
                     let name = self.cfg.name.trim();
-                    if name.is_empty() { format!("Оператор → {}", self.cfg.ip.trim()) } else { format!("Оператор → {name}") }
+                    if name.is_empty() { format!("Оператор: {}", self.cfg.ip.trim()) } else { format!("Оператор: {name}") }
                 } else {
                     format!("Сервер показа ({} кл.)", self.net.clients)
                 };
@@ -1078,7 +1078,7 @@ impl App {
                             resp.on_hover_text(&it.status)
                         } else if !it.linked.is_empty() {
                             resp.on_hover_text(format!(
-                                "Видео вставлены в презентацию ссылкой на файлы, которых нет на сервере, — на экране их не будет:\n{}\n\nВставьте видео в саму презентацию (в PowerPoint: Вставка → Видео → «Это устройство», без «Связать с файлом») и загрузите её заново.",
+                                "Видео вставлены в презентацию ссылкой на файлы, которых нет на сервере, — на экране их не будет:\n{}\n\nВставьте видео в саму презентацию (в PowerPoint: Вставка > Видео > «Это устройство», без «Связать с файлом») и загрузите её заново.",
                                 it.linked.join("\n")
                             ))
                         } else {
