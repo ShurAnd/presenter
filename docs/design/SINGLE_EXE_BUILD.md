@@ -21,4 +21,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_release.ps1
 Presentator (`libmpv-2.zip`, значки), поэтому сборку нужно делать в полном
 рабочем проекте. Убедитесь, что скрипт завершился успешно.
 
-Подробные тесты: `PDFIUM_TESTS.md`.
+Подробные тесты: `../testing/PDFIUM_TESTS.md`.

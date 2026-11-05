@@ -1,11 +1,12 @@
 # ASCII-only script for Windows PowerShell 5.1 and PowerShell 7.
 # Run from project root. Produces a sanitized ZIP for test development.
 param(
-    [string]$ProjectRoot = (Get-Location).Path,
+    [string]$ProjectRoot = '',
     [string]$OutputPath = "",
     [switch]$IncludeLockfile
 )
 $ErrorActionPreference = 'Stop'
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = Split-Path -Parent $PSScriptRoot }
 $root = (Resolve-Path -LiteralPath $ProjectRoot).Path
 if (-not (Test-Path -LiteralPath (Join-Path $root 'Cargo.toml'))) {
     throw 'Cargo.toml not found. Run from the Presentator project root.'

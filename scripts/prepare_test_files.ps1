@@ -1,4 +1,4 @@
-# Пересоздаёт тестовые файлы Presentator 3.0.
+﻿# Пересоздаёт тестовые файлы Presentator 3.0.
 # Запуск из корня репозитория:
 #   powershell -ExecutionPolicy Bypass -File scripts\prepare_test_files.ps1
 $ErrorActionPreference = 'Stop'

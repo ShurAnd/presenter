@@ -107,8 +107,8 @@ COM и не посылаются команды на настоящий пока
 
 ```powershell
 # если патч лежит в корне проекта:
-git apply --check .\presentator_tests_stage4.patch
-git apply .\presentator_tests_stage4.patch
+git apply --check docs\history\patches\presentator_tests_stage4.patch
+git apply docs\history\patches\presentator_tests_stage4.patch
 ```
 
 Если проверка не проходит, **не применяйте его принудительно**: пришлите

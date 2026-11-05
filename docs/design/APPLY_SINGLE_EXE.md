@@ -29,4 +29,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_release.ps1
 `target\release\presentator.exe` — без `pdfium.dll` и без установщика.
 Внутренний кэш `%LOCALAPPDATA%\Presentator` приложение создаст само.
 
-Подробная проверка PDF: `PDFIUM_TESTS.md`.
+Подробная проверка PDF: `../testing/PDFIUM_TESTS.md`.

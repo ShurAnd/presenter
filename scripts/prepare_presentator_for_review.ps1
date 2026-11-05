@@ -1,11 +1,12 @@
 # Presentator source and test evidence collector (Windows PowerShell 5.1+)
 param(
-    [string]$ProjectDir = 'C:\rust\presenter',
+    [string]$ProjectDir = '',
     [string]$OutputDir = '',
     [switch]$IncludeCoverage,
     [switch]$RunTests
 )
 $ErrorActionPreference = 'Stop'
+if (-not $ProjectDir) { $ProjectDir = Split-Path -Parent $PSScriptRoot }
 $ProjectDir = (Resolve-Path -LiteralPath $ProjectDir).Path
 if (-not $OutputDir) { $OutputDir = Join-Path $ProjectDir 'review_packages' }
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
@@ -41,8 +42,9 @@ try {
     Copy-SourceTree 'tests' @('.rs','.json','.toml','.md')
     Copy-SourceTree 'benches' @('.rs')
     Copy-SourceTree 'scripts' @('.ps1','.cmd','.bat','.py','.md')
+    Copy-SourceTree 'docs' @('.md','.txt','.csv')
     Copy-SourceTree '.cargo' @('.toml')
-    foreach ($file in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','rust-toolchain','build.rs','README.md','README_STAGE11.md','.gitignore')) { Copy-RelativeFile $file }
+    foreach ($file in @('Cargo.toml','Cargo.lock','rust-toolchain.toml','rust-toolchain','build.rs','README.md','PROJECT.md','CLAUDE.md','.gitignore')) { Copy-RelativeFile $file }
 
     $info = @(
         'Collected: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz'),
