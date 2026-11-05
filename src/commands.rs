@@ -7,6 +7,7 @@ impl App {
     pub(crate) fn local_state(&self) -> StateMsg {
         StateMsg {
             items: self
+                .session
                 .items
                 .iter()
                 .map(|i| ItemInfo {
@@ -24,23 +25,23 @@ impl App {
                     linked: i.linked.clone(),
                 })
                 .collect(),
-            active: self.show.as_ref().map(|s| s.id),
-            page: self.show.as_ref().map_or(0, |s| s.page),
-            pages: self.show.as_ref().map_or(0, |s| s.pages),
-            message: self.status.clone(),
-            video: self.show.as_ref().and_then(Show::video).map(|v| VideoInfo { state: v.state, pos: v.pos as u32, dur: v.dur as u32 }),
-            screen: self.screen,
-            timer: self.timer.info(),
-            audio: self.player.info(),
+            active: self.session.show.as_ref().map(|s| s.id),
+            page: self.session.show.as_ref().map_or(0, |s| s.page),
+            pages: self.session.show.as_ref().map_or(0, |s| s.pages),
+            message: self.ui.status.clone(),
+            video: self.session.show.as_ref().and_then(Show::video).map(|v| VideoInfo { state: v.state, pos: v.pos as u32, dur: v.dur as u32 }),
+            screen: self.stage.screen,
+            timer: self.stage.timer.info(),
+            audio: self.player.engine.info(),
             background: self.cfg.background.clone(),
-            zoom: self.show.as_ref().map_or(1.0, |s| s.zoom),
+            zoom: self.session.show.as_ref().map_or(1.0, |s| s.zoom),
             view: self.slide_view(),
             media: self.slide_media(),
-            ppt_focus: self.ppt_focus.clone(),
-            pdf_engine: Some(self.renderer.engine().as_str().into()),
-            pdf_engine_error: self.renderer.pdfium_error().map(str::to_owned),
+            ppt_focus: self.ppt.focus.clone(),
+            pdf_engine: Some(self.render.engine.engine().as_str().into()),
+            pdf_engine_error: self.render.engine.pdfium_error().map(str::to_owned),
             version: env!("CARGO_PKG_VERSION").into(),
-            cursor: self.show_cursor,
+            cursor: self.stage.show_cursor,
         }
     }
 
@@ -49,43 +50,43 @@ impl App {
             "pdfium" => render::PdfEngine::Pdfium,
             "hayro" => render::PdfEngine::Hayro,
             _ => {
-                self.status = format!("Неизвестный PDF-движок: {engine}");
+                self.ui.status = format!("Неизвестный PDF-движок: {engine}");
                 return;
             }
         };
-        match self.renderer.set_engine(choice) {
+        match self.render.engine.set_engine(choice) {
             Ok(()) => {
                 self.cfg.pdf_engine = choice.as_str().into();
                 self.save_cfg();
                 // Новое содержимое должно рендериться выбранным движком; старые
                 // картинки и статусы неудачи больше не соответствуют PDF.
-                self.textures.clear();
-                self.failed.clear();
-                self.last_tex = None;
-                self.render_error = None;
-                let pdf_ids: std::collections::HashSet<u64> = self.items.iter()
+                self.render.textures.clear();
+                self.render.failed.clear();
+                self.render.last_tex = None;
+                self.render.render_error = None;
+                let pdf_ids: std::collections::HashSet<u64> = self.session.items.iter()
                     .filter(|it| it.kind == "PDF").map(|it| it.id).collect();
-                self.previews.retain(|(id, _), _| !pdf_ids.contains(id));
-                self.thumb_jpg.retain(|(id, _), _| !pdf_ids.contains(id));
-                self.thumb_busy.retain(|(id, _)| !pdf_ids.contains(id));
-                self.thumb_failed.retain(|(id, _)| !pdf_ids.contains(id));
-                self.status = format!("PDF-движок переключён: {}", choice.label());
+                self.render.previews.retain(|(id, _), _| !pdf_ids.contains(id));
+                self.render.thumb_jpg.retain(|(id, _), _| !pdf_ids.contains(id));
+                self.render.thumb_busy.retain(|(id, _)| !pdf_ids.contains(id));
+                self.render.thumb_failed.retain(|(id, _)| !pdf_ids.contains(id));
+                self.ui.status = format!("PDF-движок переключён: {}", choice.label());
             }
-            Err(e) => self.status = e,
+            Err(e) => self.ui.status = e,
         }
     }
 
     /// Видимая часть текущего слайда (доли страницы).
     pub(crate) fn slide_view(&self) -> [f32; 4] {
-        match &self.show {
-            Some(s) => render::viewport(self.slide_aspect, self.stage_px, s.zoom, s.center),
+        match &self.session.show {
+            Some(s) => render::viewport(self.stage.aspect, self.stage.px, s.zoom, s.center),
             None => [0.0, 0.0, 1.0, 1.0],
         }
     }
 
     /// Увеличение и сдвиг — только у того, что рисуем сами: PDF и картинки.
     pub(crate) fn zoomable(&self) -> bool {
-        self.show.as_ref().is_some_and(|s| match &s.kind {
+        self.session.show.as_ref().is_some_and(|s| match &s.kind {
             ShowKind::Pdf(_) | ShowKind::Image(_) => true,
             ShowKind::Ppt(p) => p.phase == PptPhase::Shown,
             ShowKind::Video(_) => false,
@@ -94,7 +95,7 @@ impl App {
 
     /// Видео и звук на текущем слайде PowerPoint (список от моста — только если он про этот слайд).
     pub(crate) fn slide_media(&self) -> Vec<MediaInfo> {
-        match self.show.as_ref().map(|s| (s.page, &s.kind)) {
+        match self.session.show.as_ref().map(|s| (s.page, &s.kind)) {
             Some((page, ShowKind::Ppt(p))) if p.media.0 == page + 1 => p
                 .media
                 .1
@@ -107,13 +108,13 @@ impl App {
 
     /// То, что показывает интерфейс: список сервера, если мы подключены клиентом, иначе свой.
     pub(crate) fn view(&self) -> StateMsg {
-        if self.connected { self.remote.clone() } else { self.local_state() }
+        if self.net.connected { self.net.remote.clone() } else { self.local_state() }
     }
 
     /// Единая точка управления: клиент отправляет команду на сервер, иначе выполняем у себя.
     pub(crate) fn act(&mut self, cmd: Cmd) {
-        if self.connected {
-            if let Some(c) = &self.client {
+        if self.net.connected {
+            if let Some(c) = &self.net.client {
                 c.send(CliReq::Cmd(cmd));
             }
         } else {
@@ -126,10 +127,10 @@ impl App {
         if !matches!(cmd, Cmd::AudioVolume { .. } | Cmd::AudioSeek { .. } | Cmd::Pan { .. }) {
             jlog!("Команда: {cmd:?}");
         }
-        self.dirty = true;
+        self.session.dirty = true;
         match cmd {
             Cmd::Open { id } => {
-                let Some(it) = self.items.iter().find(|i| i.id == id) else { return };
+                let Some(it) = self.session.items.iter().find(|i| i.id == id) else { return };
                 if !matches!(it.status, Status::Ready) {
                     return;
                 }
@@ -145,22 +146,22 @@ impl App {
                 // Прежний показ закрываем: на экране остаётся сцена с фоном,
                 // новый показ появится на ней, только когда будет готов.
                 self.close_show();
-                self.stage = true;
-                self.screen = Screen::Background;
-                self.show_gen += 1;
-                let gen = self.show_gen;
+                self.stage.visible = true;
+                self.stage.screen = Screen::Background;
+                self.session.show_gen += 1;
+                let gen = self.session.show_gen;
                 let kind = match pdf {
                     Some(pdf) => ShowKind::Pdf(pdf),
                     // Картинка грузится в отдельном потоке; пока не готова — виден фон.
                     None if is_image => {
                         let ctx = self.ctx.clone();
                         let max_side = self.ctx.input(|i| i.max_texture_side) as u32;
-                        render::load_image(id, gen, src.clone(), max_side, self.out_tx.clone(), move || ctx.request_repaint());
+                        render::load_image(id, gen, src.clone(), max_side, self.bus.tx.clone(), move || ctx.request_repaint());
                         ShowKind::Image(None)
                     }
                     // Видео сразу загружается за фоном и ждёт пробела или «Старт».
                     None if is_video => {
-                        let (tx, ctx) = (self.out_tx.clone(), self.ctx.clone());
+                        let (tx, ctx) = (self.bus.tx.clone(), self.ctx.clone());
                         let rect = if self.cfg.windowed { None } else { display::target(&self.cfg.monitor).map(|m| m.rect) };
                         let player = video::Video::start(&src, self.cfg.windowed, rect, repeat, move |ev| {
                             let _ = tx.send(Out::Video { gen, ev });
@@ -169,7 +170,7 @@ impl App {
                         ShowKind::Video(VideoShow { player, state: VideoState::Loading, pos: 0.0, dur: 0.0 })
                     }
                     None => {
-                        let (tx, c) = (self.out_tx.clone(), self.ctx.clone());
+                        let (tx, c) = (self.bus.tx.clone(), self.ctx.clone());
                         ppt::install_esc_hook(move || {
                             let _ = tx.send(Out::ShowEsc);
                             c.request_repaint();
@@ -182,31 +183,31 @@ impl App {
                         } else {
                             display::target(&self.cfg.monitor).map(|m| m.device).unwrap_or_default()
                         };
-                        if let Err(e) = self.ppt_host.open(gen, &src, self.cfg.windowed, &monitor, slides.as_deref(), THUMB_W) {
-                            self.status = format!("PowerPoint: {e}");
+                        if let Err(e) = self.ppt.host.open(gen, &src, self.cfg.windowed, &monitor, slides.as_deref(), THUMB_W) {
+                            self.ui.status = format!("PowerPoint: {e}");
                             return;
                         }
-                        self.status = format!("Открытие в PowerPoint: «{name}»…");
+                        self.ui.status = format!("Открытие в PowerPoint: «{name}»…");
                         ShowKind::Ppt(PptShow { phase: PptPhase::Loading, hwnd: 0, zoom_img: None, zoom_busy: None, zoom_up: false, media: (0, Vec::new()) })
                     }
                 };
-                self.show = Some(Show { id, page: 0, pages, kind, gen: self.show_gen, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5) });
+                self.session.show = Some(Show { id, page: 0, pages, kind, gen: self.session.show_gen, opened: Instant::now(), zoom: 1.0, center: (0.5, 0.5) });
                 // При переходе с PPTX окно PowerPoint может остаться поверх сцены.
                 // Новая PDF-сцена должна повторно запросить фокус у своего viewport,
                 // даже если окно сцены уже существовало до переключения.
-                if self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Pdf(_))) {
-                    self.stage_sent = None;
-                    self.ppt_focus = PptFocus::Unknown;
-                    self.ppt_focus_candidate = None;
-                    self.ppt_focus_restore_deadline = None;
+                if self.session.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Pdf(_))) {
+                    self.stage.sent = None;
+                    self.ppt.focus = PptFocus::Unknown;
+                    self.ppt.focus_candidate = None;
+                    self.ppt.focus_restore_deadline = None;
                 }
                 if let Some(w) = linked_warn {
-                    self.status = w;
+                    self.ui.status = w;
                 }
             }
             // Видео: стрелки перематывают на 10 с, Home — в начало.
-            Cmd::Next | Cmd::Prev | Cmd::GoTo { .. } if self.show.as_ref().is_some_and(|s| s.video().is_some()) => {
-                let v = &self.show.as_ref().and_then(Show::video).unwrap().player;
+            Cmd::Next | Cmd::Prev | Cmd::GoTo { .. } if self.session.show.as_ref().is_some_and(|s| s.video().is_some()) => {
+                let v = &self.session.show.as_ref().and_then(Show::video).unwrap().player;
                 match cmd {
                     Cmd::Next => v.seek(10.0),
                     Cmd::Prev => v.seek(-10.0),
@@ -214,7 +215,7 @@ impl App {
                     _ => {}
                 }
             }
-            Cmd::Play => match self.show.as_mut().map(|s| &mut s.kind) {
+            Cmd::Play => match self.session.show.as_mut().map(|s| &mut s.kind) {
                 Some(ShowKind::Video(v)) => match v.state {
                     VideoState::Armed => {
                         v.player.play();
@@ -229,23 +230,23 @@ impl App {
                 // У презентаций пробел — следующий шаг, как в PowerPoint.
                 _ => self.apply(Cmd::Next),
             },
-            Cmd::Next | Cmd::Prev if self.show.as_ref().is_some_and(Show::is_ppt) => {
+            Cmd::Next | Cmd::Prev if self.session.show.as_ref().is_some_and(Show::is_ppt) => {
                 // Увеличенный слайд — неподвижная картинка; листаем уже живое слайд-шоу.
-                if let Some(s) = self.show.as_mut().filter(|s| s.zoom > 1.0) {
+                if let Some(s) = self.session.show.as_mut().filter(|s| s.zoom > 1.0) {
                     (s.zoom, s.center) = (1.0, (0.5, 0.5));
                 }
                 if matches!(cmd, Cmd::Next) {
-                    self.ppt_host.next();
+                    self.ppt.host.next();
                 } else {
-                    self.ppt_host.prev();
+                    self.ppt.host.prev();
                 }
             }
             Cmd::Next => self.go(|s| (s.page + 1).min(s.pages.saturating_sub(1))),
             Cmd::Prev => self.go(|s| s.page.saturating_sub(1)),
             Cmd::Background | Cmd::Clock | Cmd::Timer => {
                 self.close_show();
-                self.stage = true;
-                self.screen = match cmd {
+                self.stage.visible = true;
+                self.stage.screen = match cmd {
                     Cmd::Clock => Screen::Clock,
                     Cmd::Timer => Screen::Timer,
                     _ => Screen::Background,
@@ -265,15 +266,15 @@ impl App {
             | Cmd::AudioMove { .. }
             | Cmd::AudioClear) => {
                 let mode = matches!(c, Cmd::AudioMode { .. } | Cmd::AudioVolume { .. });
-                for f in self.player.apply(c) {
+                for f in self.player.engine.apply(c) {
                     if f.starts_with(&self.work_dir) {
                         let _ = std::fs::remove_file(f);
                     }
                 }
                 // Режим и громкость плеера запоминаются (записываются при смене режима и при выходе).
                 if mode {
-                    let changed = (self.cfg.audio_list, self.cfg.audio_repeat) != (self.player.list, self.player.repeat);
-                    (self.cfg.audio_list, self.cfg.audio_repeat, self.cfg.audio_volume) = (self.player.list, self.player.repeat, self.player.volume);
+                    let changed = (self.cfg.audio_list, self.cfg.audio_repeat) != (self.player.engine.list, self.player.engine.repeat);
+                    (self.cfg.audio_list, self.cfg.audio_repeat, self.cfg.audio_volume) = (self.player.engine.list, self.player.engine.repeat, self.player.engine.volume);
                     if changed {
                         self.save_cfg();
                     }
@@ -283,26 +284,26 @@ impl App {
                 background::reset();
                 self.cfg.background.clear();
                 self.save_cfg();
-                self.bg_checked = false; // сцена перечитает фон
-                self.status = "Фон: стандартный".into();
+                self.stage.bg_checked = false; // сцена перечитает фон
+                self.ui.status = "Фон: стандартный".into();
             }
-            Cmd::TimerSet { countdown, secs } => self.timer.set(countdown, secs),
-            Cmd::TimerRun { run } => self.timer.run(run),
-            Cmd::TimerReset => self.timer.reset(),
+            Cmd::TimerSet { countdown, secs } => self.stage.timer.set(countdown, secs),
+            Cmd::TimerRun { run } => self.stage.timer.run(run),
+            Cmd::TimerReset => self.stage.timer.reset(),
             Cmd::GoTo { page } => self.go(|s| page.min(s.pages.saturating_sub(1))),
             Cmd::Close => self.close_show(),
             Cmd::Remove { id } => {
-                if self.show.as_ref().is_some_and(|s| s.id == id) {
+                if self.session.show.as_ref().is_some_and(|s| s.id == id) {
                     self.close_show();
                 }
-                if let Some(pos) = self.items.iter().position(|i| i.id == id) {
-                    let it = self.items.remove(pos);
+                if let Some(pos) = self.session.items.iter().position(|i| i.id == id) {
+                    let it = self.session.items.remove(pos);
                     self.delete_files(&it);
                 }
             }
             Cmd::Zoom { step } if self.zoomable() => {
                 let view = self.slide_view();
-                if let Some(s) = &mut self.show {
+                if let Some(s) = &mut self.session.show {
                     let i = ZOOMS.iter().position(|&z| z >= s.zoom - 0.01).unwrap_or(0) as i32;
                     let next = if step == 0 { 0 } else { (i + step.signum()).clamp(0, ZOOMS.len() as i32 - 1) };
                     // Увеличиваем вокруг того, что сейчас в центре экрана.
@@ -316,7 +317,7 @@ impl App {
             }
             Cmd::Pan { dx, dy } if self.zoomable() => {
                 let v = self.slide_view();
-                if let Some(s) = &mut self.show {
+                if let Some(s) = &mut self.session.show {
                     // На треть видимой части — соседний кусок частично остаётся на экране, не теряешься.
                     s.center.0 += dx.signum() as f32 * (v[2] - v[0]) / 3.0;
                     s.center.1 += dy.signum() as f32 * (v[3] - v[1]) / 3.0;
@@ -325,8 +326,8 @@ impl App {
             }
             Cmd::Zoom { .. } | Cmd::Pan { .. } => {}
             Cmd::Cursor { on } => {
-                self.show_cursor = on;
-                self.ppt_host.set_cursor(on);
+                self.stage.show_cursor = on;
+                self.ppt.host.set_cursor(on);
                 video::set_cursor(on);
             }
             Cmd::SetPdfEngine { engine } => self.change_pdf_engine(&engine),
@@ -336,74 +337,74 @@ impl App {
             Cmd::RestorePptFocus => {
                 // Работает только в режиме обычного показа: при увеличении сцена
                 // намеренно перекрывает PowerPoint, поэтому восстанавливать нечего.
-                let hwnd = self.show.as_ref().and_then(|s| match &s.kind {
+                let hwnd = self.session.show.as_ref().and_then(|s| match &s.kind {
                     ShowKind::Ppt(p) if p.phase == PptPhase::Shown && s.zoom <= 1.0 && p.hwnd != 0 => Some(p.hwnd),
                     _ => None,
                 });
                 if let Some(hwnd) = hwnd {
-                    let window = match &self.ppt_focus {
+                    let window = match &self.ppt.focus {
                         PptFocus::Lost { window } | PptFocus::RestoreFailed { window } => window.clone(),
                         _ => "другое окно".into(),
                     };
-                    self.ppt_focus = PptFocus::Restoring { window };
-                    self.ppt_focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
-                    self.ppt_focus_candidate = None;
-                    self.ppt_focus_polled = Instant::now() - Duration::from_secs(1);
+                    self.ppt.focus = PptFocus::Restoring { window };
+                    self.ppt.focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
+                    self.ppt.focus_candidate = None;
+                    self.ppt.focus_polled = Instant::now() - Duration::from_secs(1);
                     // Ни Close, ни Open, ни GoTo: только активация существующего окна.
                     ppt::request_focus(hwnd);
-                    self.ppt_host.activate();
+                    self.ppt.host.activate();
                     jlog!("Оператор запросил восстановление фокуса PowerPoint");
                 } else {
-                    self.status = "Фокус недоступен: слайд-шоу PowerPoint не готово или увеличено".into();
+                    self.ui.status = "Фокус недоступен: слайд-шоу PowerPoint не готово или увеличено".into();
                 }
             }
             Cmd::RestoreStageFocus => {
                 let stage_active = self.show_uses_stage_focus();
                 if stage_active {
-                    self.ppt_focus = PptFocus::Restoring { window: "окно показа".into() };
-                    self.ppt_focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
-                    self.stage_sent = None;
-                    self.ppt_focus_candidate = None;
-                    self.ppt_focus_polled = Instant::now() - Duration::from_secs(1);
+                    self.ppt.focus = PptFocus::Restoring { window: "окно показа".into() };
+                    self.ppt.focus_restore_deadline = Some(Instant::now() + Duration::from_secs(2));
+                    self.stage.sent = None;
+                    self.ppt.focus_candidate = None;
+                    self.ppt.focus_polled = Instant::now() - Duration::from_secs(1);
                     ppt::request_focus(ppt::own_stage_window());
-                    if let Some(video) = self.show.as_ref().and_then(Show::video) {
+                    if let Some(video) = self.session.show.as_ref().and_then(Show::video) {
                         video.player.raise();
                     }
                 } else {
-                    self.status = "Фокус окна показа недоступен".into();
+                    self.ui.status = "Фокус окна показа недоступен".into();
                 }
             }
             Cmd::PptMedia { id, action } => {
-                if self.show.as_ref().is_some_and(Show::is_ppt) {
+                if self.session.show.as_ref().is_some_and(Show::is_ppt) {
                     let a = match action {
                         MediaAction::Play => "play",
                         MediaAction::Pause => "pause",
                         MediaAction::Stop => "stop",
                     };
-                    self.ppt_host.media(a, id);
+                    self.ppt.host.media(a, id);
                 }
             }
             Cmd::VideoRepeat { id, on } => {
-                if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
+                if let Some(it) = self.session.items.iter_mut().find(|i| i.id == id) {
                     it.repeat = on;
                 }
                 // Видео уже открыто — повтор меняется сразу, без перезапуска.
-                if let Some(ShowKind::Video(v)) = self.show.as_ref().filter(|s| s.id == id).map(|s| &s.kind) {
+                if let Some(ShowKind::Video(v)) = self.session.show.as_ref().filter(|s| s.id == id).map(|s| &s.kind) {
                     v.player.set_repeat(on);
                 }
             }
             Cmd::Move { id, up } => {
-                if let Some(pos) = self.items.iter().position(|i| i.id == id) {
+                if let Some(pos) = self.session.items.iter().position(|i| i.id == id) {
                     if up && pos > 0 {
-                        self.items.swap(pos, pos - 1);
-                    } else if !up && pos + 1 < self.items.len() {
-                        self.items.swap(pos, pos + 1);
+                        self.session.items.swap(pos, pos - 1);
+                    } else if !up && pos + 1 < self.session.items.len() {
+                        self.session.items.swap(pos, pos + 1);
                     }
                 }
             }
             Cmd::Clear => {
                 self.close_show();
-                for it in std::mem::take(&mut self.items) {
+                for it in std::mem::take(&mut self.session.items) {
                     self.delete_files(&it);
                 }
             }
@@ -411,17 +412,17 @@ impl App {
     }
 
     pub(crate) fn go(&mut self, f: impl Fn(&Show) -> usize) {
-        if let Some(s) = &mut self.show {
+        if let Some(s) = &mut self.session.show {
             let p = f(s);
             match &s.kind {
                 // Позицию PowerPoint сообщит сам — в нём шаг может быть анимацией, а не слайдом.
                 ShowKind::Ppt(_) => {
                     if p == s.page + 1 {
-                        self.ppt_host.next();
+                        self.ppt.host.next();
                     } else if p + 1 == s.page {
-                        self.ppt_host.prev();
+                        self.ppt.host.prev();
                     } else if p != s.page {
-                        self.ppt_host.goto(p + 1);
+                        self.ppt.host.goto(p + 1);
                     }
                 }
                 ShowKind::Pdf(_) => {
@@ -440,30 +441,30 @@ impl App {
 
     /// Закрывает показ; сцена (если она есть) остаётся и показывает фон.
     pub(crate) fn close_show(&mut self) {
-        if self.show.take().is_some_and(|s| s.is_ppt()) {
+        if self.session.show.take().is_some_and(|s| s.is_ppt()) {
             // Сцена лежит прямо под слайд-шоу, поэтому при его закрытии сразу виден фон.
-            self.ppt_host.close();
+            self.ppt.host.close();
             // Окно слайд-шоу исчезло — сцена должна заново забрать фокус.
-            self.stage_sent = None;
+            self.stage.sent = None;
             self.ctx.request_repaint();
         }
-        self.goto_buf.clear();
-        self.thumb_failed.clear();
+        self.ui.goto_buf.clear();
+        self.render.thumb_failed.clear();
         self.reset_pages(true);
     }
 
     /// Вывод слайд-шоу на экран — по шагам, чтобы запуск не был виден, плюс сторож зависаний.
     pub(crate) fn tick_ppt(&mut self, ctx: &egui::Context) {
-        let Some(show) = &mut self.show else { return };
+        let Some(show) = &mut self.session.show else { return };
         let ShowKind::Ppt(ps) = &mut show.kind else { return };
         match ps.phase {
             PptPhase::Loading => {
                 if show.opened.elapsed() >= PPT_TIMEOUT {
                     // PowerPoint не отвечает (завис, висит его диалог) — перезапускаем мост.
-                    self.ppt_host.restart();
-                    self.status = "PowerPoint не отвечает — он перезапущен, откройте презентацию ещё раз".into();
+                    self.ppt.host.restart();
+                    self.ui.status = "PowerPoint не отвечает — он перезапущен, откройте презентацию ещё раз".into();
                     self.close_show();
-                    self.dirty = true;
+                    self.session.dirty = true;
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(500));
                 }
@@ -477,7 +478,7 @@ impl App {
             PptPhase::Lowered(t) => {
                 if t.elapsed() >= PPT_LOWER {
                     let target = if self.cfg.windowed { None } else { display::target(&self.cfg.monitor).map(|m| m.rect) };
-                    self.ppt_host.reveal(ps.hwnd, target);
+                    self.ppt.host.reveal(ps.hwnd, target);
                     ps.phase = PptPhase::Shown;
                 } else {
                     ctx.request_repaint_after(Duration::from_millis(30));
@@ -490,7 +491,7 @@ impl App {
 
     /// Клавиатурная цель для PDF, картинок и видео — сцена (окно видео само не активируется).
     fn show_uses_stage_focus(&self) -> bool {
-        self.show.as_ref().is_some_and(|show| match &show.kind {
+        self.session.show.as_ref().is_some_and(|show| match &show.kind {
             ShowKind::Ppt(_) => show.ppt_zoom_on(),
             ShowKind::Pdf(_) | ShowKind::Image(_) | ShowKind::Video(_) => true,
         })
@@ -498,26 +499,26 @@ impl App {
 
     /// Опрос настоящего переднего окна Windows на компьютере показа — для всех форматов.
     pub(crate) fn tick_ppt_focus(&mut self, ctx: &egui::Context) {
-        if self.connected { return; }
-        if self.show.is_none() {
-            self.ppt_focus_candidate = None;
-            self.ppt_focus_restore_deadline = None;
+        if self.net.connected { return; }
+        if self.session.show.is_none() {
+            self.ppt.focus_candidate = None;
+            self.ppt.focus_restore_deadline = None;
             self.update_ppt_focus(PptFocus::Unknown);
             return;
         }
         let now = Instant::now();
-        let interval = Duration::from_millis(if self.ppt_focus_restore_deadline.is_some() { 200 } else { 500 });
-        let elapsed = now.saturating_duration_since(self.ppt_focus_polled);
+        let interval = Duration::from_millis(if self.ppt.focus_restore_deadline.is_some() { 200 } else { 500 });
+        let elapsed = now.saturating_duration_since(self.ppt.focus_polled);
         if elapsed < interval {
             ctx.request_repaint_after(interval - elapsed);
             return;
         }
-        self.ppt_focus_polled = now;
+        self.ppt.focus_polled = now;
         let stage_target = self.show_uses_stage_focus();
         let hwnd = if stage_target {
             ppt::own_stage_window()
         } else {
-            self.show.as_ref().and_then(|show| match &show.kind {
+            self.session.show.as_ref().and_then(|show| match &show.kind {
                 ShowKind::Ppt(p) if p.phase == PptPhase::Shown => Some(p.hwnd),
                 _ => None,
             }).unwrap_or(0)
@@ -529,13 +530,13 @@ impl App {
 
     fn handle_focus_probe(&mut self, probe: ppt::FocusProbe, now: Instant, hwnd: isize, stage_target: bool) {
         if matches!(&probe, ppt::FocusProbe::Focused) {
-            self.ppt_focus_candidate = None;
-            self.ppt_focus_restore_deadline = None;
+            self.ppt.focus_candidate = None;
+            self.ppt.focus_restore_deadline = None;
             self.update_ppt_focus(PptFocus::Ok);
-        } else if let Some(deadline) = self.ppt_focus_restore_deadline {
+        } else if let Some(deadline) = self.ppt.focus_restore_deadline {
             if now >= deadline {
-                self.ppt_focus_restore_deadline = None;
-                let window = match &self.ppt_focus {
+                self.ppt.focus_restore_deadline = None;
+                let window = match &self.ppt.focus {
                     PptFocus::Restoring { window } => window.clone(),
                     _ => "другое окно".into(),
                 };
@@ -545,27 +546,27 @@ impl App {
                 // окне проверки, не расходуя единственный щелчок оператора.
                 ppt::request_focus(hwnd);
                 if stage_target {
-                    if let Some(video) = self.show.as_ref().and_then(Show::video) {
+                    if let Some(video) = self.session.show.as_ref().and_then(Show::video) {
                         video.player.raise();
                     }
                 } else {
-                    self.ppt_host.activate();
+                    self.ppt.host.activate();
                 }
             }
         } else {
             match probe {
                 ppt::FocusProbe::Away { hwnd: front, title } => {
-                    if self.ppt_focus_candidate == Some(front) {
+                    if self.ppt.focus_candidate == Some(front) {
                         // Не сбрасываем неудачную попытку, пока окно не вернуло фокус.
-                        if !matches!(&self.ppt_focus, PptFocus::RestoreFailed { .. }) {
+                        if !matches!(&self.ppt.focus, PptFocus::RestoreFailed { .. }) {
                             self.update_ppt_focus(PptFocus::Lost { window: title });
                         }
                     } else {
-                        self.ppt_focus_candidate = Some(front);
+                        self.ppt.focus_candidate = Some(front);
                     }
                 }
                 ppt::FocusProbe::Unknown => {
-                    self.ppt_focus_candidate = None;
+                    self.ppt.focus_candidate = None;
                     self.update_ppt_focus(PptFocus::Unknown);
                 }
                 ppt::FocusProbe::Focused => {}
@@ -574,35 +575,35 @@ impl App {
     }
 
     fn update_ppt_focus(&mut self, state: PptFocus) {
-        if self.ppt_focus != state {
+        if self.ppt.focus != state {
             match &state {
                 PptFocus::Lost { window } => jlog!("Окно показа потеряло фокус: {window}"),
                 PptFocus::RestoreFailed { .. } => jlog!("Не удалось восстановить фокус окна показа"),
-                PptFocus::Ok if matches!(&self.ppt_focus, PptFocus::Lost { .. } | PptFocus::Restoring { .. } | PptFocus::RestoreFailed { .. }) => {
+                PptFocus::Ok if matches!(&self.ppt.focus, PptFocus::Lost { .. } | PptFocus::Restoring { .. } | PptFocus::RestoreFailed { .. }) => {
                     jlog!("Фокус окна показа восстановлен");
                 }
                 _ => {}
             }
-            self.ppt_focus = state;
-            self.dirty = true;
+            self.ppt.focus = state;
+            self.session.dirty = true;
         }
     }
 
     /// Файл крупной картинки слайда (с нуля) — в папке слайдов этой презентации.
     pub(crate) fn ppt_zoom_file(&self, page: usize) -> Option<PathBuf> {
-        let s = self.show.as_ref()?;
-        let dir = self.items.iter().find(|i| i.id == s.id)?.slides.clone()?;
+        let s = self.session.show.as_ref()?;
+        let dir = self.session.items.iter().find(|i| i.id == s.id)?.slides.clone()?;
         Some(dir.join(format!("zoom_{}.jpg", page + 1)))
     }
 
     /// Увеличение PowerPoint: нужна крупная картинка слайда — с диска (если уже сохранена) или
     /// заказать мосту. Вернули весь слайд — слайд-шоу снова наверх (сцена под ним, как при открытии).
     pub(crate) fn tick_ppt_zoom(&mut self) {
-        let want = self.show.as_ref().filter(|s| s.zoom > 1.0).map(|s| s.page);
+        let want = self.session.show.as_ref().filter(|s| s.zoom > 1.0).map(|s| s.page);
         let file = want.and_then(|p| self.ppt_zoom_file(p));
-        let width = (self.stage_px.0 * 3.0).clamp(1920.0, 7680.0) as u32;
-        let (out, ctx) = (self.out_tx.clone(), self.ctx.clone());
-        let Some(show) = &mut self.show else { return };
+        let width = (self.stage.px.0 * 3.0).clamp(1920.0, 7680.0) as u32;
+        let (out, ctx) = (self.bus.tx.clone(), self.ctx.clone());
+        let Some(show) = &mut self.session.show else { return };
         let gen = show.gen;
         let on = show.ppt_zoom_on();
         let ShowKind::Ppt(p) = &mut show.kind else { return };
@@ -613,7 +614,7 @@ impl App {
                 if file.is_file() {
                     render::load_ppt_zoom(gen, page, file, out, move || ctx.request_repaint());
                 } else {
-                    self.ppt_host.export_zoom(page + 1, width, &file);
+                    self.ppt.host.export_zoom(page + 1, width, &file);
                 }
             }
         }
@@ -631,31 +632,31 @@ impl App {
             Ok(()) => {
                 self.cfg.background = name.to_string();
                 self.save_cfg();
-                self.bg_checked = false; // сцена перечитает фон
-                self.status = format!("Фон: «{name}»");
+                self.stage.bg_checked = false; // сцена перечитает фон
+                self.ui.status = format!("Фон: «{name}»");
             }
-            Err(e) => self.status = format!("Не удалось сменить фон: {e}"),
+            Err(e) => self.ui.status = format!("Не удалось сменить фон: {e}"),
         }
-        self.dirty = true;
+        self.session.dirty = true;
     }
 
     /// «Выбрать фон…»: у клиента картинка уходит на сервер (и на резерв), иначе — фон этого компьютера.
     pub(crate) fn pick_background(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("Картинка или анимация (GIF, WebP, APNG)", &background::EXTS).pick_file() else { return };
         let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        if self.connected {
+        if self.net.connected {
             let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             if !background::EXTS.contains(&ext.as_str()) {
-                self.status = format!("Формат .{ext} не подходит для фона (нужен PNG, JPG, BMP, GIF или WebP)");
+                self.ui.status = format!("Формат .{ext} не подходит для фона (нужен PNG, JPG, BMP, GIF или WebP)");
                 return;
             }
-            if let Some(c) = &self.client {
+            if let Some(c) = &self.net.client {
                 c.send(CliReq::UploadBackground(path.clone()));
             }
             if let Some(m) = self.mirror_uploader() {
                 m.send_background(path);
             }
-            self.status = format!("Фон «{name}» отправляется на сервер…");
+            self.ui.status = format!("Фон «{name}» отправляется на сервер…");
         } else {
             self.set_background(&path, &name);
         }
@@ -667,32 +668,32 @@ impl App {
     pub(crate) fn tick_previews(&mut self, view: &StateMsg) {
         let cur = view.active.filter(|_| view.video.is_none()).map(|id| (id, view.page));
         let near = |k: &(u64, usize)| cur.is_some_and(|(id, p)| k.0 == id && thumb_near(k.1, p));
-        self.previews.retain(|k, _| near(k));
-        self.thumb_jpg.retain(|k, _| near(k));
-        if self.connected {
+        self.render.previews.retain(|k, _| near(k));
+        self.render.thumb_jpg.retain(|k, _| near(k));
+        if self.net.connected {
             return;
         }
-        let ppt = self.show.as_ref().filter(|s| s.is_ppt()).and_then(|s| {
-            let dir = self.items.iter().find(|i| i.id == s.id)?.slides.clone()?;
+        let ppt = self.session.show.as_ref().filter(|s| s.is_ppt()).and_then(|s| {
+            let dir = self.session.items.iter().find(|i| i.id == s.id)?.slides.clone()?;
             Some((s.id, s.page, s.pages, dir))
         });
         if let Some((id, page, pages, dir)) = ppt {
             // Текущий, следующий, предыдущий — в порядке важности.
             for k in [Some((id, page)), Some((id, page + 1)), page.checked_sub(1).map(|p| (id, p))].into_iter().flatten() {
-                if k.1 < pages && !self.previews.contains_key(&k) && !self.thumb_busy.contains(&k) && !self.thumb_failed.contains(&k) {
+                if k.1 < pages && !self.render.previews.contains_key(&k) && !self.render.thumb_busy.contains(&k) && !self.render.thumb_failed.contains(&k) {
                     // Картинки ещё нет — мост сохранит её и сообщит (`PptEvent::Slide`), тогда и прочитаем.
                     let file = dir.join(format!("{}.jpg", k.1 + 1));
                     if file.is_file() {
-                        self.thumb_busy.insert(k);
+                        self.render.thumb_busy.insert(k);
                         let ctx = self.ctx.clone();
-                        render::load_thumb(id, k.1, file, self.out_tx.clone(), move || ctx.request_repaint());
+                        render::load_thumb(id, k.1, file, self.bus.tx.clone(), move || ctx.request_repaint());
                     }
                 }
             }
         }
-        if let Some(srv) = &self.server {
+        if let Some(srv) = &self.net.server {
             let set = cur.map_or(Vec::new(), |(id, page)| {
-                [page.checked_sub(1), Some(page), Some(page + 1)].into_iter().flatten().filter_map(|p| self.thumb_jpg.get(&(id, p)).map(|j| (id, p, j.clone()))).collect()
+                [page.checked_sub(1), Some(page), Some(page + 1)].into_iter().flatten().filter_map(|p| self.render.thumb_jpg.get(&(id, p)).map(|j| (id, p, j.clone()))).collect()
             });
             srv.publish_thumbs(set);
         }
@@ -702,22 +703,22 @@ impl App {
     /// Центр видимой части — не дальше, чем позволяет край слайда (иначе сдвиг «копился» бы за краем).
     pub(crate) fn clamp_center(&mut self) {
         let v = self.slide_view();
-        if let Some(s) = &mut self.show {
+        if let Some(s) = &mut self.session.show {
             s.center = ((v[0] + v[2]) / 2.0, (v[1] + v[3]) / 2.0);
         }
     }
 
     pub(crate) fn trim_pages(&mut self, id: u64, cur: usize) {
-        self.textures.retain(|k, _| k.id == id && k.page + 2 >= cur && k.page <= cur + PREFETCH_AHEAD);
+        self.render.textures.retain(|k, _| k.id == id && k.page + 2 >= cur && k.page <= cur + PREFETCH_AHEAD);
     }
 
     pub(crate) fn reset_pages(&mut self, drop_last: bool) {
-        self.renderer.cancel();
-        self.textures.clear();
-        self.failed.clear();
-        self.render_error = None;
+        self.render.engine.cancel();
+        self.render.textures.clear();
+        self.render.failed.clear();
+        self.render.render_error = None;
         if drop_last {
-            self.last_tex = None;
+            self.render.last_tex = None;
         }
     }
 
@@ -734,13 +735,13 @@ impl App {
 
     /// Сохранить список (порядок, имена, файлы) — он переживает перезапуск программы и сбой.
     pub(crate) fn save_list(&mut self) {
-        if !self.server_online {
+        if !self.net.server_online {
             return;
         }
-        let list: Vec<SavedItem> = self.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone(), repeat: i.repeat }).collect();
-        let audio: Vec<SavedItem> = self.player.tracks.iter().map(|t| SavedItem { name: t.name.clone(), src: t.src.clone(), repeat: false }).collect();
+        let list: Vec<SavedItem> = self.session.items.iter().map(|i| SavedItem { name: i.name.clone(), src: i.src.clone(), repeat: i.repeat }).collect();
+        let audio: Vec<SavedItem> = self.player.engine.tracks.iter().map(|t| SavedItem { name: t.name.clone(), src: t.src.clone(), repeat: false }).collect();
         let (list_path, audio_path) = (self.list_path(), self.audio_path());
-        for (list, path, saved) in [(list, list_path, &mut self.saved_list), (audio, audio_path, &mut self.saved_audio)] {
+        for (list, path, saved) in [(list, list_path, &mut self.session.saved_list), (audio, audio_path, &mut self.player.saved_audio)] {
             let Ok(text) = serde_json::to_string_pretty(&list) else { continue };
             if text == *saved {
                 continue;
@@ -796,10 +797,10 @@ impl App {
         let mut missing = 0;
         for it in list.into_iter().chain(audio) {
             if it.src.is_file() {
-                let before = self.items.len();
+                let before = self.session.items.len();
                 self.add_local(it.src, Some(it.name), ctx);
-                if self.items.len() > before {
-                    if let Some(last) = self.items.last_mut() {
+                if self.session.items.len() > before {
+                    if let Some(last) = self.session.items.last_mut() {
                         last.repeat = it.repeat;
                     }
                 }
@@ -807,12 +808,12 @@ impl App {
                 missing += 1;
             }
         }
-        if !self.items.is_empty() || !self.player.tracks.is_empty() {
-            self.status = format!("Список восстановлен (файлов: {}", self.items.len() + self.player.tracks.len());
+        if !self.session.items.is_empty() || !self.player.engine.tracks.is_empty() {
+            self.ui.status = format!("Список восстановлен (файлов: {}", self.session.items.len() + self.player.engine.tracks.len());
             if missing > 0 {
-                self.status += &format!(", не найдено: {missing}");
+                self.ui.status += &format!(", не найдено: {missing}");
             }
-            self.status += ")";
+            self.ui.status += ")";
         }
     }
 
@@ -825,7 +826,7 @@ impl App {
         }
         // Картинки слайдов — если этот же файл не остался в списке ещё раз.
         if let Some(dir) = &it.slides {
-            if !self.items.iter().any(|i| i.slides.as_ref() == Some(dir)) {
+            if !self.session.items.iter().any(|i| i.slides.as_ref() == Some(dir)) {
                 let _ = std::fs::remove_dir_all(dir);
             }
         }
@@ -849,8 +850,8 @@ impl App {
         // Звук — в плеер, а не в список презентаций.
         if AUDIO_EXTS.contains(&ext.as_str()) {
             let name = name.unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-            self.player.add(path, name);
-            self.dirty = true;
+            self.player.engine.add(path, name);
+            self.session.dirty = true;
             return;
         }
         let kind = match ext.as_str() {
@@ -859,29 +860,29 @@ impl App {
             "pptx" | "ppt" | "ppsx" | "pps" => "PPTX",
             e if VIDEO_EXTS.contains(&e) => "ВИДЕО",
             _ => {
-                self.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX, картинка, видео или музыка)");
+                self.ui.status = format!("Формат .{ext} не поддерживается (нужен PDF, PPTX, картинка, видео или музыка)");
                 return;
             }
         };
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.session.next_id;
+        self.session.next_id += 1;
         let name = name.unwrap_or_else(|| path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
         let slides = (kind == "PPTX").then(|| self.slides_dir(&path));
-        self.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing, slides, repeat: false, linked: Vec::new() });
+        self.session.items.push(Item { id, name, kind: kind.into(), src: path.clone(), pdf: None, pages: 0, status: Status::Preparing, slides, repeat: false, linked: Vec::new() });
         if kind == "PPTX" {
             // PowerPoint запускаем заранее (скрыто) — к показу он уже будет готов.
-            self.ppt_host.prewarm();
+            self.ppt.host.prewarm();
         }
         let ctx = ctx.clone();
-        self.renderer.prepare(id, path, self.out_tx.clone(), move || ctx.request_repaint());
-        self.dirty = true;
+        self.render.engine.prepare(id, path, self.bus.tx.clone(), move || ctx.request_repaint());
+        self.session.dirty = true;
     }
 
     /// Добавление файлов: клиент отправляет их на сервер, иначе добавляем к себе.
     pub(crate) fn add_files(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         for p in paths {
-            if self.connected {
-                if let Some(c) = &self.client {
+            if self.net.connected {
+                if let Some(c) = &self.net.client {
                     c.send(CliReq::Upload(p.clone()));
                 }
                 // Тот же файл — и на резервный сервер, чтобы на нём было всё для переключения.
@@ -897,10 +898,10 @@ impl App {
     // ------------------------------------------------------------ события
 
     pub(crate) fn poll(&mut self, ctx: &egui::Context) {
-        while let Ok(out) = self.out_rx.try_recv() {
+        while let Ok(out) = self.bus.rx.try_recv() {
             match out {
                 Out::Prepared { id, result, linked } => {
-                    if let Some(it) = self.items.iter_mut().find(|i| i.id == id) {
+                    if let Some(it) = self.session.items.iter_mut().find(|i| i.id == id) {
                         match result {
                             Ok((pdf, pages)) => {
                                 it.pdf = pdf;
@@ -915,21 +916,21 @@ impl App {
                         // Видео по ссылке — предупредить сразу, при загрузке, а не на мероприятии.
                         if !linked.is_empty() {
                             jlog!("В «{}» видео по ссылке, файлов нет: {}", it.name, linked.join(", "));
-                            self.status = format!("Внимание: в «{}» {} — их не будет на экране. Вставьте видео в саму презентацию", it.name, linked_text(&linked));
+                            self.ui.status = format!("Внимание: в «{}» {} — их не будет на экране. Вставьте видео в саму презентацию", it.name, linked_text(&linked));
                         }
                         it.linked = linked;
-                        self.dirty = true;
+                        self.session.dirty = true;
                     }
                 }
                 Out::Ppt { gen, ev } => {
-                    if self.show.as_ref().is_some_and(|s| s.gen == gen) {
+                    if self.session.show.as_ref().is_some_and(|s| s.gen == gen) {
                         // Позиция без изменений и сохранённые слайды рассылки не требуют.
-                        self.dirty |= !matches!(ev, ppt::PptEvent::Pos(..) | ppt::PptEvent::Slide(_));
+                        self.session.dirty |= !matches!(ev, ppt::PptEvent::Pos(..) | ppt::PptEvent::Slide(_));
                         match ev {
                             ppt::PptEvent::Ready(total, hwnd) => {
                                 jlog!("PowerPoint: показ готов, слайдов {total}");
-                                self.status.clear();
-                                if let Some(s) = &mut self.show {
+                                self.ui.status.clear();
+                                if let Some(s) = &mut self.session.show {
                                     s.pages = total.max(1);
                                     if let ShowKind::Ppt(p) = &mut s.kind {
                                         p.phase = PptPhase::Ready(Instant::now());
@@ -938,9 +939,9 @@ impl App {
                                 }
                             }
                             ppt::PptEvent::Pos(cur, total) => {
-                                if let Some(s) = &mut self.show {
+                                if let Some(s) = &mut self.session.show {
                                     let (page, pages) = (cur.saturating_sub(1), total.max(1));
-                                    self.dirty |= (s.page, s.pages) != (page, pages);
+                                    self.session.dirty |= (s.page, s.pages) != (page, pages);
                                     if page != s.page {
                                         (s.zoom, s.center) = (1.0, (0.5, 0.5));
                                     }
@@ -949,28 +950,28 @@ impl App {
                             }
                             // Мост сохранил слайд картинкой — превью может его прочитать.
                             ppt::PptEvent::Slide(n) => {
-                                if let Some(s) = &self.show {
-                                    self.thumb_failed.remove(&(s.id, n.saturating_sub(1)));
+                                if let Some(s) = &self.session.show {
+                                    self.render.thumb_failed.remove(&(s.id, n.saturating_sub(1)));
                                 }
                             }
                             // Крупная картинка слайда сохранена — читаем её.
                             ppt::PptEvent::Zoom(n) => {
                                 if let Some(path) = self.ppt_zoom_file(n.saturating_sub(1)) {
                                     let c = ctx.clone();
-                                    render::load_ppt_zoom(gen, n.saturating_sub(1), path, self.out_tx.clone(), move || c.request_repaint());
+                                    render::load_ppt_zoom(gen, n.saturating_sub(1), path, self.bus.tx.clone(), move || c.request_repaint());
                                 }
                             }
                             ppt::PptEvent::Media(slide, list) => {
-                                if let Some(ShowKind::Ppt(p)) = self.show.as_mut().map(|s| &mut s.kind) {
+                                if let Some(ShowKind::Ppt(p)) = self.session.show.as_mut().map(|s| &mut s.kind) {
                                     p.media = (slide, list);
                                 }
-                                self.dirty = true;
+                                self.session.dirty = true;
                             }
                             ppt::PptEvent::ZoomFailed(e) => {
-                                if let Some(ShowKind::Ppt(p)) = self.show.as_mut().map(|s| &mut s.kind) {
+                                if let Some(ShowKind::Ppt(p)) = self.session.show.as_mut().map(|s| &mut s.kind) {
                                     p.zoom_busy = None;
                                 }
-                                self.status = format!("PowerPoint: не удалось увеличить слайд: {e}");
+                                self.ui.status = format!("PowerPoint: не удалось увеличить слайд: {e}");
                             }
                             ppt::PptEvent::Ended => {
                                 jlog!("PowerPoint: показ закончился (закрыт в PowerPoint)");
@@ -978,58 +979,58 @@ impl App {
                             }
                             ppt::PptEvent::Error(e) => {
                                 self.close_show();
-                                self.status = format!("PowerPoint: {e}");
+                                self.ui.status = format!("PowerPoint: {e}");
                             }
                         }
                     }
                 }
                 Out::PptZoom { gen, page, image } => {
-                    if let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) {
+                    if let Some(s) = self.session.show.as_mut().filter(|s| s.gen == gen) {
                         if let ShowKind::Ppt(p) = &mut s.kind {
                             p.zoom_busy = None;
                             match image {
                                 Ok(img) => p.zoom_img = Some((page, ctx.load_texture("ppt_zoom", img, egui::TextureOptions::LINEAR))),
-                                Err(e) => self.status = format!("PowerPoint: не удалось прочитать увеличенный слайд: {e}"),
+                                Err(e) => self.ui.status = format!("PowerPoint: не удалось прочитать увеличенный слайд: {e}"),
                             }
-                            self.dirty = true;
+                            self.session.dirty = true;
                         }
                     }
                 }
                 Out::ShowEsc => self.esc_press(),
                 Out::Image { gen, result } => {
-                    if let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) {
+                    if let Some(s) = self.session.show.as_mut().filter(|s| s.gen == gen) {
                         match result {
                             Ok(frames) if !frames.is_empty() => s.kind = ShowKind::Image(Some(background::Background::new(ctx, frames))),
                             Ok(_) => {}
-                            Err(e) => self.status = format!("Картинка: {e}"),
+                            Err(e) => self.ui.status = format!("Картинка: {e}"),
                         }
                     }
                 }
                 Out::Background { gen, result } => {
-                    if gen == self.bg_gen {
+                    if gen == self.stage.bg_gen {
                         match result {
-                            Ok(frames) if !frames.is_empty() => self.bg = Some(background::Background::new(ctx, frames)),
+                            Ok(frames) if !frames.is_empty() => self.stage.bg = Some(background::Background::new(ctx, frames)),
                             Ok(_) => {}
-                            Err(e) => self.status = format!("Фон: {e}"),
+                            Err(e) => self.ui.status = format!("Фон: {e}"),
                         }
                     }
                 }
                 Out::Audio(ev) => {
-                    self.dirty |= self.player.on_event(ev);
-                    if let Some(m) = self.player.message.take() {
-                        self.status = m;
-                        self.dirty = true;
+                    self.session.dirty |= self.player.engine.on_event(ev);
+                    if let Some(m) = self.player.engine.message.take() {
+                        self.ui.status = m;
+                        self.session.dirty = true;
                     }
                 }
-                Out::Health(h) => self.local_health = Some(h),
+                Out::Health(h) => self.net.local_health = Some(h),
                 Out::Video { gen, ev } => {
-                    let Some(s) = self.show.as_mut().filter(|s| s.gen == gen) else { continue };
+                    let Some(s) = self.session.show.as_mut().filter(|s| s.gen == gen) else { continue };
                     let ShowKind::Video(v) = &mut s.kind else { continue };
                     match ev {
                         video::VideoEvent::Ready(dur) => {
                             v.state = VideoState::Armed;
                             v.dur = dur;
-                            self.dirty = true;
+                            self.session.dirty = true;
                         }
                         video::VideoEvent::Pos { pos, dur, playing } => {
                             let state = match v.state {
@@ -1039,7 +1040,7 @@ impl App {
                             };
                             // Рассылаем клиентам только смену секунды или состояния.
                             if pos as u32 != v.pos as u32 || state != v.state || dur as u32 != v.dur as u32 {
-                                self.dirty = true;
+                                self.session.dirty = true;
                             }
                             (v.pos, v.dur, v.state) = (pos, dur, state);
                         }
@@ -1047,190 +1048,190 @@ impl App {
                         // пробел или «Старт» запускают его снова сразу. Закрыть — «Закрыть показ».
                         video::VideoEvent::Ended => {
                             (v.state, v.pos) = (VideoState::Armed, 0.0);
-                            self.status = "Видео доиграло — снова готово к запуску (пробел или «Старт»)".into();
-                            self.dirty = true;
+                            self.ui.status = "Видео доиграло — снова готово к запуску (пробел или «Старт»)".into();
+                            self.session.dirty = true;
                         }
                         video::VideoEvent::Error(e) => {
                             self.close_show();
-                            self.status = format!("Видео: {e}");
-                            self.dirty = true;
+                            self.ui.status = format!("Видео: {e}");
+                            self.session.dirty = true;
                         }
                     }
                 }
                 Out::Page { key, image } => {
-                    let cur = self.show.as_ref().filter(|s| s.id == key.id).map(|s| s.page);
+                    let cur = self.session.show.as_ref().filter(|s| s.id == key.id).map(|s| s.page);
                     // Страница, до которой уже не долистать в пределах кеша, не нужна.
                     if let Some(cur) = cur.filter(|&c| key.page + 2 >= c && key.page <= c + PREFETCH_AHEAD) {
                         let tex = ctx.load_texture(format!("p{}_{}", key.id, key.page), image, egui::TextureOptions::LINEAR);
-                        self.textures.insert(key, tex);
+                        self.render.textures.insert(key, tex);
                         self.trim_pages(key.id, cur);
                     }
                 }
                 Out::PageErr { key, msg } => {
-                    self.failed.insert(key);
-                    if self.show.as_ref().is_some_and(|s| s.id == key.id && s.page == key.page) {
-                        self.render_error = Some(msg);
+                    self.render.failed.insert(key);
+                    if self.session.show.as_ref().is_some_and(|s| s.id == key.id && s.page == key.page) {
+                        self.render.render_error = Some(msg);
                     }
                 }
                 Out::Thumb { id, page, image, jpg } => {
-                    self.thumb_busy.remove(&(id, page));
+                    self.render.thumb_busy.remove(&(id, page));
                     // Пока миниатюра готовилась, могли перелистнуть — ненужную не держим.
-                    if self.show.as_ref().is_some_and(|s| s.id == id && thumb_near(page, s.page)) {
+                    if self.session.show.as_ref().is_some_and(|s| s.id == id && thumb_near(page, s.page)) {
                         let tex = ctx.load_texture(format!("t{id}_{page}"), image, egui::TextureOptions::LINEAR);
-                        self.previews.insert((id, page), tex);
-                        self.thumb_jpg.insert((id, page), Arc::new(jpg));
+                        self.render.previews.insert((id, page), tex);
+                        self.render.thumb_jpg.insert((id, page), Arc::new(jpg));
                     }
                 }
                 Out::ThumbErr { id, page } => {
-                    self.thumb_busy.remove(&(id, page));
-                    self.thumb_failed.insert((id, page));
+                    self.render.thumb_busy.remove(&(id, page));
+                    self.render.thumb_failed.insert((id, page));
                 }
             }
         }
 
-        while let Ok(ev) = self.mirror_rx.try_recv() {
+        while let Ok(ev) = self.net.mirror_rx.try_recv() {
             match ev {
-                CliEvent::UploadOk(name) => self.status = format!("Файл «{name}» передан и на резервный сервер"),
-                CliEvent::UploadErr { name, msg } => self.status = format!("Резервный сервер: не удалось передать «{name}»: {msg}"),
+                CliEvent::UploadOk(name) => self.ui.status = format!("Файл «{name}» передан и на резервный сервер"),
+                CliEvent::UploadErr { name, msg } => self.ui.status = format!("Резервный сервер: не удалось передать «{name}»: {msg}"),
                 _ => {}
             }
         }
 
-        while let Ok(ev) = self.srv_rx.try_recv() {
+        while let Ok(ev) = self.net.srv_rx.try_recv() {
             match ev {
                 SrvEvent::Started => {
-                    self.server_online = true;
+                    self.net.server_online = true;
                     // Сервер восстанавливает свой список (если в окне ещё ничего нет).
-                    if self.items.is_empty() && self.player.tracks.is_empty() {
+                    if self.session.items.is_empty() && self.player.engine.tracks.is_empty() {
                         self.load_list(ctx);
                     }
                     // Файлы из `--add` — после восстановления списка (иначе он не восстановился бы).
-                    let add = std::mem::take(&mut self.pending_add);
+                    let add = std::mem::take(&mut self.session.pending_add);
                     self.add_files(add, ctx);
-                    self.dirty = true;
+                    self.session.dirty = true;
                     self.start_collector();
-                    self.stage = true; // на мониторе показа сервера сразу выводим фон
-                    self.net_status = format!("Сервер запущен на порту {}", self.cfg.port);
-                    self.dirty = true;
+                    self.stage.visible = true; // на мониторе показа сервера сразу выводим фон
+                    self.ui.net_status = format!("Сервер запущен на порту {}", self.cfg.port);
+                    self.session.dirty = true;
                 }
                 SrvEvent::Failed(e) => {
-                    self.server = None;
-                    self.server_online = false;
-                    self.net_status = format!("Не удалось запустить сервер: {e}");
+                    self.net.server = None;
+                    self.net.server_online = false;
+                    self.ui.net_status = format!("Не удалось запустить сервер: {e}");
                 }
                 SrvEvent::Clients(n) => {
                     jlog!("Клиентов подключено: {n}");
-                    self.clients = n;
+                    self.net.clients = n;
                 }
                 SrvEvent::Hello { version } => {
                     let ours = env!("CARGO_PKG_VERSION");
                     jlog!("Подключился клиент, версия {}", if version.is_empty() { "старая (без номера)" } else { &version });
                     if version != ours {
                         let v = if version.is_empty() { "старой версии".to_string() } else { format!("версии {version}") };
-                        self.status = format!("Подключился клиент {v}, здесь {ours} — обновите программу, иначе часть кнопок не работает");
+                        self.ui.status = format!("Подключился клиент {v}, здесь {ours} — обновите программу, иначе часть кнопок не работает");
                     }
                 }
                 SrvEvent::Cmd(cmd) => {
-                    if self.server.is_some() {
+                    if self.net.server.is_some() {
                         self.apply(cmd);
                     }
                 }
                 SrvEvent::Background { name, path } => {
-                    if self.server.is_some() {
+                    if self.net.server.is_some() {
                         self.set_background(&path, &name);
                     }
                     let _ = std::fs::remove_file(&path); // копия уже в папке настроек
                 }
                 SrvEvent::File { name, path } => {
-                    if self.server.is_some() {
-                        self.status = format!("Получен файл: {name}");
+                    if self.net.server.is_some() {
+                        self.ui.status = format!("Получен файл: {name}");
                         self.add_local(path, Some(name), ctx);
                     }
                 }
             }
         }
 
-        while let Ok(ev) = self.cli_rx.try_recv() {
+        while let Ok(ev) = self.net.cli_rx.try_recv() {
             match ev {
                 CliEvent::Rtt(ms) => {
-                    self.rtt = Some(ms);
-                    self.remote_live = true;
-                    self.last_seen = Some(Instant::now());
+                    self.net.rtt = Some(ms);
+                    self.net.remote_live = true;
+                    self.net.last_seen = Some(Instant::now());
                 }
                 CliEvent::Health(h) => {
-                    self.remote_health = Some(h);
-                    self.remote_live = true;
-                    self.last_seen = Some(Instant::now());
-                    self.health_at = self.last_seen;
+                    self.net.remote_health = Some(h);
+                    self.net.remote_live = true;
+                    self.net.last_seen = Some(Instant::now());
+                    self.net.health_at = self.net.last_seen;
                 }
                 CliEvent::Connected => {
-                    (self.remote_health, self.rtt, self.remote_live, self.health_at, self.lost) = (None, None, false, None, None);
-                    self.reconnect = None;
+                    (self.net.remote_health, self.net.rtt, self.net.remote_live, self.net.health_at, self.net.lost) = (None, None, false, None, None);
+                    self.net.reconnect = None;
                     // Файлы из `--add` — на сервер (и на резерв).
-                    let add = std::mem::take(&mut self.pending_add);
+                    let add = std::mem::take(&mut self.session.pending_add);
                     if !add.is_empty() {
-                        self.connected = true;
+                        self.net.connected = true;
                         self.add_files(add, ctx);
                     }
-                    self.last_seen = Some(Instant::now());
-                    self.connected = true;
+                    self.net.last_seen = Some(Instant::now());
+                    self.net.connected = true;
                     self.close_show();
-                    self.previews.clear(); // номера элементов у сервера свои
-                    self.net_status = format!("Подключено к {}:{}", self.cfg.ip, self.cfg.port);
-                    self.status.clear();
+                    self.render.previews.clear(); // номера элементов у сервера свои
+                    self.ui.net_status = format!("Подключено к {}:{}", self.cfg.ip, self.cfg.port);
+                    self.ui.status.clear();
                     self.remember_server();
                 }
                 CliEvent::Closed(reason) => {
                     // Обрыв не по нашей команде (пустая причина — мы отключились сами) — тревога
                     // и автопереподключение. Неудачная попытка — следующая через RECONNECT_EVERY.
-                    let retrying = self.reconnect.is_some();
-                    if (self.connected || retrying) && !reason.is_empty() {
-                        if self.connected {
-                            self.lost = Some(reason.clone());
+                    let retrying = self.net.reconnect.is_some();
+                    if (self.net.connected || retrying) && !reason.is_empty() {
+                        if self.net.connected {
+                            self.net.lost = Some(reason.clone());
                         }
-                        let attempt = self.reconnect.map_or(0, |(n, _)| n);
-                        self.reconnect = (attempt < RECONNECT_TRIES && reason != "Неверный пароль").then(|| (attempt, Instant::now() + RECONNECT_EVERY));
+                        let attempt = self.net.reconnect.map_or(0, |(n, _)| n);
+                        self.net.reconnect = (attempt < RECONNECT_TRIES && reason != "Неверный пароль").then(|| (attempt, Instant::now() + RECONNECT_EVERY));
                     }
-                    (self.remote_health, self.rtt, self.remote_live, self.last_seen, self.health_at) = (None, None, false, None, None);
-                    self.connected = false;
-                    self.client = None;
-                    self.remote = StateMsg::default();
-                    self.previews.clear();
-                    (self.got_state, self.version_hidden) = (false, false);
-                    self.net_status = if reason.is_empty() { "Отключено".into() } else { reason };
+                    (self.net.remote_health, self.net.rtt, self.net.remote_live, self.net.last_seen, self.net.health_at) = (None, None, false, None, None);
+                    self.net.connected = false;
+                    self.net.client = None;
+                    self.net.remote = StateMsg::default();
+                    self.render.previews.clear();
+                    (self.ui.got_state, self.ui.version_hidden) = (false, false);
+                    self.ui.net_status = if reason.is_empty() { "Отключено".into() } else { reason };
                 }
                 CliEvent::State(s) => {
-                    self.last_seen = Some(Instant::now());
-                    self.remote_at = Instant::now();
-                    if s.message != self.remote.message {
-                        self.status = s.message.clone();
+                    self.net.last_seen = Some(Instant::now());
+                    self.stage.remote_at = Instant::now();
+                    if s.message != self.net.remote.message {
+                        self.ui.status = s.message.clone();
                     }
-                    if !self.got_state {
-                        self.got_state = true;
+                    if !self.ui.got_state {
+                        self.ui.got_state = true;
                         let ours = env!("CARGO_PKG_VERSION");
                         if s.version != ours {
                             jlog!("Версия сервера {} не совпадает с этой ({ours})", if s.version.is_empty() { "старая (без номера)" } else { &s.version });
                         }
                     }
-                    if self.remote.pdf_engine != s.pdf_engine {
-                        self.previews.clear();
+                    if self.net.remote.pdf_engine != s.pdf_engine {
+                        self.render.previews.clear();
                     }
-                    self.remote = s;
-                    self.last_show = self.remote.active.and_then(|id| self.remote.items.iter().find(|i| i.id == id)).map(|it| (it.name.clone(), self.remote.page));
+                    self.net.remote = s;
+                    self.session.last_show = self.net.remote.active.and_then(|id| self.net.remote.items.iter().find(|i| i.id == id)).map(|it| (it.name.clone(), self.net.remote.page));
                     self.continue_resume();
                 }
                 CliEvent::Progress { name, sent, total } => {
                     // Пока идёт передача файла, пинги ждут своей очереди — это не молчание сервера.
-                    self.last_seen = Some(Instant::now());
+                    self.net.last_seen = Some(Instant::now());
                     let pct = if total > 0 { sent * 100 / total } else { 100 };
-                    self.status = format!("Отправка «{name}»: {pct}%");
+                    self.ui.status = format!("Отправка «{name}»: {pct}%");
                 }
-                CliEvent::UploadOk(name) => self.status = format!("Файл «{name}» передан на сервер"),
-                CliEvent::UploadErr { name, msg } => self.status = format!("Не удалось передать «{name}»: {msg}"),
+                CliEvent::UploadOk(name) => self.ui.status = format!("Файл «{name}» передан на сервер"),
+                CliEvent::UploadErr { name, msg } => self.ui.status = format!("Не удалось передать «{name}»: {msg}"),
                 CliEvent::Thumb { id, page, image } => {
-                    if self.connected && self.remote.active == Some(id) {
+                    if self.net.connected && self.net.remote.active == Some(id) {
                         let tex = ctx.load_texture(format!("t{id}_{page}"), image, egui::TextureOptions::LINEAR);
-                        self.previews.insert((id, page), tex);
+                        self.render.previews.insert((id, page), tex);
                     }
                 }
             }

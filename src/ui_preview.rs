@@ -106,15 +106,15 @@ impl App {
         ui.horizontal(|ui| {
             let page = view.page;
             match page.checked_sub(1) {
-                Some(prev) => slot(ui, format!("Предыдущий — слайд {}", prev + 1), self.previews.get(&(id, prev)), "готовится…", false),
+                Some(prev) => slot(ui, format!("Предыдущий — слайд {}", prev + 1), self.render.previews.get(&(id, prev)), "готовится…", false),
                 None => slot(ui, "Предыдущий".into(), None, "начало презентации", false),
             };
             ui.add_space(GAP);
-            let cur = slot(ui, format!("Сейчас — слайд {}", page + 1), self.previews.get(&(id, page)), "готовится…", true);
+            let cur = slot(ui, format!("Сейчас — слайд {}", page + 1), self.render.previews.get(&(id, page)), "готовится…", true);
             self.media_marks(ui, cur, &view.media);
             ui.add_space(GAP);
             if page + 1 < view.pages {
-                slot(ui, format!("Далее — слайд {}", page + 2), self.previews.get(&(id, page + 1)), "готовится…", false);
+                slot(ui, format!("Далее — слайд {}", page + 2), self.render.previews.get(&(id, page + 1)), "готовится…", false);
             } else {
                 slot(ui, "Далее".into(), None, "конец презентации", false);
             }
@@ -191,7 +191,7 @@ impl App {
                 }
             }
         });
-        self.media_hover = hover;
+        self.ui.media_hover = hover;
         for c in cmds {
             self.act(c);
         }
@@ -207,7 +207,7 @@ impl App {
             let r = egui::Rect::from_center_size(r.center(), r.size().max(egui::vec2(14.0, 14.0)));
             let resp = ui.interact(r, ui.id().with(("media_mark", i)), egui::Sense::click());
             let color = if m.state == 0 { GREEN } else { BLUE };
-            let hot = resp.hovered() || self.media_hover == Some(i);
+            let hot = resp.hovered() || self.ui.media_hover == Some(i);
             let p = ui.painter();
             if hot {
                 p.rect_filled(r, 2.0, color.gamma_multiply(0.25));

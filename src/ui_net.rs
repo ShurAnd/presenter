@@ -11,21 +11,21 @@ impl App {
             ui.label(RichText::new("Подключение к экрану показа").size(18.0).strong());
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                let (t, c) = if self.server.is_some() { ("■ Остановить сервер", RED) } else { ("▶ Запустить сервер", BLUE) };
+                let (t, c) = if self.net.server.is_some() { ("■ Остановить сервер", RED) } else { ("▶ Запустить сервер", BLUE) };
                 if btn(ui, t, c).on_hover_text("Запустить или остановить сервер в этом окне").clicked() {
                     self.toggle_server(&ctx);
                 }
-                let (t, c) = if self.client.is_some() { ("Отключиться", RED) } else { ("Подключиться", BLUE) };
+                let (t, c) = if self.net.client.is_some() { ("Отключиться", RED) } else { ("Подключиться", BLUE) };
                 if btn(ui, t, c).on_hover_text("Подключиться к серверу и управлять им").clicked() {
                     self.toggle_client(&ctx);
                 }
             });
             ui.add_space(4.0);
-            let st = if self.net_status.is_empty() { "Подключения нет" } else { self.net_status.as_str() };
+            let st = if self.ui.net_status.is_empty() { "Подключения нет" } else { self.ui.net_status.as_str() };
             ui.label(RichText::new(st).size(14.0).strong());
             ui.add_space(8.0);
 
-            let locked = self.server.is_some() || self.client.is_some();
+            let locked = self.net.server.is_some() || self.net.client.is_some();
             egui::Frame::new().fill(UI_BG).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
                 ui.add_enabled_ui(!locked, |ui| {
                     egui::Grid::new("net").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
@@ -54,7 +54,7 @@ impl App {
                             if ui.add_enabled(known.is_some(), egui::Button::new("Забыть")).on_hover_text("Убрать этот сервер из списка").clicked() {
                                 if let Some(i) = known {
                                     let srv = self.cfg.servers.remove(i);
-                                    self.forgotten.insert(srv.key());
+                                    self.session.forgotten.insert(srv.key());
                                     self.save_cfg();
                                 }
                             }
@@ -99,7 +99,7 @@ impl App {
                     self.save_cfg();
                 }
                 if ui.button("Добавить…").on_hover_text("Ввести резервный сервер, которого нет в списке").clicked() {
-                    self.reserve_form = Some(SavedServer { port: "14999".into(), password: "default_password".into(), ..Default::default() });
+                    self.ui.reserve_form = Some(SavedServer { port: "14999".into(), password: "default_password".into(), ..Default::default() });
                 }
             })
             .response

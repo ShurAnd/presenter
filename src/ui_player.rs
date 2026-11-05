@@ -44,7 +44,7 @@ impl App {
                     for (n, t) in a.tracks.iter().enumerate() {
                         let is_cur = a.current == Some(t.id) && a.state != AudioState::Stopped;
                         let is_ins = a.insert == Some(t.id);
-                        let is_sel = self.audio_selected == Some(t.id);
+                        let is_sel = self.player.selected == Some(t.id);
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
                         let bg = if is_cur || is_ins {
                             UI_LIVE
@@ -85,10 +85,10 @@ impl App {
                         }
                         let resp = resp.on_hover_text(&t.name);
                         if resp.clicked() {
-                            self.audio_selected = Some(t.id);
+                            self.player.selected = Some(t.id);
                         }
                         if resp.double_clicked() {
-                            self.audio_selected = Some(t.id);
+                            self.player.selected = Some(t.id);
                             self.act(Cmd::AudioPlay { id: t.id });
                         }
                     }
@@ -98,7 +98,7 @@ impl App {
 
     /// Позиция (с перемоткой) и кнопки плеера.
     pub(crate) fn player_controls(&mut self, ui: &mut egui::Ui, a: &AudioInfo) {
-        let sel = self.audio_selected.filter(|id| a.tracks.iter().any(|t| t.id == *id));
+        let sel = self.player.selected.filter(|id| a.tracks.iter().any(|t| t.id == *id));
         let ins = a.insert.is_some();
         // Позиция того, что звучит: вставки, если она идёт, иначе музыки.
         let (pos, dur, name) = if ins { (a.insert_pos, a.insert_dur, a.insert) } else { (a.pos, a.dur, a.current) };
@@ -114,15 +114,15 @@ impl App {
         });
         ui.horizontal(|ui| {
             let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);
-            ui.label(t(self.audio_seek.map_or(pos, |v| v as u32)));
+            ui.label(t(self.player.seek.map_or(pos, |v| v as u32)));
             ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(60.0);
-            let mut v = self.audio_seek.unwrap_or(pos as f32);
+            let mut v = self.player.seek.unwrap_or(pos as f32);
             let r = ui.add_enabled(active && dur > 0, egui::Slider::new(&mut v, 0.0..=dur.max(1) as f32).show_value(false));
             if r.dragged() {
-                self.audio_seek = Some(v);
+                self.player.seek = Some(v);
             }
             if r.drag_stopped() || r.clicked() {
-                self.audio_seek = None;
+                self.player.seek = None;
                 self.act(Cmd::AudioSeek { secs: v as u32 });
             }
             ui.label(t(dur));
@@ -175,9 +175,9 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_enabled(sel.is_some(), cbutton("Удалить", GRAY)).clicked() {
-                    if let Some(id) = self.audio_selected {
+                    if let Some(id) = self.player.selected {
                         let name = a.tracks.iter().find(|t| t.id == id).map(|t| t.name.clone()).unwrap_or_default();
-                        self.confirm = Some((format!("Удалить «{name}» из плеера? Файл удалится и на сервере."), "Удалить", Cmd::AudioRemove { id }));
+                        self.ui.confirm = Some((format!("Удалить «{name}» из плеера? Файл удалится и на сервере."), "Удалить", Cmd::AudioRemove { id }));
                     }
                 }
             });

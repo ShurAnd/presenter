@@ -286,15 +286,15 @@ pub(crate) fn indicator(ui: &mut egui::Ui, color: Color32, text: &str) {
 impl App {
     /// Красная полоса под верхней панелью, пока у сервера проблема.
     pub(crate) fn alarm_bar(&mut self, ctx: &egui::Context) {
-        let problems: Vec<String> = if let (false, Some(reason)) = (self.connected, &self.lost) {
+        let problems: Vec<String> = if let (false, Some(reason)) = (self.net.connected, &self.net.lost) {
             // Общую причину «соединение потеряно» не повторяем, конкретную (например, «не отвечает») — показываем.
             let mut text = if reason.contains("потеряно") { "связь с сервером потеряна".to_string() } else { format!("связь с сервером потеряна: {reason}") };
-            match self.reconnect {
+            match self.net.reconnect {
                 Some((n, _)) => text += &format!(" — переподключаюсь (попытка {} из {RECONNECT_TRIES})", n.max(1)),
                 None => text += " — автоматически переподключиться не удалось",
             }
             vec![text]
-        } else if self.connected {
+        } else if self.net.connected {
             let (level, rows) = self.health_rows();
             if level != health::Level::Bad {
                 return;
@@ -303,7 +303,7 @@ impl App {
         } else {
             return;
         };
-        let lost = !self.connected;
+        let lost = !self.net.connected;
         let reserve = self.reserve_server();
         let frame = egui::Frame::new().fill(RED).inner_margin(egui::Margin::symmetric(10, 6));
         egui::TopBottomPanel::top("alarm").frame(frame).show(ctx, |ui| {
@@ -318,17 +318,17 @@ impl App {
                     }
                 }
                 if lost {
-                    if self.reconnect.is_none() && btn(ui, "Переподключиться", BLUE).clicked() {
-                        self.lost = None;
+                    if self.net.reconnect.is_none() && btn(ui, "Переподключиться", BLUE).clicked() {
+                        self.net.lost = None;
                         let ctx = self.ctx.clone();
                         self.toggle_client(&ctx);
                     }
                     if btn(ui, "Скрыть", GRAY).clicked() {
-                        self.lost = None;
-                        self.reconnect = None;
+                        self.net.lost = None;
+                        self.net.reconnect = None;
                     }
                 } else if btn(ui, "Показатели", GRAY).clicked() {
-                    self.health_open = true;
+                    self.ui.health_open = true;
                 }
             });
         });
@@ -336,14 +336,14 @@ impl App {
 
     /// Окно с показателями сервера.
     pub(crate) fn health_window(&mut self, ctx: &egui::Context) {
-        if !self.health_open {
+        if !self.ui.health_open {
             return;
         }
-        if !(self.connected || self.server_online) {
-            self.health_open = false;
+        if !(self.net.connected || self.net.server_online) {
+            self.ui.health_open = false;
             return;
         }
-        if !self.connected {
+        if !self.net.connected {
             // Своё окно показателей на сервере обновляем вслед за замерами.
             ctx.request_repaint_after(Duration::from_secs(2));
         }
@@ -351,10 +351,10 @@ impl App {
         let reserve = self.reserve_server();
         let mut open = true;
         let mut switch = false;
-        let title = if self.connected { "Состояние сервера" } else { "Состояние этого сервера" };
+        let title = if self.net.connected { "Состояние сервера" } else { "Состояние этого сервера" };
         egui::Window::new(title).open(&mut open).collapsible(false).resizable(false).default_width(520.0).show(ctx, |ui| {
             if rows.is_empty() {
-                ui.label(if self.connected {
+                ui.label(if self.net.connected {
                     "Сервер не присылает показатели — вероятно, на нём старая версия Presentator (до 1.0.4)."
                 } else {
                     "Показатели появятся через пару секунд."
@@ -377,7 +377,7 @@ impl App {
             });
             ui.add_space(6.0);
             ui.label(RichText::new("Обновляется каждые 2 с. Жёлтый — на грани, красный — проблема.").size(11.5).color(GRAY));
-            if self.connected {
+            if self.net.connected {
                 ui.add_space(4.0);
                 match &reserve {
                     Some(r) => {
@@ -391,7 +391,7 @@ impl App {
                 }
             }
         });
-        self.health_open = open;
+        self.ui.health_open = open;
         if switch {
             self.switch_to_reserve();
         }
@@ -399,7 +399,7 @@ impl App {
 
     /// Окно ввода резервного сервера — те же поля, что у основного.
     pub(crate) fn reserve_window(&mut self, ctx: &egui::Context) {
-        let Some(mut srv) = self.reserve_form.take() else { return };
+        let Some(mut srv) = self.ui.reserve_form.take() else { return };
         let (mut open, mut save, mut cancel) = (true, false, false);
         let port_ok = srv.port.trim().parse::<u16>().is_ok_and(|p| p > 0);
         let ip_ok = !srv.ip.trim().is_empty();
@@ -444,7 +444,7 @@ impl App {
         if save {
             self.save_reserve(srv);
         } else if open && !cancel {
-            self.reserve_form = Some(srv);
+            self.ui.reserve_form = Some(srv);
         }
     }
 
@@ -470,18 +470,18 @@ impl App {
             let key_btn = egui::Button::new(RichText::new("⌨").size(14.0).color(Color32::WHITE)).fill(fill).corner_radius(5.0).min_size(egui::vec2(44.0, 0.0));
             if ui.add(key_btn).on_hover_text(tip).clicked() {
                 self.cfg.keyboard = !self.cfg.keyboard;
-                self.goto_buf.clear();
+                self.ui.goto_buf.clear();
                 self.save_cfg();
             }
             ui.add_space(4.0);
-            if self.connected || self.server_online {
+            if self.net.connected || self.net.server_online {
                 // Состояние сервера: зелёный — норма, жёлтый — внимание, красный — проблема.
                 let (level, rows) = self.health_rows();
-                let who = if self.connected {
+                let who = if self.net.connected {
                     let name = self.cfg.name.trim();
                     if name.is_empty() { format!("Оператор → {}", self.cfg.ip.trim()) } else { format!("Оператор → {name}") }
                 } else {
-                    format!("Сервер показа ({} кл.)", self.clients)
+                    format!("Сервер показа ({} кл.)", self.net.clients)
                 };
                 let state = match (level, rows.is_empty()) {
                     (_, true) => "нет данных",
@@ -495,7 +495,7 @@ impl App {
                 ui.painter().circle_filled(dot.center(), 6.0, color);
                 let resp = ui.add(egui::Button::new(RichText::new(format!("{who}: {state}")).color(color)).frame(false).truncate());
                 if resp.on_hover_text("Показатели сервера: процессор, память, видеокарта, мониторы, связь").clicked() {
-                    self.health_open = !self.health_open;
+                    self.ui.health_open = !self.ui.health_open;
                 }
             } else {
                 indicator(ui, OFF, "Сервер: офлайн");
@@ -503,25 +503,25 @@ impl App {
             }
 
         });
-        if !matches!(self.tab, Tab::List | Tab::Player) { return; }
+        if !matches!(self.ui.tab, Tab::List | Tab::Player) { return; }
         ui.horizontal(|ui| {
-            let count = if self.tab == Tab::Player { view.audio.tracks.len() } else { view.items.len() };
-            ui.label(RichText::new(format!("{} · {count}", if self.tab == Tab::Player { "Музыка" } else { "Файлы показа" })).color(UI_MUTED));
+            let count = if self.ui.tab == Tab::Player { view.audio.tracks.len() } else { view.items.len() };
+            ui.label(RichText::new(format!("{} · {count}", if self.ui.tab == Tab::Player { "Музыка" } else { "Файлы показа" })).color(UI_MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // На вкладке «Плеер» кнопки работают со списком плеера.
-                let player = self.tab == Tab::Player;
+                let player = self.ui.tab == Tab::Player;
                 let tip = if player { "Очистить список плеера" } else { "Очистить список презентаций" };
                 if btn(ui, "🗑 Очистить", RED).on_hover_text(tip).clicked() {
                     let (n, what) = if player { (view.audio.tracks.len(), "музыки из плеера") } else { (view.items.len(), "презентаций") };
                     if n > 0 {
                         let cmd = if player { Cmd::AudioClear } else { Cmd::Clear };
-                        self.confirm = Some((format!("Очистить список: удалить все файлы {what} ({n} шт.)? Файлы удалятся и на сервере."), "Очистить", cmd));
+                        self.ui.confirm = Some((format!("Очистить список: удалить все файлы {what} ({n} шт.)? Файлы удалятся и на сервере."), "Очистить", cmd));
                     }
                 }
                 let sel = if player {
-                    self.audio_selected.filter(|id| view.audio.tracks.iter().any(|t| t.id == *id))
+                    self.player.selected.filter(|id| view.audio.tracks.iter().any(|t| t.id == *id))
                 } else {
-                    self.selected.filter(|id| view.items.iter().any(|i| i.id == *id))
+                    self.ui.selected.filter(|id| view.items.iter().any(|i| i.id == *id))
                 };
                 let mv = |id, up| if player { Cmd::AudioMove { id, up } } else { Cmd::Move { id, up } };
                 if ui.add_enabled(sel.is_some(), cbutton("⬇ Вниз", GRAY)).clicked() {
@@ -536,7 +536,7 @@ impl App {
 
     /// Статус и команда восстановления фокуса видны оператору для удалённого показа.
     pub(crate) fn ppt_focus_bar(&mut self, ctx: &egui::Context, view: &StateMsg) {
-        if !self.connected || view.active.is_none() { return; }
+        if !self.net.connected || view.active.is_none() { return; }
         let (notice, window, can_restore, color) = match &view.ppt_focus {
             PptFocus::Lost { window } => ("Фокус сменился", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
             PptFocus::Restoring { window } => ("Возвращаем фокус…", Some(window.as_str()), false, Color32::from_rgb(255, 240, 210)),
@@ -573,8 +573,8 @@ impl App {
             .is_some_and(|item| item.kind == KIND_IMAGE) {
             ("Изображение на экране".into(), GREEN)
         } else if active {
-            if !self.goto_buf.is_empty() {
-                (format!("К слайду {} — Enter", self.goto_buf), GREEN)
+            if !self.ui.goto_buf.is_empty() {
+                (format!("К слайду {} — Enter", self.ui.goto_buf), GREEN)
             } else {
                 let zoom = if view.zoom > 1.0 { format!(" · {:.0} %", view.zoom * 100.0) } else { String::new() };
                 (format!("Слайд {} из {}{zoom}", view.page + 1, view.pages), Color32::from_gray(0x33))
@@ -597,7 +597,7 @@ impl App {
             if ui.add_enabled(active, cbutton("Вперёд ▶", GRAY)).clicked() {
                 self.act(Cmd::Next);
             }
-            let sel = self.selected.and_then(|id| view.items.iter().find(|i| i.id == id)).filter(|i| i.ready);
+            let sel = self.ui.selected.and_then(|id| view.items.iter().find(|i| i.id == id)).filter(|i| i.ready);
             if ui.add_enabled(sel.is_some(), cbutton("▶ Показать", BLUE)).clicked() {
                 self.act(Cmd::Open { id: sel.unwrap().id });
             }
@@ -615,10 +615,10 @@ impl App {
             if ui.add_enabled(active, cbutton("■ Закрыть показ", RED)).clicked() {
                 self.act(Cmd::Close);
             }
-            if ui.add_enabled(self.selected.is_some(), cbutton("Удалить", GRAY)).clicked() {
-                if let Some(id) = self.selected {
+            if ui.add_enabled(self.ui.selected.is_some(), cbutton("Удалить", GRAY)).clicked() {
+                if let Some(id) = self.ui.selected {
                     let name = view.items.iter().find(|i| i.id == id).map(|i| i.name.clone()).unwrap_or_default();
-                    self.confirm = Some((format!("Удалить «{name}» из списка? Файл удалится и на сервере."), "Удалить", Cmd::Remove { id }));
+                    self.ui.confirm = Some((format!("Удалить «{name}» из списка? Файл удалится и на сервере."), "Удалить", Cmd::Remove { id }));
                 }
             }
         });
@@ -641,11 +641,11 @@ impl App {
             if active && view.video.is_none() {
                 ui.horizontal(|ui| {
                     ui.label("Слайд №");
-                    let field = ui.add(egui::TextEdit::singleline(&mut self.goto_field).hint_text("№").desired_width(44.0));
+                    let field = ui.add(egui::TextEdit::singleline(&mut self.ui.goto_field).hint_text("№").desired_width(44.0));
                     let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    self.goto_field.retain(|c| c.is_ascii_digit());
+                    self.ui.goto_field.retain(|c| c.is_ascii_digit());
                     if btn(ui, "Перейти", BLUE).clicked() || enter {
-                        let number = std::mem::take(&mut self.goto_field);
+                        let number = std::mem::take(&mut self.ui.goto_field);
                         self.goto_number(&number, view);
                     }
                 });
@@ -656,12 +656,12 @@ impl App {
                 .changed() {
                 self.act(Cmd::Cursor { on: cursor });
             }
-            if btn(ui, "Справка", GRAY).clicked() { self.help_open = !self.help_open; }
+            if btn(ui, "Справка", GRAY).clicked() { self.ui.help_open = !self.ui.help_open; }
         });
         // Ошибки сервера и прогресс передачи — отдельной строкой, не сжимая кнопки.
-        if !self.status.is_empty() {
-            ui.add(egui::Label::new(RichText::new(&self.status).size(11.5).color(Color32::from_gray(0x66))).truncate())
-                .on_hover_text(&self.status);
+        if !self.ui.status.is_empty() {
+            ui.add(egui::Label::new(RichText::new(&self.ui.status).size(11.5).color(Color32::from_gray(0x66))).truncate())
+                .on_hover_text(&self.ui.status);
         }
         if !active && view.screen == Screen::Timer { self.timer_bar(ui, view); }
     }
@@ -694,12 +694,12 @@ impl App {
                     text.truncate(4);
                     r.lost_focus()
                 };
-                let done_min = field(ui, &mut self.timer_min, "timer_min", (t.total / 60).to_string(), "Минуты");
+                let done_min = field(ui, &mut self.stage.timer_min, "timer_min", (t.total / 60).to_string(), "Минуты");
                 ui.label(":");
-                let done_sec = field(ui, &mut self.timer_sec, "timer_sec", format!("{:02}", t.total % 60), "Секунды");
+                let done_sec = field(ui, &mut self.stage.timer_sec, "timer_sec", format!("{:02}", t.total % 60), "Секунды");
                 if done_min || done_sec {
-                    let m: u32 = self.timer_min.parse().unwrap_or(0);
-                    let sec: u32 = self.timer_sec.parse().unwrap_or(0);
+                    let m: u32 = self.stage.timer_min.parse().unwrap_or(0);
+                    let sec: u32 = self.stage.timer_sec.parse().unwrap_or(0);
                     let secs = m * 60 + sec;
                     if secs >= 1 && secs != t.total {
                         self.act(Cmd::TimerSet { countdown: true, secs });
@@ -728,7 +728,7 @@ impl App {
 
     /// Сколько мс назад снято состояние таймера: у клиента — с прихода состояния сервера.
     pub(crate) fn timer_extra(&self) -> u64 {
-        if self.connected { self.remote_at.elapsed().as_millis() as u64 } else { 0 }
+        if self.net.connected { self.stage.remote_at.elapsed().as_millis() as u64 } else { 0 }
     }
 
     /// Кнопки «Выбрать…» и «Стандартный» (во вкладке «Сеть» и в меню кнопки «Фон»).
@@ -745,7 +745,7 @@ impl App {
 
     /// Окно справки: что где нажимать.
     pub(crate) fn help_window(&mut self, ctx: &egui::Context) {
-        if !self.help_open {
+        if !self.ui.help_open {
             return;
         }
         let mut open = true;
@@ -764,21 +764,21 @@ impl App {
                 }
             });
         });
-        self.help_open = open;
+        self.ui.help_open = open;
     }
 
     /// Вкладки «Презентации / Плеер / Сеть»; справа — что играет плеер (видно с любой вкладки).
     pub(crate) fn tab_row(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         ui.horizontal(|ui| {
             for (tab, label) in [(Tab::List, "Презентации"), (Tab::Player, "Плеер"), (Tab::Net, "Сеть"), (Tab::Settings, "Настройки")] {
-                let on = self.tab == tab;
+                let on = self.ui.tab == tab;
                 let text = RichText::new(label).size(14.0).strong().color(if on { UI_ACCENT } else { UI_MUTED });
                 let b = egui::Button::new(text).fill(if on { UI_SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(96.0, 32.0));
                 if ui.add(b).clicked() && !on {
                     if tab == Tab::Net {
                         self.merge_servers_from_disk();
                     }
-                    self.tab = tab;
+                    self.ui.tab = tab;
                 }
             }
             if let Some((text, color)) = now_playing(&view.audio) {
@@ -802,7 +802,7 @@ impl App {
                 ui.set_min_size(ui.available_size());
                 if view.items.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        let t = if self.connected {
+                        let t = if self.net.connected {
                             "Список сервера пуст.\nНажмите «Добавить» или перетащите сюда PDF, PowerPoint, видео или изображения — файлы уйдут на сервер."
                         } else {
                             "Список пуст.\nНажмите «Добавить» или перетащите сюда PDF, PowerPoint, видео или изображения."
@@ -814,7 +814,7 @@ impl App {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for (n, it) in view.items.iter().enumerate() {
                         let is_active = view.active == Some(it.id);
-                        let is_sel = self.selected == Some(it.id);
+                        let is_sel = self.ui.selected == Some(it.id);
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
                         let bg = if is_active {
                             UI_LIVE
@@ -886,10 +886,10 @@ impl App {
                             resp
                         };
                         if resp.clicked() {
-                            self.selected = Some(it.id);
+                            self.ui.selected = Some(it.id);
                         }
                         if resp.double_clicked() && it.ready {
-                            self.selected = Some(it.id);
+                            self.ui.selected = Some(it.id);
                             self.act(Cmd::Open { id: it.id });
                         }
                     }
@@ -898,7 +898,7 @@ impl App {
     }
 
     pub(crate) fn keys(&mut self, ctx: &egui::Context, view: &StateMsg) {
-        if self.confirm.is_some() {
+        if self.ui.confirm.is_some() {
             return;
         }
         if ctx.wants_keyboard_input() {
@@ -919,7 +919,7 @@ impl App {
         }
         let digits = if self.cfg.keyboard { digits } else { String::new() };
         if !self.goto_typed(&digits, enter, view) && enter {
-            if let Some(id) = self.selected {
+            if let Some(id) = self.ui.selected {
                 self.act(Cmd::Open { id });
             }
         }
@@ -928,19 +928,19 @@ impl App {
     /// Номер слайда с клавиатуры, как в PowerPoint: цифры, затем Enter. Работает в главном окне
     /// и на экране показа. Возвращает true, если Enter ушёл на переход к слайду.
     pub(crate) fn goto_typed(&mut self, digits: &str, enter: bool, view: &StateMsg) -> bool {
-        if view.active.is_none() || view.video.is_some() || self.goto_at.is_some_and(|t| t.elapsed() > GOTO_TIMEOUT) {
-            self.goto_buf.clear();
-            self.goto_at = None;
+        if view.active.is_none() || view.video.is_some() || self.ui.goto_at.is_some_and(|t| t.elapsed() > GOTO_TIMEOUT) {
+            self.ui.goto_buf.clear();
+            self.ui.goto_at = None;
         }
         if view.active.is_some() && view.video.is_none() && !digits.is_empty() {
-            self.goto_buf.push_str(digits);
-            self.goto_buf.truncate(4);
-            self.goto_at = Some(Instant::now());
+            self.ui.goto_buf.push_str(digits);
+            self.ui.goto_buf.truncate(4);
+            self.ui.goto_at = Some(Instant::now());
         }
-        if !enter || self.goto_buf.is_empty() {
+        if !enter || self.ui.goto_buf.is_empty() {
             return false;
         }
-        let n = std::mem::take(&mut self.goto_buf);
+        let n = std::mem::take(&mut self.ui.goto_buf);
         self.goto_number(&n, view);
         true
     }
@@ -950,13 +950,13 @@ impl App {
         match n.parse::<usize>() {
             Ok(n) if n >= 1 && n <= view.pages => self.act(Cmd::GoTo { page: n - 1 }),
             _ if n.is_empty() => {}
-            _ => self.status = format!("Нет слайда {n}: в презентации {} слайдов", view.pages),
+            _ => self.ui.status = format!("Нет слайда {n}: в презентации {} слайдов", view.pages),
         }
     }
 
     /// Окно подтверждения («Удалить «…»?», «Очистить список?»): «Да» выполняет команду.
     pub(crate) fn confirm_window(&mut self, ctx: &egui::Context) {
-        let Some((text, yes, _)) = &self.confirm else { return };
+        let Some((text, yes, _)) = &self.ui.confirm else { return };
         let (text, yes) = (text.clone(), *yes);
         let mut answer = None;
         let modal = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
@@ -980,17 +980,17 @@ impl App {
         }
         match answer {
             Some(true) => {
-                if let Some((_, _, cmd)) = self.confirm.take() {
+                if let Some((_, _, cmd)) = self.ui.confirm.take() {
                     if let Cmd::Remove { .. } = cmd {
-                        self.selected = None;
+                        self.ui.selected = None;
                     }
                     if let Cmd::AudioRemove { .. } = cmd {
-                        self.audio_selected = None;
+                        self.player.selected = None;
                     }
                     self.act(cmd);
                 }
             }
-            Some(false) => self.confirm = None,
+            Some(false) => self.ui.confirm = None,
             None => {}
         }
     }
@@ -998,10 +998,10 @@ impl App {
     /// Жёлтая полоса у клиента: версия программы на сервере другая — часть кнопок может не работать.
     pub(crate) fn version_bar(&mut self, ctx: &egui::Context) {
         let ours = env!("CARGO_PKG_VERSION");
-        if !self.connected || !self.got_state || self.version_hidden || self.remote.version == ours {
+        if !self.net.connected || !self.ui.got_state || self.ui.version_hidden || self.net.remote.version == ours {
             return;
         }
-        let theirs = self.remote.version.clone();
+        let theirs = self.net.remote.version.clone();
         let text = match version_cmp(&theirs, ours) {
             std::cmp::Ordering::Less => format!(
                 "На сервере {} программы, у вас {ours} — новые кнопки на нём не сработают. Обновите программу на сервере.",
@@ -1015,7 +1015,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if btn(ui, "Скрыть", GRAY).clicked() {
-                        self.version_hidden = true;
+                        self.ui.version_hidden = true;
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(egui::Label::new(RichText::new(format!("⚠ {text}")).color(Color32::from_gray(0x33)).strong()).wrap());
@@ -1029,34 +1029,34 @@ impl App {
     /// запрет сна, пока работает сервер или на экране сцена.
     pub(crate) fn journal_tick(&mut self) {
         // Ход передачи файла («Отправка «…»: 37%») в журнал не пишем — только итог.
-        if self.status != self.logged_status {
-            if !self.status.is_empty() && !self.status.starts_with("Отправка «") {
-                jlog!("Сообщение: {}", self.status);
+        if self.ui.status != self.ui.logged_status {
+            if !self.ui.status.is_empty() && !self.ui.status.starts_with("Отправка «") {
+                jlog!("Сообщение: {}", self.ui.status);
             }
-            self.logged_status = self.status.clone();
+            self.ui.logged_status = self.ui.status.clone();
         }
-        if self.net_status != self.logged_net {
-            if !self.net_status.is_empty() {
-                jlog!("Сеть: {}", self.net_status);
+        if self.ui.net_status != self.ui.logged_net {
+            if !self.ui.net_status.is_empty() {
+                jlog!("Сеть: {}", self.ui.net_status);
             }
-            self.logged_net = self.net_status.clone();
+            self.ui.logged_net = self.ui.net_status.clone();
         }
-        if self.connected || self.server_online {
+        if self.net.connected || self.net.server_online {
             let (level, rows) = self.health_rows();
             let level = (!rows.is_empty()).then_some(level);
-            if level != self.logged_level {
+            if level != self.ui.logged_level {
                 if let Some(l) = level {
                     let bad: Vec<String> = rows.iter().filter(|r| r.level != health::Level::Ok).map(|r| format!("{}: {}", r.name, r.value)).collect();
                     jlog!("Состояние сервера: {:?}{}", l, if bad.is_empty() { String::new() } else { format!(" — {}", bad.join("; ")) });
                 }
-                self.logged_level = level;
+                self.ui.logged_level = level;
             }
         }
-        let awake = self.server_online || self.stage;
-        if awake != self.awake {
+        let awake = self.net.server_online || self.stage.visible;
+        if awake != self.ui.awake {
             keep_awake(awake);
             jlog!("{}", if awake { "Экран и сон: не гасить (идёт показ или работает сервер)" } else { "Экран и сон: как в настройках Windows" });
-            self.awake = awake;
+            self.ui.awake = awake;
         }
     }
 }

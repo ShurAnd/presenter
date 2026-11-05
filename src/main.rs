@@ -325,101 +325,36 @@ struct Show {
     center: (f32, f32),
 }
 
-struct App {
-    cfg: Config,
-    ctx: egui::Context,
-    work_dir: PathBuf,
+/// Шина событий фоновых потоков: единственный путь «потоки → интерфейс».
+struct EventBus {
+    tx: Sender<Out>,
+    rx: Receiver<Out>,
+}
 
-    // Локальное состояние (оно же состояние сервера)
+/// Домен показа: список файлов, текущий показ и сохранение списка.
+struct Session {
     items: Vec<Item>,
     next_id: u64,
     show: Option<Show>,
     show_gen: u64,
+    /// После любого изменения состояния — разослать его клиентам и сохранить список.
     dirty: bool,
-    /// Постоянный мост к PowerPoint (один на всё время работы).
-    ppt_host: ppt::Host,
-    /// Состояние фокуса на машине показа; через StateMsg передаётся оператору.
-    ppt_focus: PptFocus,
-    ppt_focus_polled: Instant,
-    /// Два одинаковых наблюдения подряд защищают от кратких переключений окон.
-    ppt_focus_candidate: Option<isize>,
-    /// Ручная активация: ждём результат до двух секунд, не трогая сам показ.
-    ppt_focus_restore_deadline: Option<Instant>,
-    /// Набираемый с клавиатуры номер слайда (цифры, затем Enter) и время последней цифры.
-    goto_buf: String,
-    goto_at: Option<Instant>,
-    /// Поле «перейти к слайду» в главном окне.
-    goto_field: String,
     /// Серверы, удалённые из списка в этом сеансе, — при сохранении не возвращаем их с диска.
     forgotten: HashSet<String>,
     /// Что последний раз записано в list.json — пишем только при изменениях.
     saved_list: String,
-
-    // Экран сцены без показа (фон, часы, таймер) и таймер
-    screen: Screen,
-    timer: screen::Timer,
-    /// Поля «минуты» и «секунды» таймера в главном окне.
-    timer_min: String,
-    timer_sec: String,
-    /// Когда пришло последнее состояние сервера — от него клиент досчитывает идущий таймер.
-    remote_at: Instant,
-
-    // Превью: миниатюры текущего и следующего слайда (у клиента — присланные сервером)
-    previews: HashMap<(u64, usize), egui::TextureHandle>,
-    /// Те же миниатюры в JPEG — для рассылки клиентам (на сервере).
-    thumb_jpg: HashMap<(u64, usize), Arc<Vec<u8>>>,
-    /// Миниатюры PPTX, которые сейчас читаются с диска, и те, что не удались.
-    thumb_busy: HashSet<(u64, usize)>,
-    thumb_failed: HashSet<(u64, usize)>,
-
-    // Состояние сервера (показатели)
-    /// Счётчик кадров интерфейса: по нему сборщик понимает, что программа не зависла.
-    ui_frames: Arc<AtomicU64>,
-    /// Сборщик показателей этого компьютера — работает, пока запущен сервер.
-    collector: Option<health::Collector>,
-    local_health: Option<health::HealthInfo>,
-    /// Показатели сервера, к которому подключены, задержка связи и когда сервер последний раз отвечал.
-    remote_health: Option<health::HealthInfo>,
-    rtt: Option<u32>,
-    last_seen: Option<Instant>,
-    /// Сервер отвечает на пинг (новая версия) — только тогда тревожим из-за молчания.
-    remote_live: bool,
-    /// Когда пришли последние показатели сервера.
-    health_at: Option<Instant>,
-    /// Связь с сервером оборвалась не по нашей команде — причина (для красной полосы).
-    lost: Option<String>,
-    /// Автозапуск сервера со сторожем при входе в Windows (состояние читается из реестра при запуске).
-    autostart: bool,
-    /// Дублирование загружаемых файлов на резервный сервер: загрузчик (и для какого сервера) и его события.
-    mirror: Option<(String, net::Uploader)>,
-    mirror_tx: Sender<CliEvent>,
-    mirror_rx: Receiver<CliEvent>,
-    /// После переключения на резерв — открыть там ту же презентацию на том же слайде.
-    resume: Option<Resume>,
-    /// Что последним было на экране сервера (имя файла, слайд) — переживает обрыв связи.
-    last_show: Option<(String, usize)>,
     /// Файлы из ключей `--add` — добавить (загрузить) после запуска / подключения.
     pending_add: Vec<PathBuf>,
-    /// Автопереподключение после обрыва: номер попытки и когда делать следующую.
-    reconnect: Option<(u32, Instant)>,
-    health_open: bool,
-    help_open: bool,
-    /// Видео на слайде, над строкой которого мышь в списке, — его рамка на миниатюре ярче.
-    media_hover: Option<usize>,
-    /// «Показать курсор» на экране показа (после перезапуска — снова выключено) и когда мышь
-    /// последний раз двигали над сценой (курсор виден 3 с после движения).
-    show_cursor: bool,
-    cursor_moved: Option<Instant>,
-    /// Размер сцены в пикселях и пропорции (ширина / высота) текущего слайда — для увеличения.
-    stage_px: (f32, f32),
-    slide_aspect: f32,
-    /// Окно «Резервный сервер»: вводим сервер, которого ещё нет в списке.
-    reserve_form: Option<SavedServer>,
+    /// Что последним было на экране сервера (имя файла, слайд) — переживает обрыв связи.
+    last_show: Option<(String, usize)>,
+}
 
-    // Сцена — полноэкранное окно с фоном, на котором идут показы
-    stage: bool,
+/// Сцена: полноэкранное окно показа, фон, часы, таймер и курсор.
+struct StageState {
+    /// Сцена сейчас на экране.
+    visible: bool,
     /// Что уже отправлено окну сцены: (поверх всех окон, на весь экран).
-    stage_sent: Option<(bool, bool)>,
+    sent: Option<(bool, bool)>,
     bg: Option<background::Background>,
     /// Фон загружен (или грузится) для этого появления сцены; номер загрузки.
     bg_checked: bool,
@@ -431,42 +366,108 @@ struct App {
     main_hwnd: isize,
     main_minimized: bool,
     /// Сцена была на экране на прошлом кадре (сворачиваем только в момент её появления).
-    stage_up: bool,
+    was_up: bool,
+    /// Экран без показа: фон, часы или таймер.
+    screen: Screen,
+    timer: screen::Timer,
+    /// Поля «минуты» и «секунды» таймера в главном окне.
+    timer_min: String,
+    timer_sec: String,
+    /// Когда пришло последнее состояние сервера — от него клиент досчитывает идущий таймер.
+    remote_at: Instant,
+    /// Размер сцены в пикселях и пропорции (ширина / высота) текущего слайда — для увеличения.
+    px: (f32, f32),
+    aspect: f32,
+    /// «Показать курсор» на экране показа (после перезапуска — снова выключено) и когда мышь
+    /// последний раз двигали над сценой (курсор виден 3 с после движения).
+    show_cursor: bool,
+    cursor_moved: Option<Instant>,
+}
 
-    // Рендер
-    renderer: Renderer,
-    out_tx: Sender<Out>,
-    out_rx: Receiver<Out>,
-    textures: HashMap<PageKey, egui::TextureHandle>,
-    /// Страницы, которые не удалось отрендерить, — повторно не заказываем.
-    failed: HashSet<PageKey>,
-    last_tex: Option<egui::TextureHandle>,
-    render_error: Option<String>,
+/// Постоянный мост к PowerPoint и контроль фокуса на машине показа.
+struct PptState {
+    /// Один мост на всё время работы программы.
+    host: ppt::Host,
+    /// Состояние фокуса на машине показа; через StateMsg передаётся оператору.
+    focus: PptFocus,
+    focus_polled: Instant,
+    /// Два одинаковых наблюдения подряд защищают от кратких переключений окон.
+    focus_candidate: Option<isize>,
+    /// Ручная активация: ждём результат до двух секунд, не трогая сам показ.
+    focus_restore_deadline: Option<Instant>,
+}
 
-    // Сервер
+/// Сеть: сервер, клиент, состояние показа и показатели машины показа.
+struct Net {
     server: Option<ServerHandle>,
     server_online: bool,
     srv_tx: Sender<SrvEvent>,
     srv_rx: Receiver<SrvEvent>,
     clients: usize,
-
-    // Клиент
     client: Option<ClientHandle>,
     connected: bool,
     cli_tx: Sender<CliEvent>,
     cli_rx: Receiver<CliEvent>,
+    /// Состояние сервера, которое рисует клиент.
     remote: StateMsg,
+    /// Сборщик показателей этого компьютера — работает, пока запущен сервер.
+    collector: Option<health::Collector>,
+    local_health: Option<health::HealthInfo>,
+    /// Показатели сервера, к которому подключены, задержка связи и когда сервер последний раз отвечал.
+    remote_health: Option<health::HealthInfo>,
+    rtt: Option<u32>,
+    last_seen: Option<Instant>,
+    /// Сервер отвечает на пинг (новая версия) — только тогда тревожим из-за молчания.
+    remote_live: bool,
+    health_at: Option<Instant>,
+    /// Связь с сервером оборвалась не по нашей команде — причина (для красной полосы).
+    lost: Option<String>,
+    /// Автопереподключение после обрыва: номер попытки и когда делать следующую.
+    reconnect: Option<(u32, Instant)>,
+    /// Дублирование загружаемых файлов на резервный сервер: загрузчик (и для какого сервера) и его события.
+    mirror: Option<(String, net::Uploader)>,
+    mirror_tx: Sender<CliEvent>,
+    mirror_rx: Receiver<CliEvent>,
+    /// После переключения на резерв — открыть там ту же презентацию на том же слайде.
+    resume: Option<Resume>,
+    /// Автозапуск сервера со сторожем при входе в Windows (состояние читается из реестра при запуске).
+    autostart: bool,
+    /// Счётчик кадров интерфейса: по нему сборщик понимает, что программа не зависла.
+    ui_frames: Arc<AtomicU64>,
+}
 
-    // Плеер (на сервере и в автономном режиме; у клиента — состояние сервера в `remote.audio`)
-    player: player::Player,
+/// Рендер страниц и превью: пул потоков, текстуры и кеш миниатюр.
+struct RenderState {
+    engine: Renderer,
+    textures: HashMap<PageKey, egui::TextureHandle>,
+    /// Страницы, которые не удалось отрендерить, — повторно не заказываем.
+    failed: HashSet<PageKey>,
+    last_tex: Option<egui::TextureHandle>,
+    render_error: Option<String>,
+    /// Миниатюры текущего и соседних слайдов (у клиента — присланные сервером).
+    previews: HashMap<(u64, usize), egui::TextureHandle>,
+    /// Те же миниатюры в JPEG — для рассылки клиентам (на сервере).
+    thumb_jpg: HashMap<(u64, usize), Arc<Vec<u8>>>,
+    /// Миниатюры PPTX, которые сейчас читаются с диска, и те, что не удались.
+    thumb_busy: HashSet<(u64, usize)>,
+    thumb_failed: HashSet<(u64, usize)>,
+}
+
+/// Плеер: движок и состояние выбора в интерфейсе.
+struct PlayerState {
+    engine: player::Player,
     /// Что последний раз записано в audio_<порт>.json.
     saved_audio: String,
     /// Выбранный трек в списке плеера и позиция, которую сейчас тянут мышью.
-    audio_selected: Option<u64>,
-    audio_seek: Option<f32>,
+    selected: Option<u64>,
+    seek: Option<f32>,
+}
 
-    // Интерфейс
+/// Интерфейс: вкладка, сообщения, диалоги и ввод.
+struct Ui {
     tab: Tab,
+    status: String,
+    net_status: String,
     /// Что последним записано в журнал из строки состояния и сетевого статуса (пишем только перемены),
     /// уровень состояния сервера, не даём ли системе уснуть.
     logged_status: String,
@@ -479,8 +480,30 @@ struct App {
     got_state: bool,
     version_hidden: bool,
     selected: Option<u64>,
-    net_status: String,
-    status: String,
+    health_open: bool,
+    help_open: bool,
+    /// Видео на слайде, над строкой которого мышь в списке, — его рамка на миниатюре ярче.
+    media_hover: Option<usize>,
+    /// Окно «Резервный сервер»: вводим сервер, которого ещё нет в списке.
+    reserve_form: Option<SavedServer>,
+    /// Набираемый с клавиатуры номер слайда (цифры, затем Enter) и время последней цифры.
+    goto_buf: String,
+    goto_at: Option<Instant>,
+    /// Поле «перейти к слайду» в главном окне.
+    goto_field: String,
+}
+struct App {
+    cfg: Config,
+    ctx: egui::Context,
+    work_dir: PathBuf,
+    bus: EventBus,
+    session: Session,
+    stage: StageState,
+    ppt: PptState,
+    net: Net,
+    render: RenderState,
+    player: PlayerState,
+    ui: Ui,
 }
 
 impl App {
@@ -516,111 +539,124 @@ impl App {
             })
         };
         let mut app = Self {
-            player,
-            saved_audio: String::new(),
-            audio_selected: None,
-            audio_seek: None,
             cfg,
             ctx: cc.egui_ctx.clone(),
             work_dir: app_dir().join("presentator_files"),
-            items: Vec::new(),
-            next_id: 1,
-            show: None,
-            show_gen: 0,
-            dirty: false,
-            ppt_host,
-            ppt_focus: PptFocus::Unknown,
-            ppt_focus_polled: Instant::now(),
-            ppt_focus_candidate: None,
-            ppt_focus_restore_deadline: None,
-            goto_buf: String::new(),
-            goto_at: None,
-            goto_field: String::new(),
-            forgotten: HashSet::new(),
-            saved_list: String::new(),
-            screen: Screen::Background,
-            timer: screen::Timer::default(),
-            timer_min: String::new(),
-            timer_sec: String::new(),
-            remote_at: Instant::now(),
-            previews: HashMap::new(),
-            thumb_jpg: HashMap::new(),
-            thumb_busy: HashSet::new(),
-            thumb_failed: HashSet::new(),
-            ui_frames: Arc::new(AtomicU64::new(0)),
-            collector: None,
-            local_health: None,
-            remote_health: None,
-            rtt: None,
-            last_seen: None,
-            remote_live: false,
-            health_at: None,
-            lost: None,
-            reconnect: None,
-            mirror: None,
-            mirror_tx,
-            mirror_rx,
-            resume: None,
-            last_show: None,
-            pending_add: Vec::new(),
-            autostart: watchdog::autostart_enabled(),
-            health_open: false,
-            help_open: false,
-            media_hover: None,
-            show_cursor: false,
-            cursor_moved: None,
-            stage_px: (1920.0, 1080.0),
-            slide_aspect: 16.0 / 9.0,
-            reserve_form: None,
-            stage: false,
-            stage_sent: None,
-            bg: None,
-            bg_checked: false,
-            bg_gen: 0,
-            bg_shown: false,
-            esc_at: None,
-            main_hwnd: main_hwnd(cc),
-            main_minimized: false,
-            stage_up: false,
-            renderer,
-            out_tx,
-            out_rx,
-            textures: HashMap::new(),
-            failed: HashSet::new(),
-            last_tex: None,
-            render_error: None,
-            server: None,
-            server_online: false,
-            srv_tx,
-            srv_rx,
-            clients: 0,
-            client: None,
-            connected: false,
-            cli_tx,
-            cli_rx,
-            remote: StateMsg::default(),
-            tab: if std::env::args().any(|a| a == "--net") { Tab::Net } else { Tab::List },
-            logged_status: String::new(),
-            logged_net: String::new(),
-            logged_level: None,
-            awake: false,
-            confirm: None,
-            got_state: false,
-            version_hidden: false,
-            selected: None,
-            net_status: String::new(),
-            status: String::new(),
+            bus: EventBus { tx: out_tx, rx: out_rx },
+            session: Session {
+                items: Vec::new(),
+                next_id: 1,
+                show: None,
+                show_gen: 0,
+                dirty: false,
+                forgotten: HashSet::new(),
+                saved_list: String::new(),
+                pending_add: Vec::new(),
+                last_show: None,
+            },
+            stage: StageState {
+                visible: false,
+                sent: None,
+                bg: None,
+                bg_checked: false,
+                bg_gen: 0,
+                bg_shown: false,
+                esc_at: None,
+                main_hwnd: main_hwnd(cc),
+                main_minimized: false,
+                was_up: false,
+                screen: Screen::Background,
+                timer: screen::Timer::default(),
+                timer_min: String::new(),
+                timer_sec: String::new(),
+                remote_at: Instant::now(),
+                px: (1920.0, 1080.0),
+                aspect: 16.0 / 9.0,
+                show_cursor: false,
+                cursor_moved: None,
+            },
+            ppt: PptState {
+                host: ppt_host,
+                focus: PptFocus::Unknown,
+                focus_polled: Instant::now(),
+                focus_candidate: None,
+                focus_restore_deadline: None,
+            },
+            net: Net {
+                server: None,
+                server_online: false,
+                srv_tx,
+                srv_rx,
+                clients: 0,
+                client: None,
+                connected: false,
+                cli_tx,
+                cli_rx,
+                remote: StateMsg::default(),
+                collector: None,
+                local_health: None,
+                remote_health: None,
+                rtt: None,
+                last_seen: None,
+                remote_live: false,
+                health_at: None,
+                lost: None,
+                reconnect: None,
+                mirror: None,
+                mirror_tx,
+                mirror_rx,
+                resume: None,
+                autostart: watchdog::autostart_enabled(),
+                ui_frames: Arc::new(AtomicU64::new(0)),
+            },
+            render: RenderState {
+                engine: renderer,
+                textures: HashMap::new(),
+                failed: HashSet::new(),
+                last_tex: None,
+                render_error: None,
+                previews: HashMap::new(),
+                thumb_jpg: HashMap::new(),
+                thumb_busy: HashSet::new(),
+                thumb_failed: HashSet::new(),
+            },
+            player: PlayerState {
+                engine: player,
+                saved_audio: String::new(),
+                selected: None,
+                seek: None,
+            },
+            ui: Ui {
+                tab: if std::env::args().any(|a| a == "--net") { Tab::Net } else { Tab::List },
+                status: String::new(),
+                net_status: String::new(),
+                logged_status: String::new(),
+                logged_net: String::new(),
+                logged_level: None,
+                awake: false,
+                confirm: None,
+                got_state: false,
+                version_hidden: false,
+                selected: None,
+                health_open: false,
+                help_open: false,
+                media_hover: None,
+                reserve_form: None,
+                goto_buf: String::new(),
+                goto_at: None,
+                goto_field: String::new(),
+            },
         };
         // Автозапуск: `presentator --server` или `presentator --connect`.
         let args: Vec<String> = std::env::args().collect();
         // `--add <файл>` (можно несколько): добавить в список; при `--connect` — загрузить на сервер.
-        app.pending_add = args.windows(2).filter(|w| w[0] == "--add").map(|w| PathBuf::from(&w[1])).collect();
+        app.session.pending_add = args.windows(2).filter(|w| w[0] == "--add").map(|w| PathBuf::from(&w[1])).collect();
         if args.iter().any(|a| a == "--server") {
             app.toggle_server(&cc.egui_ctx); // файлы добавятся, когда сервер восстановит свой список
         } else if args.iter().any(|a| a == "--connect") {
             app.toggle_client(&cc.egui_ctx); // файлы уйдут на сервер после подключения
         } else {
-            let add = std::mem::take(&mut app.pending_add);
+            let add = std::mem::take(&mut app.session.pending_add);
             app.add_files(add, &cc.egui_ctx);
         }
         app
@@ -631,7 +667,7 @@ impl App {
         // компьютере пишут один файл, и одна не должна стирать серверы, запомненные другой.
         let mut cfg = self.cfg.clone();
         let disk: Option<Config> = std::fs::read_to_string(config_path()).ok().and_then(|s| serde_json::from_str(&s).ok());
-        merge_servers(&mut cfg.servers, disk.map(|c| c.servers).unwrap_or_default(), &self.forgotten);
+        merge_servers(&mut cfg.servers, disk.map(|c| c.servers).unwrap_or_default(), &self.session.forgotten);
         if let Ok(s) = serde_json::to_string_pretty(&cfg) {
             let path = config_path();
             if let Some(dir) = path.parent() {
@@ -647,20 +683,20 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui_frames.fetch_add(1, Ordering::SeqCst);
+        self.net.ui_frames.fetch_add(1, Ordering::SeqCst);
         self.poll(ctx);
         self.journal_tick();
-        if let Some((n, at)) = self.reconnect {
-            if self.client.is_none() && Instant::now() >= at {
-                self.reconnect = Some((n + 1, Instant::now() + Duration::from_secs(3600)));
+        if let Some((n, at)) = self.net.reconnect {
+            if self.net.client.is_none() && Instant::now() >= at {
+                self.net.reconnect = Some((n + 1, Instant::now() + Duration::from_secs(3600)));
                 let ctx = ctx.clone();
                 self.toggle_client(&ctx);
-                self.net_status = format!("Переподключение… попытка {} из {RECONNECT_TRIES}", n + 1);
-            } else if self.client.is_none() {
+                self.ui.net_status = format!("Переподключение… попытка {} из {RECONNECT_TRIES}", n + 1);
+            } else if self.net.client.is_none() {
                 ctx.request_repaint_after(at.saturating_duration_since(Instant::now()));
             }
         }
-        if self.connected {
+        if self.net.connected {
             // Раз в секунду пересчитываем, давно ли сервер отвечал.
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -689,13 +725,13 @@ impl eframe::App for App {
         self.help_window(ctx);
         egui::TopBottomPanel::bottom("bottom").frame(margin).show(ctx, |ui| self.bottom_bar(ui, &view));
         // Превью — над нижней панелью, пока открыта презентация (у видео превью нет).
-        if self.tab == Tab::List && view.active.is_some() && view.video.is_none() {
+        if self.ui.tab == Tab::List && view.active.is_some() && view.video.is_none() {
             egui::TopBottomPanel::bottom("preview").frame(margin).show(ctx, |ui| self.preview_bar(ui, &view));
         }
         egui::CentralPanel::default().frame(margin).show(ctx, |ui| {
             self.tab_row(ui, &view);
             ui.add_space(4.0);
-            match self.tab {
+            match self.ui.tab {
                 Tab::List => self.list(ui, &view),
                 Tab::Player => self.player_panel(ui, &view),
                 Tab::Net => self.network_panel(ui),
@@ -705,14 +741,14 @@ impl eframe::App for App {
 
         self.tick_ppt(ctx);
         self.minimize_for_stage(ctx);
-        ppt::grab_esc(self.show.as_ref().is_some_and(|s| matches!(s.kind, ShowKind::Ppt(_))));
-        if !self.connected {
+        ppt::grab_esc(self.session.show.as_ref().is_some_and(|s| matches!(s.kind, ShowKind::Ppt(_))));
+        if !self.net.connected {
             self.stage_window(ctx);
         }
 
-        if self.dirty {
-            self.dirty = false;
-            if let Some(s) = &self.server {
+        if self.session.dirty {
+            self.session.dirty = false;
+            if let Some(s) = &self.net.server {
                 s.publish(&self.local_state());
             }
             self.save_list();
@@ -723,7 +759,7 @@ impl eframe::App for App {
         jlog!("Выход из программы");
         keep_awake(false);
         // Показ PowerPoint закрываем сами, пока процесс жив: иначе скрытый PowerPoint останется с файлом.
-        self.ppt_host.shutdown();
+        self.ppt.host.shutdown();
         self.save_cfg();
         // Список и присланные файлы остаются — при следующем запуске список восстановится.
         self.save_list();

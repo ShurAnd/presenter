@@ -6,16 +6,16 @@ impl App {
     /// Сцена: полноэкранное окно сервера. Показывает фон, а поверх — PDF;
     /// PowerPoint выводит своё слайд-шоу поверх неё. Скрывается двойным Esc, когда на ней только фон.
     pub(crate) fn stage_window(&mut self, ctx: &egui::Context) {
-        if !self.stage {
-            self.stage_sent = None;
-            self.bg_checked = false;
+        if !self.stage.visible {
+            self.stage.sent = None;
+            self.stage.bg_checked = false;
             return;
         }
-        if !self.bg_checked {
+        if !self.stage.bg_checked {
             // Фон перечитывается при каждом появлении сцены и после смены; пока грузится — прежний.
-            self.bg_checked = true;
-            self.bg_gen += 1;
-            let (gen, tx, c) = (self.bg_gen, self.out_tx.clone(), ctx.clone());
+            self.stage.bg_checked = true;
+            self.stage.bg_gen += 1;
+            let (gen, tx, c) = (self.stage.bg_gen, self.bus.tx.clone(), ctx.clone());
             let max_side = ctx.input(|i| i.max_texture_side) as u32;
             std::thread::spawn(move || {
                 let _ = tx.send(Out::Background { gen, result: background::load(max_side) });
@@ -23,15 +23,15 @@ impl App {
             });
         }
         // Анимация фона — только пока он виден (на прошлом кадре был на экране).
-        let bg_next = if self.bg_shown { self.bg.as_mut().and_then(background::Background::tick) } else { None };
+        let bg_next = if self.stage.bg_shown { self.stage.bg.as_mut().and_then(background::Background::tick) } else { None };
         // Под слайд-шоу PowerPoint и под играющим видео фона не видно — анимацию не двигаем.
-        let bg_hidden = self.show.as_ref().is_some_and(|s| match &s.kind {
+        let bg_hidden = self.session.show.as_ref().is_some_and(|s| match &s.kind {
             ShowKind::Ppt(p) => matches!(p.phase, PptPhase::Lowered(_) | PptPhase::Shown),
             ShowKind::Video(_) => s.video_on_screen(),
             ShowKind::Pdf(_) | ShowKind::Image(_) => false,
         });
         let mut bg_drawn = false;
-        let pdf = match &self.show {
+        let pdf = match &self.session.show {
             Some(s) => match &s.kind {
                 ShowKind::Pdf(pdf) => Some((s.id, s.page, s.pages, pdf.clone())),
                 ShowKind::Ppt(_) | ShowKind::Video(_) | ShowKind::Image(_) => None,
@@ -39,12 +39,12 @@ impl App {
             None => None,
         };
         // Сразу после открытия какое-то время виден только фон, даже если страница уже готова.
-        let hold = self.show.as_ref().map_or(Duration::ZERO, |s| SWITCH_BG.saturating_sub(s.opened.elapsed()));
+        let hold = self.session.show.as_ref().map_or(Duration::ZERO, |s| SWITCH_BG.saturating_sub(s.opened.elapsed()));
         if !hold.is_zero() {
             ctx.request_repaint_after(hold);
         }
         // Картинка, открытая как презентация (анимация — по своим кадрам).
-        let (img_tex, img_next) = match self.show.as_mut().map(|s| &mut s.kind) {
+        let (img_tex, img_next) = match self.session.show.as_mut().map(|s| &mut s.kind) {
             Some(ShowKind::Image(Some(b))) => {
                 let next = if hold.is_zero() { b.tick() } else { None };
                 (Some(b.texture().clone()), next)
@@ -54,7 +54,7 @@ impl App {
         let view = self.local_state();
         let windowed = self.cfg.windowed;
         // Во время показа отдельное окно PPTX или видео располагается над сценой.
-        let top = self.show.as_ref().is_none_or(Show::stage_on_top);
+        let top = self.session.show.as_ref().is_none_or(Show::stage_on_top);
         let level = |top: bool| if top { egui::WindowLevel::AlwaysOnTop } else { egui::WindowLevel::Normal };
         // «Полный экран» делаем сами: окно без рамки ровно по монитору. Режим fullscreen
         // у дочернего окна eframe на Windows оставляет окно прежнего размера.
@@ -75,29 +75,29 @@ impl App {
         let mut esc = false;
         let mut typed = (String::new(), false);
         // Без показа на сцене может быть экран часов или таймера.
-        let scr = if self.show.is_none() { self.screen } else { Screen::Background };
-        let timer = self.timer.info();
+        let scr = if self.session.show.is_none() { self.stage.screen } else { Screen::Background };
+        let timer = self.stage.timer.info();
         let mut repaint: Option<Duration> = None;
         // Флаги builder'а у нового окна eframe на Windows не применяются — шлём команды явно.
-        let sent = self.stage_sent;
-        let bg = self.bg.as_ref().map(background::Background::texture);
+        let sent = self.stage.sent;
+        let bg = self.stage.bg.as_ref().map(background::Background::texture);
         // Увеличение: видимая часть слайда; у PDF — ключ куска страницы, который нужен для экрана.
-        let zoom = self.show.as_ref().map_or(1.0, |s| s.zoom);
+        let zoom = self.session.show.as_ref().map_or(1.0, |s| s.zoom);
         let zview = self.slide_view();
         let zoomed = zoom > 1.0;
         // Устаревшие увеличенные куски (другой масштаб или место) не держим.
         let zkey_view = render::view_key(zview);
-        self.textures.retain(|k, _| k.view == FULL_VIEW || k.view == zkey_view);
-        let mut stage_px = self.stage_px;
-        let mut slide_aspect = self.slide_aspect;
-        let ppt_page = self.show.as_ref().map_or(0, |s| s.page);
-        let ppt_zoom = match self.show.as_ref().map(|s| &s.kind) {
+        self.render.textures.retain(|k, _| k.view == FULL_VIEW || k.view == zkey_view);
+        let mut stage_px = self.stage.px;
+        let mut slide_aspect = self.stage.aspect;
+        let ppt_page = self.session.show.as_ref().map_or(0, |s| s.page);
+        let ppt_zoom = match self.session.show.as_ref().map(|s| &s.kind) {
             Some(ShowKind::Ppt(p)) => p.zoom_img.clone(),
             _ => None,
         };
-        let show_cursor = self.show_cursor;
-        let mut cursor_moved = self.cursor_moved;
-        let (textures, last_tex, error, failed) = (&self.textures, &mut self.last_tex, &self.render_error, &self.failed);
+        let show_cursor = self.stage.show_cursor;
+        let mut cursor_moved = self.stage.cursor_moved;
+        let (textures, last_tex, error, failed) = (&self.render.textures, &mut self.render.last_tex, &self.render.render_error, &self.render.failed);
 
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("stage"), builder, |ctx, _| {
             if sent.is_none_or(|(_, fs)| fs == windowed) {
@@ -240,10 +240,10 @@ impl App {
                 }
             });
         });
-        self.cursor_moved = cursor_moved;
-        if (stage_px, slide_aspect) != (self.stage_px, self.slide_aspect) {
-            (self.stage_px, self.slide_aspect) = (stage_px, slide_aspect);
-            self.dirty = true; // клиентам — новая рамка видимой части
+        self.stage.cursor_moved = cursor_moved;
+        if (stage_px, slide_aspect) != (self.stage.px, self.stage.aspect) {
+            (self.stage.px, self.stage.aspect) = (stage_px, slide_aspect);
+            self.session.dirty = true; // клиентам — новая рамка видимой части
         }
         // Часы и идущий таймер перерисовываем ровно при смене секунды.
         if let Some(d) = repaint {
@@ -257,25 +257,25 @@ impl App {
         if bg_drawn {
             match bg_next {
                 Some(d) => ctx.request_repaint_after(d),
-                None if !self.bg_shown && self.bg.as_ref().is_some_and(background::Background::animated) => ctx.request_repaint(),
+                None if !self.stage.bg_shown && self.stage.bg.as_ref().is_some_and(background::Background::animated) => ctx.request_repaint(),
                 None => {}
             }
         }
-        self.bg_shown = bg_drawn;
+        self.stage.bg_shown = bg_drawn;
         // Уровень окна сцены дублируем напрямую через Windows: при смене, а пока PowerPoint
         // готовит показ за сценой — каждый кадр (его окно не должно вылезти поверх фона).
-        let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
+        let ppt_loading = self.session.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
         // Проверяем на каждой перерисовке: после показа PowerPoint сцена теряла «поверх всех»
         // и не получала его обратно — тогда подготовленное видео оказывалось над фоном.
         // Порядок пары «активное видео — сцена» держит поток видео: поднимать или
         // опускать сцену отсюда — гонка с воспроизведением и сменой проигрывателей на стыке повтора.
-        if !self.show.as_ref().is_some_and(Show::video_on_screen) {
+        if !self.session.show.as_ref().is_some_and(Show::video_on_screen) {
             ppt::stage_topmost(top);
         }
         if ppt_loading {
             ctx.request_repaint_after(Duration::from_millis(15));
         }
-        self.stage_sent = Some((top, !windowed));
+        self.stage.sent = Some((top, !windowed));
         // На весь экран: окно сцены ровно на монитор показа (+1 точка по высоте, см. выше), в физических
         // пикселях — так верно и при разном масштабе мониторов. Окно на месте — ничего не делается.
         if !windowed {
@@ -289,11 +289,11 @@ impl App {
         if let Some((id, page, pages, pdf)) = pdf {
             // Миниатюры для превью — после страниц для экрана.
             for p in [Some(page), Some(page + 1), page.checked_sub(1)].into_iter().flatten().filter(|&p| p < pages) {
-                if !self.previews.contains_key(&(id, p)) && !self.thumb_failed.contains(&(id, p)) {
+                if !self.render.previews.contains_key(&(id, p)) && !self.render.thumb_failed.contains(&(id, p)) {
                     wanted.push(PageKey { id, page: p, w: THUMB_W, h: THUMB_H, thumb: true, view: FULL_VIEW });
                 }
             }
-            self.renderer.want(&pdf, wanted);
+            self.render.engine.want(&pdf, wanted);
         }
         for cmd in cmds {
             self.apply(cmd);
@@ -302,10 +302,10 @@ impl App {
             self.esc_press();
         }
         self.goto_typed(&typed.0, typed.1, &self.local_state());
-        if hide && self.show.is_none() {
-            self.stage = false;
-            self.screen = Screen::Background;
-            self.dirty = true;
+        if hide && self.session.show.is_none() {
+            self.stage.visible = false;
+            self.stage.screen = Screen::Background;
+            self.session.dirty = true;
         }
     }
 
@@ -314,37 +314,37 @@ impl App {
     /// на фоне) — окно разворачивается. Сцена на другом мониторе или «в окне» — окно не трогаем.
     /// Действуем только при смене: если оператор сам развернул окно, оно так и останется.
     pub(crate) fn minimize_for_stage(&mut self, ctx: &egui::Context) {
-        let stage = self.stage && !self.connected && !self.cfg.windowed;
-        if stage && !self.main_minimized && !self.stage_up {
-            let same = display::target(&self.cfg.monitor).is_some_and(|m| display::window_on(self.main_hwnd, m.rect));
+        let stage = self.stage.visible && !self.net.connected && !self.cfg.windowed;
+        if stage && !self.stage.main_minimized && !self.stage.was_up {
+            let same = display::target(&self.cfg.monitor).is_some_and(|m| display::window_on(self.stage.main_hwnd, m.rect));
             if same {
                 ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(true));
-                self.main_minimized = true;
+                self.stage.main_minimized = true;
             }
-        } else if !stage && self.main_minimized {
+        } else if !stage && self.stage.main_minimized {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
-            self.main_minimized = false;
+            self.stage.main_minimized = false;
         }
-        self.stage_up = stage;
+        self.stage.was_up = stage;
     }
 
     /// Esc на сцене или в слайд-шоу PowerPoint. Одиночное нажатие ничего не делает.
     /// Двойное: закрывает презентацию, а если её нет — убирает сцену с фоном.
     pub(crate) fn esc_press(&mut self) {
-        if !self.esc_at.is_some_and(|t| t.elapsed() <= DOUBLE_ESC) {
-            self.esc_at = Some(Instant::now());
+        if !self.stage.esc_at.is_some_and(|t| t.elapsed() <= DOUBLE_ESC) {
+            self.stage.esc_at = Some(Instant::now());
             return;
         }
-        self.esc_at = None;
-        if self.show.is_some() {
+        self.stage.esc_at = None;
+        if self.session.show.is_some() {
             self.apply(Cmd::Close);
-        } else if self.screen != Screen::Background {
+        } else if self.stage.screen != Screen::Background {
             // Часы или таймер — сначала возвращаем фон.
-            self.screen = Screen::Background;
-            self.dirty = true;
+            self.stage.screen = Screen::Background;
+            self.session.dirty = true;
         } else {
-            self.stage = false;
+            self.stage.visible = false;
         }
     }
 }

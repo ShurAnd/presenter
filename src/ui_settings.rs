@@ -57,7 +57,7 @@ impl App {
                 ui.checkbox(&mut self.cfg.windowed, "Сцена и показ в окне, а не на весь экран (только для теста на одном компьютере)");
 
                 section(ui, "PDF — движок отрисовки");
-                ui.label(if self.connected {
+                ui.label(if self.net.connected {
                     "Настройка презентационного компьютера. Изменение отправляется на сервер."
                 } else { "Движок PDF на этом компьютере." });
                 let state = self.view();
@@ -77,19 +77,19 @@ impl App {
                 if let Some(error) = state.pdf_engine_error {
                     ui.label(RichText::new(format!("PDFium на компьютере показа недоступен: {error}")).color(RED));
                 }
-                if self.connected {
+                if self.net.connected {
                     ui.label(&state.message);
                 }
 
                 section(ui, "Запуск");
-                let mut auto = self.autostart;
+                let mut auto = self.net.autostart;
                 let resp = ui.checkbox(&mut auto, "Запускать сервер при входе в Windows (с самовосстановлением после сбоя)").on_hover_text(
                     r"Сервер стартует сам при входе в Windows. Сторож следит за ним: упал или завис — перезапустит, с тем же списком. Закрыли сервер сами — сторож тоже завершится. Журнал: %APPDATA%\presenter\watchdog.log",
                 );
                 if resp.changed() {
                     match watchdog::set_autostart(auto) {
-                        Ok(()) => self.autostart = auto,
-                        Err(e) => self.status = format!("Не удалось изменить автозапуск: {e}"),
+                        Ok(()) => self.net.autostart = auto,
+                        Err(e) => self.ui.status = format!("Не удалось изменить автозапуск: {e}"),
                     }
                 }
 
@@ -101,7 +101,7 @@ impl App {
                     .changed()
                 {
                     self.cfg.keyboard = kb;
-                    self.goto_buf.clear();
+                    self.ui.goto_buf.clear();
                     self.save_cfg();
                 }
 
