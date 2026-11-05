@@ -42,3 +42,9 @@
 - [`screenshots/light.png`](screenshots/light.png) — светлая тема.
 - [`screenshots/dark.png`](screenshots/dark.png) — тёмная тема.
 - [`screenshots/empty.png`](screenshots/empty.png) — пустой список.
+- [`screenshots/network_client_connected.png`](screenshots/network_client_connected.png) —
+  клиент 3.0.0 подключён к серверу, список и состояние пришли по сети.
+- [`screenshots/network_client_next.png`](screenshots/network_client_next.png) —
+  после команды «Вперёд» с клиента: слайд 2 из 10.
+- [`screenshots/network_server_slide2.png`](screenshots/network_server_slide2.png) —
+  сцена сервера после удалённой команды.
