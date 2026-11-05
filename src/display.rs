@@ -30,21 +30,17 @@ pub fn target(device: &str) -> Option<Monitor> {
     all.iter().find(|m| !device.is_empty() && m.device == device).or_else(|| all.first()).cloned()
 }
 
-/// Поставить окно (по заголовку) ровно на прямоугольник; `extra_h` — добавка к высоте
-/// (сцене нужна +1 точка: OpenGL-окно ровно по экрану Windows переводит в «полноэкранный режим»).
-/// Окно не трогается, если оно уже на месте. Порядок окон и фокус не меняются.
-pub fn fit_window(title: &str, rect: (i32, i32, i32, i32), extra_h: i32) {
-    win::fit_window(title, rect, extra_h);
-}
-
 /// Окно (по дескриптору) — на этом мониторе: его центр внутри прямоугольника.
 pub fn window_on(hwnd: isize, rect: (i32, i32, i32, i32)) -> bool {
     win::window_on(hwnd, rect)
 }
 
-/// Поставить окно (по дескриптору) на прямоугольник монитора, если оно не там.
-pub fn fit_hwnd(hwnd: isize, rect: (i32, i32, i32, i32)) {
-    win::fit_hwnd(hwnd, rect, 0);
+/// Поставить окно (по дескриптору) ровно на прямоугольник; `extra_h` — добавка к высоте
+/// (сцене нужна +1 точка: OpenGL-окно ровно по экрану Windows переводит в «полноэкранный режим»).
+/// Окно не трогается, если оно уже на месте. Порядок окон и фокус не меняются.
+/// Дескриптор, а не заголовок: две копии программы создают окна с одинаковыми заголовками.
+pub fn fit_hwnd(hwnd: isize, rect: (i32, i32, i32, i32), extra_h: i32) {
+    win::fit_hwnd(hwnd, rect, extra_h)
 }
 
 #[cfg(not(windows))]
@@ -53,7 +49,6 @@ mod win {
     pub fn list() -> Vec<Monitor> {
         Vec::new()
     }
-    pub fn fit_window(_: &str, _: (i32, i32, i32, i32), _: i32) {}
     pub fn window_on(_: isize, _: (i32, i32, i32, i32)) -> bool {
         false
     }
@@ -65,8 +60,7 @@ mod win {
     use super::Monitor;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER};
-    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetWindowPos, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER};
 
     unsafe extern "system" fn cb(m: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
         let list = &mut *(data.0 as *mut Vec<Monitor>);
@@ -118,13 +112,6 @@ mod win {
         cx >= rect.0 && cx < rect.0 + rect.2 && cy >= rect.1 && cy < rect.1 + rect.3
     }
 
-    pub fn fit_window(title: &str, rect: (i32, i32, i32, i32), extra_h: i32) {
-        unsafe {
-            if let Ok(h) = FindWindowW(PCWSTR::null(), &HSTRING::from(title)) {
-                fit_hwnd(h.0 as isize, rect, extra_h);
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -169,7 +156,6 @@ mod stage9_tests {
     #[test]
     fn absent_window_handle_is_never_reported_on_monitor() {
         assert!(!window_on(0, (0, 0, 1920, 1080)));
-        fit_hwnd(0, (0, 0, 1920, 1080));
-        fit_window("__missing_presentator_stage9__", (0, 0, 1280, 720), 1);
+        fit_hwnd(0, (0, 0, 1920, 1080), 1);
     }
 }

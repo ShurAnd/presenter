@@ -1,13 +1,13 @@
 [package]
 name = "presentator"
-version = "2.5.3"
+version = "2.5.4"
 edition = "2021"
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 hayro = { version = "0.8", features = ["embed-fonts"] }
-# PDFium 7881 is embedded into the Windows EXE at compile time.
-# Its DLL is prepared automatically by scripts/build_release.ps1.
+# PDFium 7881 вшивается в Windows-ex на этапе сборки;
+# DLL готовится скриптом scripts/build_release.ps1 автоматически.
 pdfium-render = { version = "=0.9.5", default-features = false, features = ["pdfium_7881", "thread_safe"] }
 rfd = "0.15"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "io-util", "fs"] }

@@ -80,11 +80,13 @@ pub enum Cmd {
     /// Ручное восстановление фокуса слайд-шоу PowerPoint на компьютере показа.
     /// Не открывает презентацию заново, не переключает слайды и не закрывает окна.
     RestorePptFocus,
-    /// Remote focus restoration for a PDF stage window; kept separate for older clients.
+    /// Ручное восстановление фокуса сцены (PDF, картинки, видео) на компьютере показа.
+    /// Отдельная команда — чтобы старые клиенты продолжали слать понятную им.
     RestoreStageFocus,
-    /// Server chooses the current presentation window, including zoomed PPTX.
+    /// Восстановление фокуса текущего окна показа: сервер сам выбирает, какое окно
+    /// активировать (слайд-шоу PowerPoint, в том числе увеличенное, или сцену).
     RestoreFocus,
-    /// Change the PDF renderer on the presentation computer.
+    /// Сменить движок отрисовки PDF на компьютере показа.
     SetPdfEngine { engine: String },
 }
 
@@ -272,7 +274,7 @@ pub struct StateMsg {
     /// Состояние фокуса PowerPoint на компьютере показа.
     #[serde(default)]
     pub ppt_focus: PptFocus,
-    /// Actual server renderer. None means a server without remote PDF settings.
+    /// Действующий движок PDF на сервере. Нет поля — старый сервер без удалённой смены движка.
     #[serde(default)]
     pub pdf_engine: Option<String>,
     #[serde(default)]
@@ -556,8 +558,8 @@ async fn serve_client(
                             if ws.send(js(&S2C::Pong { ts })).await.is_err() { break; }
                         }
                         Ok(C2S::UploadBegin { name, size, background }) => {
-                            // A second UploadBegin cancels the first transfer. Dropping the old
-                            // file before deletion is important on Windows (sharing/locking).
+                            // Второй UploadBegin отменяет прежнюю передачу. Файл закрываем
+                            // до удаления — на Windows открытый файл удалить нельзя.
                             if let Some((old_name, old_path, old_file, _, _, _)) = upload.take() {
                                 drop(old_file);
                                 let _ = tokio::fs::remove_file(&old_path).await;
@@ -601,8 +603,8 @@ async fn serve_client(
                     Message::Binary(b) => {
                         if let Some((name, path, mut f, size, mut got, background)) = upload.take() {
                             let len = b.len() as u64;
-                            // Check BEFORE write_all: never put even temporary excess bytes
-                            // on disk. Subtraction also avoids integer overflow at u64::MAX.
+                            // Проверяем до записи: лишние байты не попадают на диск даже
+                            // временно. Вычитание заодно защищает от переполнения u64.
                             if len > size.saturating_sub(got) {
                                 drop(f);
                                 let _ = tokio::fs::remove_file(&path).await;
@@ -986,8 +988,7 @@ mod tests {
 #[path = "net_loopback_tests.rs"]
 mod loopback_tests;
 
-// Stage 6 test seam: an in-memory client channel, never a socket or worker thread.
-// This is not compiled into release builds.
+// Тестовый канал клиента в памяти — без сокета и потока (в release не компилируется).
 #[cfg(test)]
 pub(crate) fn mock_client_for_tests() -> (ClientHandle, tmpsc::UnboundedReceiver<CliReq>) {
     let (tx, rx) = tmpsc::unbounded_channel();

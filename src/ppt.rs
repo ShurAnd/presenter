@@ -106,9 +106,9 @@ unsafe fn activate_existing_window(hwnd: isize) {
     if attached { AttachThreadInput(current_thread, foreground_thread, 0); }
 }
 
-// COM HWND is not available through IDispatch in some PowerPoint installations.
-// Windowed shows can use PPTFrameClass, which is also used by the editor.
-// Require an explicit slideshow caption and the current presentation filename.
+// COM не всегда отдаёт HWND показа через IDispatch. Для показа «в окне» подходит
+// PPTFrameClass — но он же у редактора, поэтому требуем явный заголовок слайд-шоу
+// с именем открытой презентации.
 #[cfg(any(windows, test))]
 fn windowed_slideshow_title(title: &str, filename: &str) -> bool {
     if filename.is_empty() { return false; }
@@ -290,6 +290,14 @@ pub fn probe_focus(slideshow: isize) -> FocusProbe {
         let root = GetAncestor(slideshow, GA_ROOT);
         let front_root = GetAncestor(foreground, GA_ROOT);
         if root != 0 && root == front_root {
+            return FocusProbe::Focused;
+        }
+        // Переднее окно нашего процесса (например, главное окно программы на сервере
+        // с двумя мониторами) — не потеря фокуса: показ по-прежнему управляется
+        // (клавиши в окне программы при включённой ⌨). Иначе обычная работа оператора
+        // на сервере давала ложное «фокус сменился» у клиента.
+        let mut owner = 0u32;
+        if GetWindowThreadProcessId(front_root, &mut owner) != 0 && owner == std::process::id() {
             return FocusProbe::Focused;
         }
         let mut buf = [0u16; 160];
@@ -636,16 +644,18 @@ impl Host {
             let slideshow = if slideshow != 0 { slideshow } else { FindWindowW(class.as_ptr(), std::ptr::null()) };
             if slideshow != 0 {
                 if let Some(r) = target {
-                    crate::display::fit_hwnd(slideshow, r);
+                    crate::display::fit_hwnd(slideshow, r, 0);
                 }
                 SetWindowPos(slideshow, -1, 0, 0, 0, 0, SWP); // HWND_TOPMOST
-                let title: Vec<u16> = STAGE_TITLE.encode_utf16().chain(Some(0)).collect();
-                let stage = FindWindowW(std::ptr::null(), title.as_ptr());
+                // Сцену ищем только среди окон своего процесса: на одном компьютере могут
+                // работать две копии программы с одинаковым заголовком сцены, и поиск по
+                // заголовку поднимал чужую сцену, а свою оставлял поверх слайд-шоу.
+                let stage = own_stage_window();
                 if stage != 0 {
                     SetWindowPos(stage, slideshow, 0, 0, 0, 0, SWP);
                 }
-                // HWND_TOP only changes z-order; explicitly activate the slideshow so it
-                // appears above the operator/server windows when a new show is launched.
+                // HWND_TOP меняет только порядок; активируем слайд-шоу явно, чтобы новый
+                // показ встал выше окон оператора и сервера.
                 activate_existing_window(slideshow);
             }
         }

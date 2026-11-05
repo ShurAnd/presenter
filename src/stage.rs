@@ -267,8 +267,8 @@ impl App {
         let ppt_loading = self.show.as_ref().is_some_and(|s| matches!(&s.kind, ShowKind::Ppt(p) if matches!(p.phase, PptPhase::Loading | PptPhase::Ready(_))));
         // Проверяем на каждой перерисовке: после показа PowerPoint сцена теряла «поверх всех»
         // и не получала его обратно — тогда подготовленное видео оказывалось над фоном.
-        // The video worker owns the ordering of the active video and stage pair.
-        // Raising/demoting the stage here races with playback and loop handoffs.
+        // Порядок пары «активное видео — сцена» держит поток видео: поднимать или
+        // опускать сцену отсюда — гонка с воспроизведением и сменой проигрывателей на стыке повтора.
         if !self.show.as_ref().is_some_and(Show::video_on_screen) {
             ppt::stage_topmost(top);
         }
@@ -280,7 +280,9 @@ impl App {
         // пикселях — так верно и при разном масштабе мониторов. Окно на месте — ничего не делается.
         if !windowed {
             if let Some(m) = display::target(&self.cfg.monitor) {
-                display::fit_window(ppt::STAGE_TITLE, m.rect, 1);
+                // Свою сцену — по дескриптору своего процесса, не по заголовку (две копии
+                // программы создают одинаковые заголовки).
+                display::fit_hwnd(ppt::own_stage_window(), m.rect, 1);
             }
         }
 

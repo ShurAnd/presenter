@@ -82,7 +82,7 @@ impl Video {
         self.send(VCmd::Start);
     }
 
-    /// Raise the active video after the operator restores keyboard focus to the stage.
+    /// Поднять активное видео после того, как оператор вернул фокус клавиатуры сцене.
     pub fn raise(&self) {
         self.send(VCmd::Raise);
     }
@@ -368,7 +368,7 @@ mod win {
 
     // ------------------------------------------------------------ окно и цикл
 
-    /// Video uses the normal window band. TOPMOST is unreliable with the embedded renderer.
+    /// Видео живёт в обычном слое окон: «поверх всех» со встроенным движком ненадёжен.
     unsafe fn raise_playing_window(hwnd: HWND) {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
         if let Err(error) = SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, flags) {
@@ -377,14 +377,14 @@ mod win {
         keep_stage_below_video(HWND(crate::ppt::own_stage_window() as *mut _), hwnd);
     }
 
-    /// Only repair a reversed pair. Never raise the background above the video first.
-    /// Inserting a topmost stage after a normal video also removes the stage's TOPMOST flag.
+/// Чиним только перевёрнутую пару, сами сцену выше видео не поднимаем.
+/// Вставка «поверх всех»-сцены после обычного окна видео ещё и снимает у сцены признак TOPMOST.
     unsafe fn keep_stage_below_video(stage: HWND, video: HWND) {
         if stage.is_invalid() || !IsWindow(stage).as_bool() {
             return;
         }
         let mut above = GetWindow(video, GW_HWNDPREV).unwrap_or_default();
-        // Bound the walk because another process may reorder windows concurrently.
+        // Обход ограничен: другой процесс может менять порядок окон одновременно с нами.
         for _ in 0..4096 {
             if above.is_invalid() {
                 return;
@@ -610,8 +610,9 @@ mod win {
                     if stage_hwnd.is_invalid() || !IsWindow(stage_hwnd).as_bool() {
                         stage_hwnd = HWND(crate::ppt::own_stage_window() as *mut _);
                     }
-                    // GUI focus/WindowLevel changes may arrive after Start. Repair their order
-                    // using the active player, including the spare after a loop handoff.
+                    // Изменения фокуса и уровня окна от GUI могут прийти после «Старт»:
+                    // чиним порядок по активному проигрывателю, в том числе по запасному
+                    // после смены на стыке повтора.
                     keep_stage_below_video(stage_hwnd, main.hwnd);
                 }
                 let c = SHOW_CURSOR.load(Ordering::SeqCst);

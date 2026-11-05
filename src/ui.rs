@@ -542,7 +542,7 @@ impl App {
             PptFocus::Restoring { window } => ("Возвращаем фокус…", Some(window.as_str()), false, Color32::from_rgb(255, 240, 210)),
             PptFocus::RestoreFailed { window } => ("Фокус не восстановлен", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
             PptFocus::Ok => ("С фокусом всё в порядке", None, false, Color32::from_rgb(220, 242, 220)),
-            PptFocus::Unknown => ("Фокус пока не определён", None, true, Color32::from_gray(235)),
+            PptFocus::Unknown => ("Фокус пока не определён", None, false, Color32::from_gray(235)),
         };
         egui::TopBottomPanel::top("ppt_focus_status")
             .exact_height(36.0)
@@ -565,7 +565,7 @@ impl App {
 
     pub(crate) fn bottom_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         let active = view.active.is_some();
-        // Status gets its own full-width row; it cannot grow backwards into buttons.
+        // Статус — отдельная строка на всю ширину: не наезжает на кнопки обратным ростом.
         let (summary, color) = if let Some(video) = &view.video {
             let (text, color) = video_label(video);
             (format!("Видео · {text}"), color)
@@ -625,14 +625,14 @@ impl App {
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Экран").color(UI_MUTED));
-            for (screen, command, label) in [
-                (Screen::Background, Cmd::Background, "Фон"),
-                (Screen::Clock, Cmd::Clock, "Часы"),
-                (Screen::Timer, Cmd::Timer, "Таймер"),
+            for (screen, command, label, tip) in [
+                (Screen::Background, Cmd::Background, "Фон", "Закрыть показ и вывести фон. Правый щелчок — выбрать картинку или анимацию фона"),
+                (Screen::Clock, Cmd::Clock, "Часы", "Закрыть показ и вывести часы на весь экран"),
+                (Screen::Timer, Cmd::Timer, "Таймер", "Закрыть показ и вывести таймер; управление — в нижней панели"),
             ] {
                 let selected = !active && view.screen == screen;
                 let response = btn(ui, label, if selected { BLUE } else { GRAY })
-                    .on_hover_text("Закрыть текущий показ и вывести выбранный экран на компьютере показа");
+                    .on_hover_text(tip);
                 if response.clicked() { self.act(command); }
                 if screen == Screen::Background {
                     response.context_menu(|ui| self.background_menu(ui, &view.background));
@@ -658,7 +658,7 @@ impl App {
             }
             if btn(ui, "Справка", GRAY).clicked() { self.help_open = !self.help_open; }
         });
-        // Keep server errors and transfer progress visible without squeezing controls.
+        // Ошибки сервера и прогресс передачи — отдельной строкой, не сжимая кнопки.
         if !self.status.is_empty() {
             ui.add(egui::Label::new(RichText::new(&self.status).size(11.5).color(Color32::from_gray(0x66))).truncate())
                 .on_hover_text(&self.status);

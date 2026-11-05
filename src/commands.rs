@@ -443,7 +443,7 @@ impl App {
         if self.show.take().is_some_and(|s| s.is_ppt()) {
             // Сцена лежит прямо под слайд-шоу, поэтому при его закрытии сразу виден фон.
             self.ppt_host.close();
-            // The stage must issue Focus again after the slideshow window is gone.
+            // Окно слайд-шоу исчезло — сцена должна заново забрать фокус.
             self.stage_sent = None;
             self.ctx.request_repaint();
         }
@@ -488,7 +488,7 @@ impl App {
         self.tick_ppt_zoom();
     }
 
-    /// The keyboard target for PDF/images/video is the stage. Video itself is NOACTIVATE.
+    /// Клавиатурная цель для PDF, картинок и видео — сцена (окно видео само не активируется).
     fn show_uses_stage_focus(&self) -> bool {
         self.show.as_ref().is_some_and(|show| match &show.kind {
             ShowKind::Ppt(_) => show.ppt_zoom_on(),
@@ -496,7 +496,7 @@ impl App {
         })
     }
 
-    /// Poll the presentation computer's real foreground HWND for every format.
+    /// Опрос настоящего переднего окна Windows на компьютере показа — для всех форматов.
     pub(crate) fn tick_ppt_focus(&mut self, ctx: &egui::Context) {
         if self.connected { return; }
         if self.show.is_none() {
@@ -541,8 +541,8 @@ impl App {
                 };
                 self.update_ppt_focus(PptFocus::RestoreFailed { window });
             } else {
-                // Activation can be denied while PowerPoint is starting. Retry during the
-                // short verification window instead of spending the operator's click once.
+                // Пока PowerPoint запускается, активацию могут отвергать — повторяем в коротком
+                // окне проверки, не расходуя единственный щелчок оператора.
                 ppt::request_focus(hwnd);
                 if stage_target {
                     if let Some(video) = self.show.as_ref().and_then(Show::video) {

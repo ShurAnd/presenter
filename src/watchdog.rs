@@ -12,10 +12,9 @@ const HANG_LIMIT: Duration = Duration::from_secs(20);
 /// Падений подряд, после которых делаем длинную паузу (чтобы не крутиться в цикле).
 const FAST_CRASHES: u32 = 5;
 
-/// Bounded backoff for consecutive failures of the supervised server process.
-/// A server that has run for >=30s breaks the rapid-crash sequence.
-/// Pure policy function so the real restart thresholds can be regression-tested
-/// without spawning the application or modifying the user's autostart registry.
+/// Пауза перед перезапуском после падений подряд. Проживший 30 с и дольше сервер
+/// прерывает серию «падает сразу после запуска». Функция чистая — пороги перезапуска
+/// проверяются тестами без запуска программы и без правки автозапуска в реестре.
 fn restart_backoff(previous_crashes: u32, ran_for: Duration) -> (u32, Duration) {
     let crashes = if ran_for < Duration::from_secs(30) {
         previous_crashes.saturating_add(1)
@@ -26,8 +25,8 @@ fn restart_backoff(previous_crashes: u32, ran_for: Duration) -> (u32, Duration) 
     (crashes, pause)
 }
 
-/// Exact command stored under HKCU\...\Run. Keep the real registry write separate
-/// from the pure formatting code, so tests never affect autostart settings.
+/// Точная команда в HKCU\...\Run. Форматирование отделено от настоящей записи в реестр,
+/// чтобы тесты не трогали настройки автозапуска.
 fn autostart_command(exe: &std::path::Path) -> String {
     format!("\"{}\" --watchdog --server", exe.display())
 }
