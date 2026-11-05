@@ -2717,7 +2717,7 @@ dependencies = [
 
 [[package]]
 name = "presentator"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "eframe",
  "futures-util",

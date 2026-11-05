@@ -4,7 +4,7 @@
 видео и картинки, оператор управляет показом с другого компьютера по сети.
 Один exe, без установки и без Python.
 
-- **Версия:** 3.0.0 (ветка `v3.0`). Стабильная v2.5.4 — тег `v2.5.4`, ветка `v2-stable`.
+- **Версия:** 3.0.1 (ветка `v3.0`). Стабильная v2.5.4 — тег `v2.5.4`, ветка `v2-stable`.
 - **Платформа:** Windows 10/11 x64 (PowerPoint через COM, libmpv, PDFium).
 - **Сборка:** `cargo build --release` → `target/release/presentator.exe`.
 
@@ -34,7 +34,7 @@ presentator.exe --watchdog --server  # сервер с перезапуском 
 - [`PROJECT.md`](PROJECT.md) — полная сводка: цель, архитектура, протокол, решения,
   что проверено и что осталось.
 - [`docs/README.md`](docs/README.md) — индекс документации.
-- [`docs/releases/3.0.0.md`](docs/releases/3.0.0.md) — что нового в 3.0.0.
+- [`docs/releases/3.0.1.md`](docs/releases/3.0.1.md) — что нового в 3.0.1.
 - [`tests/fixtures/3.0/README.md`](tests/fixtures/3.0/README.md) — тестовые файлы
   и чек-лист ручной проверки.
 
