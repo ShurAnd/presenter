@@ -122,6 +122,38 @@ fn nav_item(ui: &mut egui::Ui, label: &str, icon: NavIcon, on: bool) -> egui::Re
     resp
 }
 
+/// Кнопка-переключатель «клавиатура»: значок рисуем сами, цвет показывает состояние.
+fn keyboard_button(ui: &mut egui::Ui, on: bool, tip: &str) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(42.0, 32.0), egui::Sense::click());
+    let p = ui.painter();
+    p.rect_filled(rect, 8.0, if on { GREEN } else { ui_surface_alt() });
+    if resp.hovered() {
+        p.rect_stroke(
+            rect,
+            8.0,
+            egui::Stroke::new(1.5_f32, if on { Color32::WHITE } else { ui_accent() }),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let body = egui::Rect::from_center_size(rect.center(), egui::vec2(26.0, 17.0));
+    p.rect_filled(body, 3.0, if on { Color32::WHITE } else { ui_surface() });
+    let key = if on { GREEN } else { ui_muted() };
+    for row in 0..2 {
+        for col in 0..5 {
+            let x = body.left() + 3.0 + col as f32 * 4.4;
+            let y = body.top() + 3.0 + row as f32 * 4.0;
+            p.rect_filled(egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(2.8, 2.4)), 0.6, key);
+        }
+    }
+    // Пробел — длинная клавиша внизу.
+    p.rect_filled(
+        egui::Rect::from_min_size(body.left_top() + egui::vec2(5.0, 11.8), egui::vec2(16.0, 2.4)),
+        0.6,
+        key,
+    );
+    resp.on_hover_text(tip)
+}
+
 /// Единый стиль интерфейса (оставлено для тестов и совместимости).
 #[cfg(test)]
 pub(crate) fn configure_operator_style(ctx: &egui::Context) {
@@ -147,7 +179,7 @@ pub(crate) const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Показать курсор", "Галочка внизу, рядом со «Справкой»: курсор мыши на экране показа виден, пока мышь двигают, и сам прячется через 3 с. В PowerPoint так можно щёлкнуть по видео в слайде. Работает и у клиента; после перезапуска — снова выключено."),
         ("Увеличение слайда", "Справа от превью: «+» / «−» — крупнее и мельче (до 400 %), стрелки — сдвинуть увеличенный слайд, кнопка в центре — снова весь слайд. На миниатюре «Сейчас» оранжевой рамкой — то, что видно на экране. С клавиатуры: «+» / «−», Ctrl+стрелки. Перелистнули — слайд снова целиком. PDF, картинки и PowerPoint; у PowerPoint увеличенный слайд — неподвижная картинка (анимация и видео в слайде не идут), первое увеличение слайда — через долю секунды."),
         ("Двойной Esc", "На экране показа: закрыть показ. На часах или таймере — вернуть фон. На фоне — убрать сцену. Одиночный Esc ничего не делает."),
-        ("Кнопка ⌨", "Зелёная — клавиши в окне программы управляют показом. Серая — не управляют (на самом экране показа клавиши работают всегда)."),
+        ("Кнопка с клавиатурой", "Зелёная — клавиши в окне программы управляют показом. Серая — не управляют (на самом экране показа клавиши работают всегда)."),
     ]),
     ("Экран сервера: фон, часы, таймер", &[
         ("Фон", "Закрыть показ и оставить на экране показа фоновую картинку."),
@@ -546,18 +578,17 @@ impl App {
                 self.add_dialog(&ctx);
             }
             // Переключатель «управление с клавиатуры»: зелёный — клавиши в этом окне управляют показом.
-            let (fill, tip) = if self.cfg.keyboard {
-                (GREEN, "Клавиатура включена: стрелки и PageUp/PageDown листают слайды, пробел — следующий шаг или старт/пауза видео, цифры + Enter — переход к слайду. Нажмите, чтобы выключить.")
+            let tip = if self.cfg.keyboard {
+                "Клавиатура включена: стрелки и PageUp/PageDown листают слайды, пробел — следующий шаг или старт/пауза видео, цифры + Enter — переход к слайду. Нажмите, чтобы выключить."
             } else {
-                (GRAY, "Клавиатура выключена: клавиши в этом окне показом не управляют. Нажмите, чтобы включить.")
+                "Клавиатура выключена: клавиши в этом окне показом не управляют. Нажмите, чтобы включить."
             };
-            let key_btn = egui::Button::new(RichText::new("Клавиши").size(13.0).color(Color32::WHITE)).fill(fill).corner_radius(8.0).min_size(egui::vec2(76.0, 0.0));
-            if ui.add(key_btn).on_hover_text(tip).clicked() {
+            if keyboard_button(ui, self.cfg.keyboard, tip).clicked() {
                 self.cfg.keyboard = !self.cfg.keyboard;
                 self.ui.goto_buf.clear();
                 self.save_cfg();
             }
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             if self.net.connected || self.net.server_online {
                 // Состояние сервера: зелёный — норма, жёлтый — внимание, красный — проблема.
                 let (level, rows) = self.health_rows();
@@ -585,40 +616,41 @@ impl App {
                 indicator(ui, OFF, "Сервер: офлайн");
                 indicator(ui, OFF, "Клиент: не подключен");
             }
-
-        });
-        if !matches!(self.ui.tab, Tab::List | Tab::Player) { return; }
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // На вкладке «Плеер» кнопки работают со списком плеера.
-                let player = self.ui.tab == Tab::Player;
-                let tip = if player { "Очистить список плеера" } else { "Очистить список презентаций" };
-                if btn(ui, "Очистить", RED).on_hover_text(tip).clicked() {
-                    let (n, what) = if player { (view.audio.tracks.len(), "музыки из плеера") } else { (view.items.len(), "презентаций") };
-                    if n > 0 {
-                        let cmd = if player { Cmd::AudioClear } else { Cmd::Clear };
-                        self.ui.confirm = Some((format!("Очистить список: удалить все файлы {what} ({n} шт.)? Файлы удалятся и на сервере."), "Очистить", cmd));
+            // Справа — действия со списком (на «Презентациях» и «Плеере»).
+            if matches!(self.ui.tab, Tab::List | Tab::Player) {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let player = self.ui.tab == Tab::Player;
+                    let tip = if player { "Очистить список плеера" } else { "Очистить список презентаций" };
+                    if btn(ui, "Очистить", RED).on_hover_text(tip).clicked() {
+                        let (n, what) = if player { (view.audio.tracks.len(), "музыки из плеера") } else { (view.items.len(), "презентаций") };
+                        if n > 0 {
+                            let cmd = if player { Cmd::AudioClear } else { Cmd::Clear };
+                            self.ui.confirm = Some((format!("Очистить список: удалить все файлы {what} ({n} шт.)? Файлы удалятся и на сервере."), "Очистить", cmd));
+                        }
                     }
-                }
-                let sel = if player {
-                    self.player.selected.filter(|id| view.audio.tracks.iter().any(|t| t.id == *id))
-                } else {
-                    self.ui.selected.filter(|id| view.items.iter().any(|i| i.id == *id))
-                };
-                let mv = |id, up| if player { Cmd::AudioMove { id, up } } else { Cmd::Move { id, up } };
-                if ui.add_enabled(sel.is_some(), cbutton("Вниз", GRAY)).clicked() {
-                    self.act(mv(sel.unwrap(), false));
-                }
-                if ui.add_enabled(sel.is_some(), cbutton("Вверх", GRAY)).clicked() {
-                    self.act(mv(sel.unwrap(), true));
-                }
-            });
+                    let sel = if player {
+                        self.player.selected.filter(|id| view.audio.tracks.iter().any(|t| t.id == *id))
+                    } else {
+                        self.ui.selected.filter(|id| view.items.iter().any(|i| i.id == *id))
+                    };
+                    let mv = |id, up| if player { Cmd::AudioMove { id, up } } else { Cmd::Move { id, up } };
+                    if ui.add_enabled(sel.is_some(), cbutton("Вниз", GRAY)).clicked() {
+                        self.act(mv(sel.unwrap(), false));
+                    }
+                    if ui.add_enabled(sel.is_some(), cbutton("Вверх", GRAY)).clicked() {
+                        self.act(mv(sel.unwrap(), true));
+                    }
+                });
+            }
         });
     }
 
     /// Статус и команда восстановления фокуса видны оператору для удалённого показа.
     pub(crate) fn ppt_focus_bar(&mut self, ctx: &egui::Context, view: &StateMsg) {
         if !self.net.connected || view.active.is_none() { return; }
+        // «Всё в порядке» не занимает строку: место дороже. Полоса появляется,
+        // только когда фокус потерян или восстанавливается.
+        if matches!(view.ppt_focus, PptFocus::Ok | PptFocus::Unknown) { return; }
         let (notice, window, can_restore, color) = {
             let tint = |light: Color32, dark: Color32| if is_dark() { dark } else { light };
             match &view.ppt_focus {
@@ -630,8 +662,8 @@ impl App {
             }
         };
         egui::TopBottomPanel::top("ppt_focus_status")
-            .exact_height(36.0)
-            .frame(egui::Frame::new().fill(color).inner_margin(egui::Margin::symmetric(8, 3)))
+            .exact_height(30.0)
+            .frame(egui::Frame::new().fill(color).inner_margin(egui::Margin::symmetric(8, 2)))
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center)
                     .with_main_align(egui::Align::Center), |ui| {
@@ -937,10 +969,9 @@ impl App {
             Tab::Settings => ("Настройки", "оформление, экран показа, запуск и журнал".into()),
         };
         ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(title).size(22.0).strong().color(ui_ink()));
-                ui.label(RichText::new(subtitle).size(12.0).color(ui_muted()));
-            });
+            ui.label(RichText::new(title).size(18.0).strong().color(ui_ink()));
+            ui.add_space(2.0);
+            ui.add(egui::Label::new(RichText::new(subtitle).size(11.5).color(ui_muted())).truncate());
             if let Some((text, color)) = now_playing(&view.audio) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(cbutton("■", RED)).on_hover_text("Остановить музыку (плавно)").clicked() {
@@ -950,7 +981,7 @@ impl App {
                 });
             }
         });
-        ui.add_space(8.0);
+        ui.add_space(4.0);
     }
 
     /// Диалог «Добавить» — общий для верхней панели и пустого списка.
@@ -973,7 +1004,7 @@ impl App {
             .fill(ui_surface())
             .stroke(egui::Stroke::new(1.0_f32, ui_line()))
             .corner_radius(12.0)
-            .inner_margin(8.0)
+            .inner_margin(6.0)
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 if view.items.is_empty() {
@@ -984,8 +1015,8 @@ impl App {
                     for (n, it) in view.items.iter().enumerate() {
                         let is_active = view.active == Some(it.id);
                         let is_sel = self.ui.selected == Some(it.id);
-                        let (slot, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 66.0), egui::Sense::click());
-                        let rect = slot.shrink2(egui::vec2(2.0, 3.0));
+                        let (slot, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
+                        let rect = slot.shrink2(egui::vec2(2.0, 2.0));
                         let bg = if is_active {
                             ui_live()
                         } else if is_sel {
@@ -1000,36 +1031,36 @@ impl App {
                         if is_active || is_sel {
                             p.rect_filled(
                                 egui::Rect::from_min_size(
-                                    rect.left_top() + egui::vec2(0.0, 10.0),
-                                    egui::vec2(4.0, rect.height() - 20.0),
+                                    rect.left_top() + egui::vec2(0.0, 8.0),
+                                    egui::vec2(4.0, rect.height() - 16.0),
                                 ),
                                 2.0,
                                 if is_active { GREEN } else { ui_accent() },
                             );
                         }
                         // Номер файла в аккуратном квадрате слева.
-                        let badge = egui::Rect::from_min_size(rect.left_top() + egui::vec2(14.0, 18.0), egui::vec2(30.0, 30.0));
+                        let badge = egui::Rect::from_min_size(rect.left_top() + egui::vec2(12.0, 14.0), egui::vec2(26.0, 26.0));
                         p.rect_filled(
                             badge,
-                            8.0,
+                            7.0,
                             if is_active { GREEN } else if is_sel { ui_accent() } else { ui_surface_alt() },
                         );
                         p.text(
                             badge.center(),
                             egui::Align2::CENTER_CENTER,
                             format!("{}", n + 1),
-                            egui::FontId::proportional(12.0),
+                            egui::FontId::proportional(11.0),
                             if is_active || is_sel { Color32::WHITE } else { ui_muted() },
                         );
                         let is_video = it.kind == "ВИДЕО";
-                        let right = if is_video { 58.0 } else { 14.0 };
+                        let right = if is_video { 52.0 } else { 12.0 };
                         let title_rect = egui::Rect::from_min_max(
-                            egui::pos2(rect.left() + 54.0, rect.top() + 12.0),
-                            egui::pos2(rect.right() - right, rect.top() + 33.0),
+                            egui::pos2(rect.left() + 46.0, rect.top() + 8.0),
+                            egui::pos2(rect.right() - right, rect.top() + 27.0),
                         );
                         let status_rect = egui::Rect::from_min_max(
-                            egui::pos2(rect.left() + 54.0, rect.top() + 34.0),
-                            egui::pos2(rect.right() - right, rect.bottom() - 10.0),
+                            egui::pos2(rect.left() + 46.0, rect.top() + 27.0),
+                            egui::pos2(rect.right() - right, rect.bottom() - 7.0),
                         );
                         let (info, col) = if !it.status.is_empty() {
                             (it.status.clone(), if it.ready || it.status.starts_with("обработка") { ui_muted() } else { RED })
@@ -1058,10 +1089,10 @@ impl App {
                         } else {
                             ""
                         };
-                        row_label(p, title_rect, &it.name, 14.5, ui_ink(), false);
-                        row_label(p, status_rect, &format!("{state_label}{info}"), 12.0, col, false);
+                        row_label(p, title_rect, &it.name, 13.5, ui_ink(), false);
+                        row_label(p, status_rect, &format!("{state_label}{info}"), 11.5, col, false);
                         if is_video {
-                            let r = egui::Rect::from_center_size(rect.right_center() - egui::vec2(24.0, 0.0), egui::vec2(30.0, 24.0));
+                            let r = egui::Rect::from_center_size(rect.right_center() - egui::vec2(22.0, 0.0), egui::vec2(26.0, 22.0));
                             let icon = ui.interact(r, ui.id().with(("repeat", it.id)), egui::Sense::click());
                             repeat_icon(ui.painter(), r, it.repeat, icon.hovered());
                             let tip = if it.repeat {

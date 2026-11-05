@@ -54,7 +54,7 @@ impl App {
     /// Превью у оператора: миниатюры предыдущего, текущего и следующего слайда.
     pub(crate) fn preview_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         let Some(id) = view.active else { return };
-        const GAP: f32 = 12.0;
+        const GAP: f32 = 8.0;
         // Увеличение — у PDF и картинок (их рисуем сами); панель справа от миниатюр.
         let kind = view.items.iter().find(|i| i.id == id).map(|i| i.kind.as_str()).unwrap_or("");
         let zoomable = kind == "PDF" || kind == KIND_IMAGE || kind == "PPTX";
@@ -62,17 +62,17 @@ impl App {
         // Три миниатюры 16:9 по ширине окна, но не выше 112 точек.
         // Учитываем и промежутки между элементами строки — иначе панель увеличения уезжала за край.
         let spacing = 4.0 * ui.spacing().item_spacing.x;
-        let h = ((ui.available_width() - 2.0 * GAP - panel - spacing) / 3.0 * 9.0 / 16.0).clamp(50.0, 112.0);
+        let h = ((ui.available_width() - 2.0 * GAP - panel - spacing) / 3.0 * 9.0 / 16.0).clamp(44.0, 88.0);
         let zview = (view.zoom > 1.0).then_some(view.view);
         // Видео и звук на слайде PowerPoint — списком над миниатюрами, номера — как рамки на «Сейчас».
         if !view.media.is_empty() {
             self.media_list(ui, &view.media);
-            ui.add_space(4.0);
+            ui.add_space(2.0);
         }
         let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| -> egui::Rect {
             ui.vertical(|ui| {
                 let color = if current { ui_ink() } else { ui_muted() };
-                ui.label(RichText::new(title).size(12.0).color(color).strong());
+                ui.label(RichText::new(title).size(11.0).color(color).strong());
                 // Слайды не 16:9 вписываются в ту же рамку.
                 let frame = egui::vec2(h * 16.0 / 9.0, h);
                 let (rect, _) = ui.allocate_exact_size(frame, egui::Sense::hover());

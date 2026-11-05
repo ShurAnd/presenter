@@ -106,9 +106,9 @@ pub(crate) fn apply_titlebar(_hwnd: isize, _dark: bool) {}
 pub(crate) fn configure(ctx: &egui::Context) {
     ctx.set_theme(if is_dark() { egui::Theme::Dark } else { egui::Theme::Light });
     ctx.style_mut(|s| {
-        s.spacing.button_padding = egui::vec2(12.0, 8.0);
-        s.spacing.item_spacing = egui::vec2(10.0, 8.0);
-        s.spacing.interact_size = egui::vec2(38.0, 32.0);
+        s.spacing.button_padding = egui::vec2(10.0, 6.0);
+        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        s.spacing.interact_size = egui::vec2(36.0, 30.0);
         for (kind, size) in [
             (egui::TextStyle::Body, 14.5),
             (egui::TextStyle::Button, 14.0),

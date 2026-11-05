@@ -731,12 +731,14 @@ impl eframe::App for App {
             ctx.request_repaint_after(screen::timer_tick(&view.timer, self.timer_extra()));
         }
 
-        let margin = egui::Frame::new().fill(ui_bg()).inner_margin(12.0);
+        let margin = egui::Frame::new().fill(ui_bg()).inner_margin(10.0);
+        // Превью — компактнее по вертикали: над списком и без лишних полей.
+        let preview_margin = egui::Frame::new().fill(ui_bg()).inner_margin(egui::Margin::symmetric(10, 6));
         // Левое меню — разделы окна; верхняя и нижняя панели занимают оставшуюся ширину.
         egui::SidePanel::left("nav")
             .resizable(false)
             .exact_width(204.0)
-            .frame(egui::Frame::new().fill(ui_surface()).inner_margin(egui::Margin::symmetric(12, 14)))
+            .frame(egui::Frame::new().fill(ui_surface()).inner_margin(egui::Margin::symmetric(12, 12)))
             .show(ctx, |ui| self.sidebar(ui, &view));
         egui::TopBottomPanel::top("top").frame(margin).show(ctx, |ui| self.top_bar(ui, &view));
         self.ppt_focus_bar(ctx, &view);
@@ -748,11 +750,11 @@ impl eframe::App for App {
         egui::TopBottomPanel::bottom("bottom").frame(margin).show(ctx, |ui| self.bottom_bar(ui, &view));
         // Превью — над нижней панелью, пока открыта презентация (у видео превью нет).
         if self.ui.tab == Tab::List && view.active.is_some() && view.video.is_none() {
-            egui::TopBottomPanel::bottom("preview").frame(margin).show(ctx, |ui| self.preview_bar(ui, &view));
+            egui::TopBottomPanel::bottom("preview").frame(preview_margin).show(ctx, |ui| self.preview_bar(ui, &view));
         }
         egui::CentralPanel::default().frame(margin).show(ctx, |ui| {
             self.tab_row(ui, &view);
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             match self.ui.tab {
                 Tab::List => self.list(ui, &view),
                 Tab::Player => self.player_panel(ui, &view),
