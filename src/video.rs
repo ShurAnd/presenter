@@ -113,8 +113,8 @@ impl Drop for Video {
     }
 }
 
-// The unit-test video has only an in-memory command sender; it never starts mpv,
-// Media Foundation, a Windows message loop, or a native window.
+// В тестах видео — только канал команд в памяти: mpv, Media Foundation,
+// цикл сообщений и нативное окно не запускаются.
 #[cfg(test)]
 pub(crate) fn mock_for_tests() -> Video {
     let (tx, _rx) = channel::<VCmd>();

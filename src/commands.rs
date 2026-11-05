@@ -746,11 +746,21 @@ impl App {
             if text == *saved {
                 continue;
             }
-            let _ = std::fs::create_dir_all(&self.work_dir);
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if let Err(e) = std::fs::create_dir_all(&self.work_dir) {
+                jlog!("Не удалось создать папку списка: {e}");
+                self.ui.status = format!("Не удалось сохранить список ({name}): {e}");
+                continue;
+            }
             // Через временный файл: при сбое посреди записи старый список останется целым.
             let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, &text).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
-                *saved = text;
+            match std::fs::write(&tmp, &text).and_then(|_| std::fs::rename(&tmp, &path)) {
+                Ok(()) => *saved = text,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    jlog!("Не удалось сохранить список {name}: {e}");
+                    self.ui.status = format!("Не удалось сохранить список ({name}): {e}. Проверьте свободное место на диске.");
+                }
             }
         }
     }
@@ -759,38 +769,66 @@ impl App {
     /// в рабочей папке, на которые не ссылается ни один список (недокачанные при сбое), удаляются.
     pub(crate) fn load_list(&mut self, ctx: &egui::Context) {
         // list.json — файл первой сборки с сохранением списка (до раздельных файлов по портам).
-        let list: Vec<SavedItem> = std::fs::read_to_string(self.list_path())
+        let list: Vec<SavedItem> = match std::fs::read_to_string(self.list_path())
             .or_else(|_| std::fs::read_to_string(self.work_dir.join("list.json")))
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
-        let audio: Vec<SavedItem> = std::fs::read_to_string(self.audio_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(v) => v,
+                Err(e) => {
+                    jlog!("Список не прочитан: {e} — файлы в рабочей папке не удаляем");
+                    self.ui.status = "Список не прочитан (повреждён) — файлы не удалялись.".into();
+                    Vec::new()
+                }
+            },
+            Err(_) => Vec::new(),
+        };
+        let audio: Vec<SavedItem> = match std::fs::read_to_string(self.audio_path()) {
+            Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+                jlog!("Список плеера не прочитан: {e} — файлы в рабочей папке не удаляем");
+                self.ui.status = "Список плеера не прочитан (повреждён) — файлы не удалялись.".into();
+                Vec::new()
+            }),
+            Err(_) => Vec::new(),
+        };
         let is_list = |name: &str| name.starts_with("list_") || name.starts_with("list.json") || name.starts_with("audio_");
         let mut keep: HashSet<PathBuf> = HashSet::new();
+        let mut corrupt = false;
         if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
             for e in dir.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if is_list(&name) && name.ends_with(".json") {
-                    let other: Vec<SavedItem> = std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
-                    keep.extend(other.into_iter().map(|i| i.src));
+                    // Повреждённый файл списка — не повод удалять чужие файлы: уборку отменяем.
+                    match std::fs::read_to_string(e.path()).ok().and_then(|s| serde_json::from_str::<Vec<SavedItem>>(&s).ok()) {
+                        Some(other) => keep.extend(other.into_iter().map(|i| i.src)),
+                        None => {
+                            corrupt = true;
+                            jlog!("Файл списка {name} не прочитан — уборка файлов отменена");
+                        }
+                    }
                 }
             }
         }
-        if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
-            for e in dir.flatten() {
-                let p = e.path();
-                let name = e.file_name().to_string_lossy().to_string();
-                if p.is_file() && !is_list(&name) && !keep.contains(&p) {
-                    let _ = std::fs::remove_file(&p);
+        if corrupt {
+            if !self.ui.status.contains("повреждён") {
+                self.ui.status = "Один из файлов списка повреждён — файлы в рабочей папке не удалялись.".into();
+            }
+        } else {
+            if let Ok(dir) = std::fs::read_dir(&self.work_dir) {
+                for e in dir.flatten() {
+                    let p = e.path();
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if p.is_file() && !is_list(&name) && !keep.contains(&p) {
+                        let _ = std::fs::remove_file(&p);
+                    }
                 }
             }
-        }
-        // Картинки слайдов файлов, которых нет ни в одном списке, тоже не нужны.
-        let used: HashSet<PathBuf> = keep.iter().map(|p| self.slides_dir(p)).collect();
-        if let Ok(dir) = std::fs::read_dir(self.work_dir.join(SLIDES_DIR)) {
-            for e in dir.flatten() {
-                if !used.contains(&e.path()) {
-                    let _ = std::fs::remove_dir_all(e.path());
+            // Картинки слайдов файлов, которых нет ни в одном списке, тоже не нужны.
+            let used: HashSet<PathBuf> = keep.iter().map(|p| self.slides_dir(p)).collect();
+            if let Ok(dir) = std::fs::read_dir(self.work_dir.join(SLIDES_DIR)) {
+                for e in dir.flatten() {
+                    if !used.contains(&e.path()) {
+                        let _ = std::fs::remove_dir_all(e.path());
+                    }
                 }
             }
         }

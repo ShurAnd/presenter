@@ -19,6 +19,7 @@ mod pdfium_bundle;
 mod render;
 mod screen;
 mod stage;
+mod theme;
 mod ui;
 mod ui_net;
 mod ui_player;
@@ -41,6 +42,7 @@ use serde::{Deserialize, Serialize};
 
 // Общие помощники модулей интерфейса и настроек — видны во всех модулях программы.
 use config::*;
+use theme::*;
 use ui::*;
 use ui_preview::*;
 
@@ -82,8 +84,8 @@ fn main() -> eframe::Result {
     journal::init();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title(format!("Presentator v{}", env!("CARGO_PKG_VERSION")))
-        .with_inner_size([750.0, 620.0])
-        .with_min_inner_size([640.0, 420.0])
+        .with_inner_size([1000.0, 700.0])
+        .with_min_inner_size([900.0, 620.0])
         .with_icon(app_icon());
     // По центру рабочей области: иначе Windows при каскадной раскладке мог открыть окно так низко,
     // что нижняя панель с кнопками уходила за край экрана (1080p при масштабе 150 %).
@@ -148,7 +150,7 @@ fn initial_geometry() -> Option<(egui::Pos2, egui::Vec2)> {
         let (x, y) = (r.left as f32 / k, r.top as f32 / k);
         let (w, h) = ((r.right - r.left) as f32 / k, (r.bottom - r.top) as f32 / k);
         const FRAME: f32 = 45.0; // заголовок и рамки окна
-        let size = egui::vec2(750f32.min(w - 20.0), 620f32.min(h - FRAME - 10.0)).max(egui::vec2(640.0, 420.0));
+        let size = egui::vec2(1000f32.min(w - 20.0), 700f32.min(h - FRAME - 10.0)).max(egui::vec2(900.0, 620.0));
         let pos = egui::pos2(x + (w - size.x) / 2.0, y + (h - size.y - FRAME) / 2.0).max(egui::pos2(x, y));
         Some((pos, size))
     }
@@ -474,6 +476,8 @@ struct Ui {
     logged_net: String,
     logged_level: Option<health::Level>,
     awake: bool,
+    /// Тёмный заголовок окна уже применён: DWM вызываем на первом кадре, когда окно уже видно.
+    titlebar: bool,
     /// Ждёт подтверждения: текст вопроса, надпись на кнопке и команда (удалить, очистить).
     confirm: Option<(String, &'static str, Cmd)>,
     /// Состояние от сервера уже пришло (до этого версия сервера неизвестна); полосу о версии скрыли.
@@ -508,13 +512,14 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_operator_style(&cc.egui_ctx);
         // Если в %APPDATA% настроек ещё нет — берём прежний файл рядом с exe (старые версии хранили их там).
         let cfg: Config = std::fs::read_to_string(config_path())
             .or_else(|_| std::fs::read_to_string(app_dir().join(CONFIG_FILE)))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
+        set_dark(cfg.dark);
+        theme::configure(&cc.egui_ctx);
 
         let (out_tx, out_rx) = channel();
         let ctx = cc.egui_ctx.clone();
@@ -634,6 +639,7 @@ impl App {
                 logged_net: String::new(),
                 logged_level: None,
                 awake: false,
+                titlebar: false,
                 confirm: None,
                 got_state: false,
                 version_hidden: false,
@@ -648,6 +654,7 @@ impl App {
             },
         };
         // Автозапуск: `presentator --server` или `presentator --connect`.
+        apply_titlebar(app.stage.main_hwnd, app.cfg.dark);
         let args: Vec<String> = std::env::args().collect();
         // `--add <файл>` (можно несколько): добавить в список; при `--connect` — загрузить на сервер.
         app.session.pending_add = args.windows(2).filter(|w| w[0] == "--add").map(|w| PathBuf::from(&w[1])).collect();
@@ -671,9 +678,14 @@ impl App {
         if let Ok(s) = serde_json::to_string_pretty(&cfg) {
             let path = config_path();
             if let Some(dir) = path.parent() {
-                let _ = std::fs::create_dir_all(dir);
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    jlog!("Не удалось создать папку настроек: {e}");
+                    return;
+                }
             }
-            let _ = std::fs::write(path, s);
+            if let Err(e) = std::fs::write(&path, s) {
+                jlog!("Не удалось сохранить настройки: {e}");
+            }
         }
     }
 
@@ -684,6 +696,10 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.net.ui_frames.fetch_add(1, Ordering::SeqCst);
+        if !self.ui.titlebar {
+            apply_titlebar(self.stage.main_hwnd, self.cfg.dark);
+            self.ui.titlebar = true;
+        }
         self.poll(ctx);
         self.journal_tick();
         if let Some((n, at)) = self.net.reconnect {
@@ -715,7 +731,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(screen::timer_tick(&view.timer, self.timer_extra()));
         }
 
-        let margin = egui::Frame::new().fill(UI_BG).inner_margin(8.0);
+        let margin = egui::Frame::new().fill(ui_bg()).inner_margin(12.0);
+        // Левое меню — разделы окна; верхняя и нижняя панели занимают оставшуюся ширину.
+        egui::SidePanel::left("nav")
+            .resizable(false)
+            .exact_width(204.0)
+            .frame(egui::Frame::new().fill(ui_surface()).inner_margin(egui::Margin::symmetric(12, 14)))
+            .show(ctx, |ui| self.sidebar(ui, &view));
         egui::TopBottomPanel::top("top").frame(margin).show(ctx, |ui| self.top_bar(ui, &view));
         self.ppt_focus_bar(ctx, &view);
         self.alarm_bar(ctx);
@@ -730,7 +752,7 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default().frame(margin).show(ctx, |ui| {
             self.tab_row(ui, &view);
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             match self.ui.tab {
                 Tab::List => self.list(ui, &view),
                 Tab::Player => self.player_panel(ui, &view),

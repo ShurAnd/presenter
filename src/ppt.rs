@@ -146,7 +146,7 @@ fn slideshow_window_for_process(pid: u32, filename: &str) -> isize {
             let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
             if n > 0 {
                 let class = String::from_utf16_lossy(&class[..n as usize]);
-                // Do not read captions of helper windows that cannot be slideshows.
+                // Заголовки окон-помощников, которые не могут быть слайд-шоу, не читаем.
                 if class == "screenClass" || class == "PPTFrameClass" {
                     let mut title = [0u16; 1024];
                     let n = GetWindowTextW(hwnd, title.as_mut_ptr(), title.len() as i32).max(0) as usize;
@@ -164,7 +164,7 @@ fn slideshow_window_for_process(pid: u32, filename: &str) -> isize {
     }
 }
 
-// Only used by explicit native tests when HWND resolution fails.
+// Только для явных нативных тестов, когда дескриптор показа не нашёлся.
 #[cfg(all(test, windows))]
 fn diagnose_slideshow_windows(expected_pid: u32) {
     struct Dump { expected_pid: u32, lines: Vec<String> }
@@ -176,8 +176,8 @@ fn diagnose_slideshow_windows(expected_pid: u32) {
         let n = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
         if n <= 0 { return 1; }
         let class = String::from_utf16_lossy(&buf[..n as usize]);
-        // Include the recorded process plus PowerPoint frames of other PIDs:
-        // this distinguishes an incorrect recorded PID from a class mismatch.
+        // Показываем записанный процесс и окна PowerPoint других PID:
+        // так видно, ошибка в PID или не совпал класс окна.
         if pid == dump.expected_pid || class == "screenClass" || class == "PPTFrameClass" {
             let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
             let title = if n > 0 { String::from_utf16_lossy(&buf[..n as usize]) } else { String::new() };
@@ -1180,7 +1180,7 @@ mod bridge {
             if hwnd != 0 && unsafe { IsWindow(hwnd) } == 0 { hwnd = 0; }
             if hwnd == 0 {
                 let pid = self.ctx.pid.load(Ordering::SeqCst);
-                // Run may return before the native slideshow window has been created.
+                // Run может вернуться раньше, чем Windows создаст окно слайд-шоу.
                 for attempt in 0..20 {
                     hwnd = slideshow_window_for_process(pid, path.file_name().and_then(|n| n.to_str()).unwrap_or(""));
                     if hwnd != 0 { break; }

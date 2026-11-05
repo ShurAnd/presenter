@@ -28,7 +28,7 @@ pub(crate) fn icon_button(ui: &mut egui::Ui, size: egui::Vec2, enabled: bool, ic
         (false, ..) => (Color32::from_gray(0xee), Color32::from_gray(0xbb)),
         (true, _, true) => (Color32::from_rgb(28, 73, 145), Color32::WHITE),
         (true, true, false) => (Color32::from_rgb(48, 111, 203), Color32::WHITE),
-        (true, false, false) => (UI_ACCENT, Color32::WHITE),
+        (true, false, false) => (ui_accent(), Color32::WHITE),
     };
     let p = ui.painter();
     p.rect_filled(rect, 4.0, bg);
@@ -71,13 +71,13 @@ impl App {
         }
         let slot = |ui: &mut egui::Ui, title: String, tex: Option<&egui::TextureHandle>, empty: &str, current: bool| -> egui::Rect {
             ui.vertical(|ui| {
-                let color = if current { Color32::from_gray(0x22) } else { Color32::from_gray(0x77) };
+                let color = if current { ui_ink() } else { ui_muted() };
                 ui.label(RichText::new(title).size(12.0).color(color).strong());
                 // Слайды не 16:9 вписываются в ту же рамку.
                 let frame = egui::vec2(h * 16.0 / 9.0, h);
                 let (rect, _) = ui.allocate_exact_size(frame, egui::Sense::hover());
                 let p = ui.painter();
-                p.rect_filled(rect, 3.0, UI_BG);
+                p.rect_filled(rect, 3.0, ui_bg());
                 let rect = tex.map_or(rect, |t| {
                     let s = t.size_vec2();
                     let k = (frame.x / s.x.max(1.0)).min(frame.y / s.y.max(1.0));
@@ -92,7 +92,7 @@ impl App {
                     }
                 }
                 // Текущий слайд — в зелёной рамке, как активная строка списка.
-                let stroke = if current { egui::Stroke::new(3.0_f32, GREEN) } else { egui::Stroke::new(1.0_f32, Color32::from_gray(0xbb)) };
+                let stroke = if current { egui::Stroke::new(3.0_f32, GREEN) } else { egui::Stroke::new(1.0_f32, ui_line()) };
                 p.rect_stroke(rect, 3.0, stroke, egui::StrokeKind::Outside);
                 // Увеличен — оранжевой рамкой та часть слайда, что сейчас на экране показа.
                 if let (true, Some(v), Some(_)) = (current, zview, tex) {

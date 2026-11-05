@@ -27,7 +27,7 @@ impl App {
         // Позиция и кнопки — внизу, список занимает остальное.
         egui::TopBottomPanel::bottom("player_controls").frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(0, 6))).show_inside(ui, |ui| self.player_controls(ui, &a));
         egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0_f32, UI_LINE))
+            .stroke(egui::Stroke::new(1.0_f32, ui_line()))
             .corner_radius(5.0)
             .inner_margin(6.0)
             .fill(Color32::WHITE)
@@ -47,17 +47,17 @@ impl App {
                         let is_sel = self.player.selected == Some(t.id);
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::click());
                         let bg = if is_cur || is_ins {
-                            UI_LIVE
+                            ui_live()
                         } else if is_sel {
-                            UI_SELECTED
+                            ui_selected()
                         } else if resp.hovered() {
-                            Color32::from_gray(0xf3)
+                            ui_surface_alt()
                         } else {
-                            Color32::WHITE
+                            ui_surface()
                         };
                         let p = ui.painter();
-                        p.rect_filled(rect, 3.0, bg);
-                        p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0_f32, Color32::from_gray(0xee)));
+                        p.rect_filled(rect, 8.0, bg);
+                        p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0_f32, ui_line()));
                         let mark = if is_cur || is_ins { "▶ " } else { "" };
                         let info = if is_ins {
                             Some((format!("вставка {}", audio_time(a.insert_pos, a.insert_dur)), INSERT))
@@ -76,7 +76,7 @@ impl App {
                         let title_rect = egui::Rect::from_min_max(
                             rect.left_top() + egui::vec2(8.0, 0.0),
                             egui::pos2(rect.right() - status_width - 18.0, rect.bottom()));
-                        row_label(p, title_rect, &format!("{mark}{}. {}", n + 1, t.name), 14.0, Color32::from_gray(0x22), false);
+                        row_label(p, title_rect, &format!("{mark}{}. {}", n + 1, t.name), 14.0, ui_ink(), false);
                         if let Some((text, color)) = info {
                             let status_rect = egui::Rect::from_min_max(
                                 egui::pos2(rect.right() - status_width - 8.0, rect.top()),
@@ -110,7 +110,7 @@ impl App {
                 Some(n) => n.to_string(),
                 None => "Ничего не играет".into(),
             };
-            ui.add(egui::Label::new(RichText::new(title).strong().color(if ins { INSERT } else { Color32::from_gray(0x33) })).truncate());
+            ui.add(egui::Label::new(RichText::new(title).strong().color(if ins { INSERT } else { ui_ink() })).truncate());
         });
         ui.horizontal(|ui| {
             let t = |s: u32| format!("{:02}:{:02}", s / 60, s % 60);

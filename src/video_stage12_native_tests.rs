@@ -163,17 +163,14 @@ fn stage14_native_video_invalid_media_then_valid_recovery() {
         let _ = bad_tx.send(ev);
     });
     let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match bad_rx.recv_timeout(remaining) {
-            Ok(VideoEvent::Error(message)) => {
-                assert!(!message.trim().is_empty(), "native decoder error must carry a message");
-                break;
-            }
-            Ok(VideoEvent::Ready(_)) => panic!("invalid media unexpectedly became ready"),
-            Ok(VideoEvent::Pos { .. }) | Ok(VideoEvent::Ended) => panic!("invalid media emitted playback events before Error"),
-            Err(e) => panic!("invalid media did not produce a bounded error event: {e}"),
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match bad_rx.recv_timeout(remaining) {
+        Ok(VideoEvent::Error(message)) => {
+            assert!(!message.trim().is_empty(), "native decoder error must carry a message");
         }
+        Ok(VideoEvent::Ready(_)) => panic!("invalid media unexpectedly became ready"),
+        Ok(VideoEvent::Pos { .. }) | Ok(VideoEvent::Ended) => panic!("invalid media emitted playback events before Error"),
+        Err(e) => panic!("invalid media did not produce a bounded error event: {e}"),
     }
     drop(invalid);
     drop(_bad_file);

@@ -10,6 +10,23 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.label(RichText::new("Настройки").size(18.0).strong());
 
+                section(ui, "Оформление");
+                let mut dark = self.cfg.dark;
+                let mut theme_changed = false;
+                ui.horizontal_wrapped(|ui| {
+                    theme_changed |= ui.radio_value(&mut dark, false, "Светлая тема").changed();
+                    theme_changed |= ui.radio_value(&mut dark, true, "Тёмная тема").changed();
+                });
+                if theme_changed && dark != self.cfg.dark {
+                    self.cfg.dark = dark;
+                    set_dark(dark);
+                    apply_titlebar(self.stage.main_hwnd, dark);
+                    self.ui.titlebar = true;
+                    theme::configure(ui.ctx());
+                    self.save_cfg();
+                }
+                ui.label(RichText::new("Тёмная тема меньше слепит в тёмном зале, светлая лучше читается при дневном свете. Выбор запоминается.").size(11.5).color(ui_muted()));
+
                 section(ui, "Экран показа");
                 ui.label(RichText::new("Монитор и «в окне» — для этого компьютера, когда он сервер; фон у клиента меняется на сервере.").size(11.5).color(GRAY));
                 // Монитор для показа — на сервере: основной или любой из подключённых.
@@ -107,7 +124,7 @@ impl App {
 
                 section(ui, "Журнал событий");
                 let log = journal::path();
-                ui.label(RichText::new("Что открывали, ответы PowerPoint, ошибки, обрывы связи — если что-то не сработало, пришлите этот файл.").size(12.0).color(Color32::from_gray(0x55)));
+                ui.label(RichText::new("Что открывали, ответы PowerPoint, ошибки, обрывы связи — если что-то не сработало, пришлите этот файл.").size(12.0).color(ui_muted()));
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Открыть папку журнала").clicked() {
                         let _ = std::process::Command::new("explorer").arg(format!("/select,{}", log.display())).spawn();
@@ -125,6 +142,6 @@ impl App {
 /// Заголовок раздела настроек.
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(12.0);
-    ui.label(RichText::new(title).strong().size(15.0).color(UI_ACCENT));
+    ui.label(RichText::new(title).strong().size(15.0).color(ui_accent()));
     ui.separator();
 }

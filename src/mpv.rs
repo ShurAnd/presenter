@@ -7,13 +7,35 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use sha2::{Digest, Sha256};
 use windows::core::{s, HSTRING, PCSTR};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 const MPV_TAG: &str = "20260924";
 const MPV_DLL: &str = "libmpv-2.dll";
 const MPV_DLL_SIZE: u64 = 120_797_184;
+/// SHA-256 распакованной DLL — из vendor/libmpv/README.md.
+const MPV_DLL_SHA256: &str = "d2d081547efea8a1530f4ba0bf58a0d72069b25c40d8b2a7071cea5aa82381c6";
 static MPV_ZIP: &[u8] = include_bytes!("../vendor/libmpv/libmpv-2.zip");
+
+/// Файл на месте, нужного размера и с ожидаемой контрольной суммой.
+/// Размер проверяем до чтения, хэш — потоком: файл 120 МБ, целиком в память не берём.
+fn dll_ok(path: &std::path::Path) -> bool {
+    if std::fs::metadata(path).map(|m| m.len()).ok() != Some(MPV_DLL_SIZE) {
+        return false;
+    }
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 256 * 1024];
+    loop {
+        match std::io::Read::read(&mut f, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(_) => return false,
+        }
+    }
+    format!("{:x}", hasher.finalize()) == MPV_DLL_SHA256
+}
 
 pub const FORMAT_FLAG: i32 = 3;
 pub const FORMAT_DOUBLE: i32 = 5;
@@ -58,7 +80,7 @@ fn extract() -> Result<PathBuf, String> {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     let dir = base.join("Presentator").join(format!("libmpv-{MPV_TAG}"));
     let dll = dir.join(MPV_DLL);
-    if std::fs::metadata(&dll).is_ok_and(|m| m.len() == MPV_DLL_SIZE) {
+    if dll_ok(&dll) {
         return Ok(dll);
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("не удалось создать {}: {e}", dir.display()))?;
@@ -72,9 +94,14 @@ fn extract() -> Result<PathBuf, String> {
     if std::fs::rename(&tmp, &dll).is_err() {
         // DLL могла появиться параллельно (второй экземпляр программы) — тогда берём её.
         let _ = std::fs::remove_file(&tmp);
-        if !std::fs::metadata(&dll).is_ok_and(|m| m.len() == MPV_DLL_SIZE) {
+        if !dll_ok(&dll) {
             return Err("не удалось сохранить libmpv".into());
         }
+    }
+    // Файл мог быть подменён или распакован с повреждением: сверяем SHA-256 перед загрузкой.
+    if !dll_ok(&dll) {
+        let _ = std::fs::remove_file(&dll);
+        return Err("libmpv повреждена: контрольная сумма не совпала".into());
     }
     Ok(dll)
 }
@@ -193,8 +220,8 @@ impl Drop for Mpv {
 }
 
 
-// Stage 9: test libmpv's Rust adapter with an in-memory C function table.
-// No DLL is loaded, no video is decoded, and no graphics device is created.
+// Этап 9: проверка Rust-обёртки libmpv на подставной таблице C-функций.
+// DLL не загружается, видео не декодируется, графическое устройство не создаётся.
 #[cfg(test)]
 mod stage9_tests {
     use super::*;

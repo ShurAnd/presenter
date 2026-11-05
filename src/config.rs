@@ -30,6 +30,8 @@ pub(crate) struct Config {
     pub(crate) audio_volume: u8,
     /// Выбранный фон сцены — имя исходного файла (для показа); пусто — стандартный.
     pub(crate) background: String,
+    /// Тёмная тема операторского окна (3.0). Светлая — по умолчанию.
+    pub(crate) dark: bool,
 }
 
 /// `"servers": null` (файл правили руками или другой программой) читаем как пустой список,
@@ -56,6 +58,7 @@ impl Default for Config {
             audio_repeat: false,
             audio_volume: 100,
             background: String::new(),
+            dark: false,
         }
     }
 }

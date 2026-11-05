@@ -109,6 +109,7 @@ fn test_app() -> App {
             logged_net: String::new(),
             logged_level: None,
             awake: false,
+            titlebar: false,
             confirm: None,
             got_state: false,
             version_hidden: false,
@@ -2749,6 +2750,7 @@ fn redesign_tabs_keep_controls_inside_standard_window() {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(750.0, 650.0))),
                 ..Default::default()
             }, |ctx| {
+                egui::SidePanel::left("redesign_nav").show(ctx, |ui| app.sidebar(ui, &view));
                 egui::TopBottomPanel::top("redesign_top").show(ctx, |ui| app.top_bar(ui, &view));
                 egui::TopBottomPanel::bottom("redesign_bottom").show(ctx, |ui| app.bottom_bar(ui, &view));
                 egui::CentralPanel::default().show(ctx, |ui| {

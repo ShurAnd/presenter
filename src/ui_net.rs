@@ -26,7 +26,7 @@ impl App {
             ui.add_space(8.0);
 
             let locked = self.net.server.is_some() || self.net.client.is_some();
-            egui::Frame::new().fill(UI_BG).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
+            egui::Frame::new().fill(ui_bg()).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
                 ui.add_enabled_ui(!locked, |ui| {
                     egui::Grid::new("net").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
                         // Сохранённые серверы: выбор подставляет адрес, порт, пароль и название.
@@ -119,13 +119,13 @@ impl App {
             ui.add_space(8.0);
             ui.label(
                 RichText::new(
-                    "💡 На компьютере, который выводит показ на монитор, нажмите «Запустить сервер».\n\
+                    "На компьютере, который выводит показ на монитор, нажмите «Запустить сервер».\n\
                      На управляющем компьютере выберите сервер из списка или введите его IP и нажмите «Подключиться».\n\
                      Серверы, к которым удалось подключиться, запоминаются в списке.\n\
                      Для теста на одном компьютере оставьте IP 127.0.0.1.",
                 )
                 .size(12.0)
-                .color(Color32::from_gray(0x55)),
+                .color(ui_muted()),
             );
             });
         });

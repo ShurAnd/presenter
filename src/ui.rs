@@ -2,49 +2,131 @@
 
 use super::*;
 
-// Палитра панели оператора. Цвета сцены и поведение окон не меняются.
-pub(crate) const UI_ACCENT: Color32 = Color32::from_rgb(37, 99, 190);
-pub(crate) const UI_INK: Color32 = Color32::from_rgb(36, 48, 65);
-pub(crate) const UI_MUTED: Color32 = Color32::from_rgb(94, 108, 126);
-pub(crate) const UI_BG: Color32 = Color32::from_rgb(244, 246, 249);
-pub(crate) const UI_LINE: Color32 = Color32::from_rgb(218, 225, 234);
-pub(crate) const UI_SELECTED: Color32 = Color32::from_rgb(231, 240, 254);
-pub(crate) const UI_LIVE: Color32 = Color32::from_rgb(229, 244, 234);
-
-pub(crate) fn configure_operator_style(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Light);
-    ctx.style_mut(|s| {
-        s.spacing.button_padding = egui::vec2(10.0, 7.0);
-        s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.interact_size = egui::vec2(36.0, 30.0);
-        for (kind, size) in [(egui::TextStyle::Body, 14.0), (egui::TextStyle::Button, 14.0),
-            (egui::TextStyle::Small, 12.0), (egui::TextStyle::Heading, 20.0)] {
-            s.text_styles.insert(kind, egui::FontId::proportional(size));
-        }
-        s.visuals.override_text_color = Some(UI_INK);
-        s.visuals.panel_fill = UI_BG;
-        s.visuals.window_fill = Color32::WHITE;
-        s.visuals.extreme_bg_color = Color32::WHITE;
-        s.visuals.faint_bg_color = UI_BG;
-        s.visuals.selection.bg_fill = UI_SELECTED;
-        s.visuals.selection.stroke = egui::Stroke::new(1.0_f32, UI_ACCENT);
-        s.visuals.widgets.inactive.bg_fill = Color32::from_rgb(235, 239, 244);
-        s.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(235, 239, 244);
-        s.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, UI_LINE);
-        s.visuals.widgets.hovered.bg_fill = UI_SELECTED;
-        s.visuals.widgets.hovered.weak_bg_fill = UI_SELECTED;
-        s.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, UI_ACCENT);
-        s.visuals.widgets.active.bg_fill = UI_SELECTED;
-        s.visuals.widgets.active.weak_bg_fill = UI_SELECTED;
-        s.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, UI_ACCENT);
-    });
-}
-
+/// Карточка раздела: поверхность, рамка и мягкая тень.
 pub(crate) fn ui_card() -> egui::Frame {
-    egui::Frame::new().fill(Color32::WHITE).stroke(egui::Stroke::new(1.0_f32, UI_LINE))
-        .corner_radius(8.0).inner_margin(12.0)
+    egui::Frame::new()
+        .fill(ui_surface())
+        .stroke(egui::Stroke::new(1.0_f32, ui_line()))
+        .corner_radius(12.0)
+        .inner_margin(16.0)
+        .shadow(ui_shadow())
 }
 
+
+/// Значок раздела в левом меню.
+#[derive(Clone, Copy)]
+pub(crate) enum NavIcon {
+    List,
+    Play,
+    Net,
+    Sliders,
+}
+
+/// Логотип: синяя плитка с экраном и кнопкой «плей».
+fn brand_mark(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, 9.0, ui_accent());
+    let c = rect.center();
+    let outer = egui::Rect::from_center_size(c + egui::vec2(0.0, -2.0), egui::vec2(20.0, 14.0));
+    p.rect_filled(outer, 2.0, Color32::WHITE);
+    let inner = outer.shrink(2.0);
+    p.rect_filled(inner, 1.0, ui_accent());
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            inner.center() + egui::vec2(-3.0, -4.0),
+            inner.center() + egui::vec2(-3.0, 4.0),
+            inner.center() + egui::vec2(4.0, 0.0),
+        ],
+        Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
+    p.line_segment([c + egui::vec2(0.0, 5.0), c + egui::vec2(0.0, 9.0)], egui::Stroke::new(2.0_f32, Color32::WHITE));
+    p.line_segment([c + egui::vec2(-6.0, 10.0), c + egui::vec2(6.0, 10.0)], egui::Stroke::new(2.0_f32, Color32::WHITE));
+}
+
+/// Простые векторные значки: в шрифте egui нет подходящих символов.
+fn nav_icon(p: &egui::Painter, r: egui::Rect, kind: NavIcon, color: Color32) {
+    match kind {
+        NavIcon::List => {
+            for (i, w) in [0.78_f32, 0.56, 0.68].iter().enumerate() {
+                let y = r.top() + 5.0 + i as f32 * 5.5;
+                p.circle_filled(egui::pos2(r.left() + 1.5, y), 1.3, color);
+                p.line_segment(
+                    [egui::pos2(r.left() + 5.0, y), egui::pos2(r.left() + 5.0 + w * (r.width() - 7.0), y)],
+                    egui::Stroke::new(1.7_f32, color),
+                );
+            }
+        }
+        NavIcon::Play => {
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    r.left_center() + egui::vec2(5.0, -7.0),
+                    r.left_center() + egui::vec2(5.0, 7.0),
+                    r.right_center() + egui::vec2(-3.0, 0.0),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
+        NavIcon::Net => {
+            let a = r.left_center() + egui::vec2(4.0, 0.0);
+            let b = r.center() + egui::vec2(0.0, -5.0);
+            let c = r.right_center() + egui::vec2(-4.0, 0.0);
+            let line = egui::Stroke::new(1.4_f32, color);
+            for (x, y) in [(a, b), (b, c), (a, c)] {
+                p.line_segment([x, y], line);
+            }
+            for q in [a, b, c] {
+                p.circle_filled(q, 2.6, color);
+            }
+        }
+        NavIcon::Sliders => {
+            for (i, x) in [0.28_f32, 0.6, 0.82].iter().enumerate() {
+                let y = r.top() + 4.0 + i as f32 * 5.5;
+                p.line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], egui::Stroke::new(1.5_f32, color));
+                p.circle_filled(egui::pos2(r.left() + x * r.width(), y), 2.2, color);
+            }
+        }
+    }
+}
+
+/// Пункт левого меню.
+fn nav_item(ui: &mut egui::Ui, label: &str, icon: NavIcon, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), egui::Sense::click());
+    let bg = if on {
+        ui_selected()
+    } else if resp.hovered() {
+        ui_surface_alt()
+    } else {
+        Color32::TRANSPARENT
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, 9.0, bg);
+    if on {
+        p.rect_filled(
+            egui::Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 9.0), egui::vec2(3.0, rect.height() - 18.0)),
+            1.5,
+            ui_accent(),
+        );
+    }
+    let icon_rect = egui::Rect::from_center_size(rect.left_center() + egui::vec2(26.0, 0.0), egui::vec2(20.0, 20.0));
+    nav_icon(p, icon_rect, icon, if on { ui_accent() } else { ui_muted() });
+    p.text(
+        rect.left_center() + egui::vec2(46.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(14.0),
+        if on { ui_accent() } else { ui_ink() },
+    );
+    resp
+}
+
+/// Единый стиль интерфейса (оставлено для тестов и совместимости).
+#[cfg(test)]
+pub(crate) fn configure_operator_style(ctx: &egui::Context) {
+    crate::theme::configure(ctx);
+}
 
 /// Справка: разделы и строки «что — как».
 pub(crate) const HELP: &[(&str, &[(&str, &str)])] = &[
@@ -263,14 +345,23 @@ pub(crate) fn repeat_icon(p: &egui::Painter, r: egui::Rect, on: bool, hovered: b
 
 pub(crate) fn cbutton(text: &str, color: Color32) -> egui::Button<'static> {
     let (fill, ink) = if color == GRAY {
-        (Color32::from_rgb(235, 239, 244), UI_INK)
+        (ui_surface_alt(), ui_ink())
     } else if color == RED {
-        (Color32::from_rgb(252, 235, 235), Color32::from_rgb(173, 43, 43))
+        (
+            if is_dark() { Color32::from_rgb(0x3a, 0x1f, 0x22) } else { Color32::from_rgb(252, 235, 235) },
+            if is_dark() { Color32::from_rgb(0xff, 0x9a, 0x94) } else { Color32::from_rgb(173, 43, 43) },
+        )
     } else if color == INSERT {
-        (Color32::from_rgb(255, 241, 215), Color32::from_rgb(132, 79, 5))
-    } else if color == BLUE { (UI_ACCENT, Color32::WHITE) }
-    else { (color, Color32::WHITE) };
-    egui::Button::new(RichText::new(text.to_owned()).color(ink)).fill(fill).corner_radius(6.0)
+        (
+            if is_dark() { Color32::from_rgb(0x3a, 0x2a, 0x12) } else { Color32::from_rgb(255, 241, 215) },
+            if is_dark() { Color32::from_rgb(0xff, 0xc4, 0x6b) } else { Color32::from_rgb(132, 79, 5) },
+        )
+    } else if color == BLUE {
+        (ui_accent(), Color32::WHITE)
+    } else {
+        (color, Color32::WHITE)
+    };
+    egui::Button::new(RichText::new(text.to_owned()).color(ink)).fill(fill).corner_radius(8.0)
 }
 
 pub(crate) fn btn(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
@@ -371,7 +462,7 @@ impl App {
             egui::Grid::new("health").num_columns(2).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
                 for r in &rows {
                     ui.label(r.name);
-                    ui.label(RichText::new(&r.value).color(if r.level == health::Level::Ok { Color32::from_gray(0x33) } else { level_color(r.level) }).strong());
+                    ui.label(RichText::new(&r.value).color(if r.level == health::Level::Ok { ui_ink() } else { level_color(r.level) }).strong());
                     ui.end_row();
                 }
             });
@@ -411,16 +502,16 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 egui::Grid::new("reserve_form").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
-                    ui.label("🏷 Название (необязательно):");
+                    ui.label("Название (необязательно):");
                     ui.add(egui::TextEdit::singleline(&mut srv.name).hint_text("Например: Зал 2").desired_width(220.0));
                     ui.end_row();
-                    ui.label("📡 IP адрес сервера:");
+                    ui.label("IP адрес сервера:");
                     ui.add(egui::TextEdit::singleline(&mut srv.ip).hint_text("Например: 192.168.1.101").desired_width(220.0));
                     ui.end_row();
-                    ui.label("🔌 Порт:");
+                    ui.label("Порт:");
                     ui.add(egui::TextEdit::singleline(&mut srv.port).hint_text("14999").desired_width(90.0));
                     ui.end_row();
-                    ui.label("🔑 Пароль доступа:");
+                    ui.label("Пароль доступа:");
                     ui.add(egui::TextEdit::singleline(&mut srv.password).password(true).desired_width(220.0));
                     ui.end_row();
                 });
@@ -450,16 +541,9 @@ impl App {
 
     pub(crate) fn top_bar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         ui.horizontal(|ui| {
-            if btn(ui, "➕ Добавить", BLUE).clicked() {
-                if let Some(files) = rfd::FileDialog::new()
-                    .add_filter("Презентации, картинки, видео и музыка", &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &background::EXTS[..], &VIDEO_EXTS[..], &AUDIO_EXTS[..]].concat())
-                    .add_filter("Картинки", &background::EXTS)
-                    .add_filter("Музыка", &AUDIO_EXTS)
-                    .pick_files()
-                {
-                    let ctx = ui.ctx().clone();
-                    self.add_files(files, &ctx);
-                }
+            if btn(ui, "Добавить", BLUE).clicked() {
+                let ctx = ui.ctx().clone();
+                self.add_dialog(&ctx);
             }
             // Переключатель «управление с клавиатуры»: зелёный — клавиши в этом окне управляют показом.
             let (fill, tip) = if self.cfg.keyboard {
@@ -467,7 +551,7 @@ impl App {
             } else {
                 (GRAY, "Клавиатура выключена: клавиши в этом окне показом не управляют. Нажмите, чтобы включить.")
             };
-            let key_btn = egui::Button::new(RichText::new("⌨").size(14.0).color(Color32::WHITE)).fill(fill).corner_radius(5.0).min_size(egui::vec2(44.0, 0.0));
+            let key_btn = egui::Button::new(RichText::new("Клавиши").size(13.0).color(Color32::WHITE)).fill(fill).corner_radius(8.0).min_size(egui::vec2(76.0, 0.0));
             if ui.add(key_btn).on_hover_text(tip).clicked() {
                 self.cfg.keyboard = !self.cfg.keyboard;
                 self.ui.goto_buf.clear();
@@ -505,13 +589,11 @@ impl App {
         });
         if !matches!(self.ui.tab, Tab::List | Tab::Player) { return; }
         ui.horizontal(|ui| {
-            let count = if self.ui.tab == Tab::Player { view.audio.tracks.len() } else { view.items.len() };
-            ui.label(RichText::new(format!("{} · {count}", if self.ui.tab == Tab::Player { "Музыка" } else { "Файлы показа" })).color(UI_MUTED));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // На вкладке «Плеер» кнопки работают со списком плеера.
                 let player = self.ui.tab == Tab::Player;
                 let tip = if player { "Очистить список плеера" } else { "Очистить список презентаций" };
-                if btn(ui, "🗑 Очистить", RED).on_hover_text(tip).clicked() {
+                if btn(ui, "Очистить", RED).on_hover_text(tip).clicked() {
                     let (n, what) = if player { (view.audio.tracks.len(), "музыки из плеера") } else { (view.items.len(), "презентаций") };
                     if n > 0 {
                         let cmd = if player { Cmd::AudioClear } else { Cmd::Clear };
@@ -524,10 +606,10 @@ impl App {
                     self.ui.selected.filter(|id| view.items.iter().any(|i| i.id == *id))
                 };
                 let mv = |id, up| if player { Cmd::AudioMove { id, up } } else { Cmd::Move { id, up } };
-                if ui.add_enabled(sel.is_some(), cbutton("⬇ Вниз", GRAY)).clicked() {
+                if ui.add_enabled(sel.is_some(), cbutton("Вниз", GRAY)).clicked() {
                     self.act(mv(sel.unwrap(), false));
                 }
-                if ui.add_enabled(sel.is_some(), cbutton("⬆ Вверх", GRAY)).clicked() {
+                if ui.add_enabled(sel.is_some(), cbutton("Вверх", GRAY)).clicked() {
                     self.act(mv(sel.unwrap(), true));
                 }
             });
@@ -537,12 +619,15 @@ impl App {
     /// Статус и команда восстановления фокуса видны оператору для удалённого показа.
     pub(crate) fn ppt_focus_bar(&mut self, ctx: &egui::Context, view: &StateMsg) {
         if !self.net.connected || view.active.is_none() { return; }
-        let (notice, window, can_restore, color) = match &view.ppt_focus {
-            PptFocus::Lost { window } => ("Фокус сменился", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
-            PptFocus::Restoring { window } => ("Возвращаем фокус…", Some(window.as_str()), false, Color32::from_rgb(255, 240, 210)),
-            PptFocus::RestoreFailed { window } => ("Фокус не восстановлен", Some(window.as_str()), true, Color32::from_rgb(255, 224, 224)),
-            PptFocus::Ok => ("С фокусом всё в порядке", None, false, Color32::from_rgb(220, 242, 220)),
-            PptFocus::Unknown => ("Фокус пока не определён", None, false, Color32::from_gray(235)),
+        let (notice, window, can_restore, color) = {
+            let tint = |light: Color32, dark: Color32| if is_dark() { dark } else { light };
+            match &view.ppt_focus {
+                PptFocus::Lost { window } => ("Фокус сменился", Some(window.as_str()), true, tint(Color32::from_rgb(255, 224, 224), Color32::from_rgb(0x3a, 0x1f, 0x22))),
+                PptFocus::Restoring { window } => ("Возвращаем фокус…", Some(window.as_str()), false, tint(Color32::from_rgb(255, 240, 210), Color32::from_rgb(0x3a, 0x2e, 0x14))),
+                PptFocus::RestoreFailed { window } => ("Фокус не восстановлен", Some(window.as_str()), true, tint(Color32::from_rgb(255, 224, 224), Color32::from_rgb(0x3a, 0x1f, 0x22))),
+                PptFocus::Ok => ("С фокусом всё в порядке", None, false, tint(Color32::from_rgb(220, 242, 220), Color32::from_rgb(0x17, 0x30, 0x1c))),
+                PptFocus::Unknown => ("Фокус пока не определён", None, false, ui_surface_alt()),
+            }
         };
         egui::TopBottomPanel::top("ppt_focus_status")
             .exact_height(36.0)
@@ -577,7 +662,7 @@ impl App {
                 (format!("К слайду {} — Enter", self.ui.goto_buf), GREEN)
             } else {
                 let zoom = if view.zoom > 1.0 { format!(" · {:.0} %", view.zoom * 100.0) } else { String::new() };
-                (format!("Слайд {} из {}{zoom}", view.page + 1, view.pages), Color32::from_gray(0x33))
+                (format!("Слайд {} из {}{zoom}", view.page + 1, view.pages), ui_ink())
             }
         } else {
             ("Показ не запущен".into(), GRAY)
@@ -587,7 +672,7 @@ impl App {
         if let Some(video) = &view.video {
             if video.dur > 0 && matches!(video.state, VideoState::Playing | VideoState::Paused) {
                 ui.add(egui::ProgressBar::new((video.pos as f32 / video.dur as f32).clamp(0.0, 1.0))
-                    .desired_height(4.0).fill(UI_ACCENT));
+                    .desired_height(4.0).fill(ui_accent()));
             }
         }
         ui.horizontal_wrapped(|ui| {
@@ -598,7 +683,7 @@ impl App {
                 self.act(Cmd::Next);
             }
             let sel = self.ui.selected.and_then(|id| view.items.iter().find(|i| i.id == id)).filter(|i| i.ready);
-            if ui.add_enabled(sel.is_some(), cbutton("▶ Показать", BLUE)).clicked() {
+            if ui.add_enabled(sel.is_some(), cbutton("▶ Показать", if sel.is_some() { BLUE } else { GRAY })).clicked() {
                 self.act(Cmd::Open { id: sel.unwrap().id });
             }
             if let Some(v) = &view.video {
@@ -612,7 +697,7 @@ impl App {
                     self.act(Cmd::Play);
                 }
             }
-            if ui.add_enabled(active, cbutton("■ Закрыть показ", RED)).clicked() {
+            if ui.add_enabled(active, cbutton("■ Закрыть показ", if active { RED } else { GRAY })).clicked() {
                 self.act(Cmd::Close);
             }
             if ui.add_enabled(self.ui.selected.is_some(), cbutton("Удалить", GRAY)).clicked() {
@@ -624,7 +709,7 @@ impl App {
         });
         ui.separator();
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Экран").color(UI_MUTED));
+            ui.label(RichText::new("Экран").color(ui_muted()));
             for (screen, command, label, tip) in [
                 (Screen::Background, Cmd::Background, "Фон", "Закрыть показ и вывести фон. Правый щелчок — выбрать картинку или анимацию фона"),
                 (Screen::Clock, Cmd::Clock, "Часы", "Закрыть показ и вывести часы на весь экран"),
@@ -660,7 +745,7 @@ impl App {
         });
         // Ошибки сервера и прогресс передачи — отдельной строкой, не сжимая кнопки.
         if !self.ui.status.is_empty() {
-            ui.add(egui::Label::new(RichText::new(&self.ui.status).size(11.5).color(Color32::from_gray(0x66))).truncate())
+            ui.add(egui::Label::new(RichText::new(&self.ui.status).size(11.5).color(ui_muted())).truncate())
                 .on_hover_text(&self.ui.status);
         }
         if !active && view.screen == Screen::Timer { self.timer_bar(ui, view); }
@@ -720,7 +805,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let (text, phase) = screen::timer_text(&t, self.timer_extra());
-                let color = if phase == screen::Phase::Normal { Color32::from_gray(0x22) } else { screen::phase_color(phase).gamma_multiply(0.85) };
+                let color = if phase == screen::Phase::Normal { ui_ink() } else { screen::phase_color(phase).gamma_multiply(0.85) };
                 ui.label(RichText::new(text).strong().size(18.0).color(color));
             });
         });
@@ -767,20 +852,95 @@ impl App {
         self.ui.help_open = open;
     }
 
-    /// Вкладки «Презентации / Плеер / Сеть»; справа — что играет плеер (видно с любой вкладки).
-    pub(crate) fn tab_row(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+    /// Левое меню: разделы окна, что играет плеер и состояние сервера.
+    pub(crate) fn sidebar(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         ui.horizontal(|ui| {
-            for (tab, label) in [(Tab::List, "Презентации"), (Tab::Player, "Плеер"), (Tab::Net, "Сеть"), (Tab::Settings, "Настройки")] {
-                let on = self.ui.tab == tab;
-                let text = RichText::new(label).size(14.0).strong().color(if on { UI_ACCENT } else { UI_MUTED });
-                let b = egui::Button::new(text).fill(if on { UI_SELECTED } else { Color32::TRANSPARENT }).corner_radius(5.0).min_size(egui::vec2(96.0, 32.0));
-                if ui.add(b).clicked() && !on {
-                    if tab == Tab::Net {
-                        self.merge_servers_from_disk();
-                    }
-                    self.ui.tab = tab;
+            brand_mark(ui);
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new("Presentator").size(17.0).strong().color(ui_ink()));
+                ui.label(RichText::new(format!("версия {}", env!("CARGO_PKG_VERSION"))).size(10.5).color(ui_muted()));
+            });
+        });
+        ui.add_space(20.0);
+        for (tab, label, icon) in [
+            (Tab::List, "Презентации", NavIcon::List),
+            (Tab::Player, "Плеер", NavIcon::Play),
+            (Tab::Net, "Сеть", NavIcon::Net),
+            (Tab::Settings, "Настройки", NavIcon::Sliders),
+        ] {
+            if nav_item(ui, label, icon, self.ui.tab == tab).clicked() && self.ui.tab != tab {
+                if tab == Tab::Net {
+                    self.merge_servers_from_disk();
                 }
+                self.ui.tab = tab;
             }
+            ui.add_space(2.0);
+        }
+        // Низ меню: что играет и состояние сервера.
+        ui.add_space((ui.available_height() - 96.0).max(8.0));
+        if let Some((text, color)) = now_playing(&view.audio) {
+            ui.label(RichText::new(text).size(11.0).color(color));
+            if ui.add(cbutton("Стоп", RED)).clicked() {
+                self.act(Cmd::AudioStop);
+            }
+            ui.add_space(4.0);
+        }
+        let (text, color) = self.sidebar_status();
+        let resp = ui.add(
+            egui::Button::new(RichText::new(text).size(11.5).color(color))
+                .fill(ui_surface_alt())
+                .corner_radius(10.0)
+                .min_size(egui::vec2(ui.available_width(), 30.0)),
+        );
+        if resp.on_hover_text("Показатели сервера: процессор, память, видеокарта, мониторы, связь").clicked()
+            && (self.net.connected || self.net.server_online)
+        {
+            self.ui.health_open = !self.ui.health_open;
+        }
+    }
+
+    /// Короткая строка состояния для левого меню.
+    fn sidebar_status(&self) -> (String, Color32) {
+        if self.net.connected {
+            let (level, rows) = self.health_rows();
+            if rows.is_empty() {
+                ("Сервер: нет данных".into(), OFF)
+            } else {
+                let state = match level {
+                    health::Level::Ok => "норма",
+                    health::Level::Warn => "внимание",
+                    health::Level::Bad => "проблема",
+                };
+                (format!("Сервер: {state}"), level_color(level))
+            }
+        } else if self.net.server_online {
+            (format!("Сервер: {} кл.", self.net.clients), GREEN)
+        } else {
+            ("Сервер: офлайн".into(), OFF)
+        }
+    }
+
+    /// Заголовок раздела: место прежних вкладок (сами вкладки — в левом меню).
+    pub(crate) fn tab_row(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
+        let (title, subtitle) = match self.ui.tab {
+            Tab::List => (
+                "Презентации",
+                format!(
+                    "{} · {}",
+                    view.items.len(),
+                    if self.net.connected { "список сервера" } else { "локальный список" }
+                ),
+            ),
+            Tab::Player => ("Плеер", format!("{} трек(ов) · звук на компьютере показа", view.audio.tracks.len())),
+            Tab::Net => ("Сеть", "сервер, клиент, резерв и дублирование файлов".into()),
+            Tab::Settings => ("Настройки", "оформление, экран показа, запуск и журнал".into()),
+        };
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).size(22.0).strong().color(ui_ink()));
+                ui.label(RichText::new(subtitle).size(12.0).color(ui_muted()));
+            });
             if let Some((text, color)) = now_playing(&view.audio) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add(cbutton("■", RED)).on_hover_text("Остановить музыку (плавно)").clicked() {
@@ -790,56 +950,98 @@ impl App {
                 });
             }
         });
+        ui.add_space(8.0);
+    }
+
+    /// Диалог «Добавить» — общий для верхней панели и пустого списка.
+    pub(crate) fn add_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(files) = rfd::FileDialog::new()
+            .add_filter(
+                "Презентации, картинки, видео и музыка",
+                &[&["pdf", "pptx", "ppt", "ppsx", "pps"][..], &background::EXTS[..], &VIDEO_EXTS[..], &AUDIO_EXTS[..]].concat(),
+            )
+            .add_filter("Картинки", &background::EXTS)
+            .add_filter("Музыка", &AUDIO_EXTS)
+            .pick_files()
+        {
+            self.add_files(files, ctx);
+        }
     }
 
     pub(crate) fn list(&mut self, ui: &mut egui::Ui, view: &StateMsg) {
         egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0_f32, UI_LINE))
-            .corner_radius(5.0)
-            .inner_margin(6.0)
-            .fill(Color32::WHITE)
+            .fill(ui_surface())
+            .stroke(egui::Stroke::new(1.0_f32, ui_line()))
+            .corner_radius(12.0)
+            .inner_margin(8.0)
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 if view.items.is_empty() {
-                    ui.centered_and_justified(|ui| {
-                        let t = if self.net.connected {
-                            "Список сервера пуст.\nНажмите «Добавить» или перетащите сюда PDF, PowerPoint, видео или изображения — файлы уйдут на сервер."
-                        } else {
-                            "Список пуст.\nНажмите «Добавить» или перетащите сюда PDF, PowerPoint, видео или изображения."
-                        };
-                        ui.label(RichText::new(t).color(GRAY).size(14.0));
-                    });
+                    self.empty_list(ui);
                     return;
                 }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     for (n, it) in view.items.iter().enumerate() {
                         let is_active = view.active == Some(it.id);
                         let is_sel = self.ui.selected == Some(it.id);
-                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 52.0), egui::Sense::click());
+                        let (slot, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 66.0), egui::Sense::click());
+                        let rect = slot.shrink2(egui::vec2(2.0, 3.0));
                         let bg = if is_active {
-                            UI_LIVE
+                            ui_live()
                         } else if is_sel {
-                            UI_SELECTED
+                            ui_selected()
                         } else if resp.hovered() {
-                            Color32::from_gray(0xf3)
+                            ui_surface_alt()
                         } else {
-                            Color32::WHITE
+                            ui_bg()
                         };
                         let p = ui.painter();
-                        p.rect_filled(rect, 3.0, bg);
-                        p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0_f32, Color32::from_gray(0xee)));
-                        let mark = if is_active { "▶ " } else { "" };
+                        p.rect_filled(rect, 9.0, bg);
+                        if is_active || is_sel {
+                            p.rect_filled(
+                                egui::Rect::from_min_size(
+                                    rect.left_top() + egui::vec2(0.0, 10.0),
+                                    egui::vec2(4.0, rect.height() - 20.0),
+                                ),
+                                2.0,
+                                if is_active { GREEN } else { ui_accent() },
+                            );
+                        }
+                        // Номер файла в аккуратном квадрате слева.
+                        let badge = egui::Rect::from_min_size(rect.left_top() + egui::vec2(14.0, 18.0), egui::vec2(30.0, 30.0));
+                        p.rect_filled(
+                            badge,
+                            8.0,
+                            if is_active { GREEN } else if is_sel { ui_accent() } else { ui_surface_alt() },
+                        );
+                        p.text(
+                            badge.center(),
+                            egui::Align2::CENTER_CENTER,
+                            format!("{}", n + 1),
+                            egui::FontId::proportional(12.0),
+                            if is_active || is_sel { Color32::WHITE } else { ui_muted() },
+                        );
+                        let is_video = it.kind == "ВИДЕО";
+                        let right = if is_video { 58.0 } else { 14.0 };
+                        let title_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 54.0, rect.top() + 12.0),
+                            egui::pos2(rect.right() - right, rect.top() + 33.0),
+                        );
+                        let status_rect = egui::Rect::from_min_max(
+                            egui::pos2(rect.left() + 54.0, rect.top() + 34.0),
+                            egui::pos2(rect.right() - right, rect.bottom() - 10.0),
+                        );
                         let (info, col) = if !it.status.is_empty() {
-                            (it.status.clone(), if it.ready || it.status.starts_with("обработка") { GRAY } else { RED })
+                            (it.status.clone(), if it.ready || it.status.starts_with("обработка") { ui_muted() } else { RED })
                         } else if let Some(v) = view.video.as_ref().filter(|_| is_active) {
                             let (t, c) = video_label(v);
                             (format!("{} · {t}", it.kind), c)
                         } else if is_active {
                             (format!("{} · слайд {}/{}", it.kind, view.page + 1, view.pages), GREEN)
                         } else if it.pages == 0 || it.kind == KIND_IMAGE {
-                            (it.kind.clone(), GRAY)
+                            (it.kind.clone(), ui_muted())
                         } else {
-                            (format!("{} · {} стр.", it.kind, it.pages), GRAY)
+                            (format!("{} · {} стр.", it.kind, it.pages), ui_muted())
                         };
                         // Видео по ссылке на отсутствующие файлы — предупреждение прямо в строке.
                         let (info, col) = if it.linked.is_empty() || !it.status.is_empty() {
@@ -847,29 +1049,26 @@ impl App {
                         } else {
                             (format!("{info} · видео по ссылке: {}", it.linked.len()), INSERT)
                         };
-                        let is_video = it.kind == "ВИДЕО";
-                        let right = if is_video { 44.0 } else { 8.0 };
-                        let title_rect = egui::Rect::from_min_max(
-                            rect.left_top() + egui::vec2(12.0, 3.0),
-                            egui::pos2(rect.right() - right, rect.top() + 27.0));
-                        let status_rect = egui::Rect::from_min_max(
-                            rect.left_top() + egui::vec2(12.0, 27.0),
-                            egui::pos2(rect.right() - right, rect.bottom() - 3.0));
-                        let state_label = if is_active && is_sel { "Текущий показ · Выбрано · " }
-                            else if is_active { "Текущий показ · " }
-                            else if is_sel { "Выбрано · " } else { "" };
-                        if is_active || is_sel {
-                            p.rect_filled(egui::Rect::from_min_size(rect.left_top() + egui::vec2(0.0, 5.0),
-                                egui::vec2(3.0, rect.height() - 10.0)), 1.0,
-                                if is_active { GREEN } else { UI_ACCENT });
-                        }
-                        row_label(p, title_rect, &format!("{mark}{}. {}", n + 1, it.name), 14.0, UI_INK, false);
+                        let state_label = if is_active && is_sel {
+                            "Текущий показ · Выбрано · "
+                        } else if is_active {
+                            "Текущий показ · "
+                        } else if is_sel {
+                            "Выбрано · "
+                        } else {
+                            ""
+                        };
+                        row_label(p, title_rect, &it.name, 14.5, ui_ink(), false);
                         row_label(p, status_rect, &format!("{state_label}{info}"), 12.0, col, false);
                         if is_video {
-                            let r = egui::Rect::from_center_size(rect.right_center() - egui::vec2(22.0, 0.0), egui::vec2(28.0, 22.0));
+                            let r = egui::Rect::from_center_size(rect.right_center() - egui::vec2(24.0, 0.0), egui::vec2(30.0, 24.0));
                             let icon = ui.interact(r, ui.id().with(("repeat", it.id)), egui::Sense::click());
                             repeat_icon(ui.painter(), r, it.repeat, icon.hovered());
-                            let tip = if it.repeat { "Повтор включён: видео по окончании начнётся заново. Щёлкните, чтобы выключить" } else { "Повтор выключен: по окончании — фон. Щёлкните, чтобы видео шло по кругу" };
+                            let tip = if it.repeat {
+                                "Повтор включён: видео по окончании начнётся заново. Щёлкните, чтобы выключить"
+                            } else {
+                                "Повтор выключен: по окончании — фон. Щёлкните, чтобы видео шло по кругу"
+                            };
                             if icon.on_hover_text(tip).clicked() {
                                 self.act(Cmd::VideoRepeat { id: it.id, on: !it.repeat });
                             }
@@ -895,6 +1094,44 @@ impl App {
                     }
                 });
             });
+    }
+
+    /// Пустой список: подсказка и кнопка добавления по центру.
+    fn empty_list(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space((ui.available_height() * 0.16).max(20.0));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(92.0, 72.0), egui::Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, 16.0, ui_surface_alt());
+            let screen = egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, -4.0), egui::vec2(48.0, 32.0));
+            p.rect_filled(screen, 7.0, ui_surface());
+            for (i, w) in [0.8_f32, 0.55, 0.68].iter().enumerate() {
+                let y = screen.top() + 9.0 + i as f32 * 6.0;
+                p.line_segment(
+                    [
+                        egui::pos2(screen.left() + 9.0, y),
+                        egui::pos2(screen.left() + 9.0 + w * (screen.width() - 18.0), y),
+                    ],
+                    egui::Stroke::new(1.6_f32, ui_muted()),
+                );
+            }
+            p.line_segment([rect.center() + egui::vec2(0.0, 12.0), rect.center() + egui::vec2(0.0, 20.0)], egui::Stroke::new(2.5_f32, ui_muted()));
+            p.line_segment([rect.center() + egui::vec2(-8.0, 21.0), rect.center() + egui::vec2(8.0, 21.0)], egui::Stroke::new(2.5_f32, ui_muted()));
+            ui.add_space(14.0);
+            ui.label(RichText::new("Список пуст").size(19.0).strong().color(ui_ink()));
+            ui.add_space(4.0);
+            let hint = if self.net.connected {
+                "Перетащите файлы сюда или нажмите «Добавить» — они уйдут на сервер."
+            } else {
+                "Перетащите файлы сюда или нажмите «Добавить»: PDF, PowerPoint, видео, изображения и музыка."
+            };
+            ui.label(RichText::new(hint).size(13.0).color(ui_muted()));
+            ui.add_space(14.0);
+            if btn(ui, "Добавить файлы", BLUE).clicked() {
+                let ctx = ui.ctx().clone();
+                self.add_dialog(&ctx);
+            }
+        });
     }
 
     pub(crate) fn keys(&mut self, ctx: &egui::Context, view: &StateMsg) {

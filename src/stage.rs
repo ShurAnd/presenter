@@ -111,7 +111,7 @@ impl App {
             if sent.is_none_or(|(t, _)| t != top) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level(top)));
                 // Сцена появилась или снова поднялась после PowerPoint — забирает клавиатуру.
-                // A fresh stage viewport (including a remote PDF restore request) must also get focus.
+                // Новое окно сцены (в том числе после запроса фокуса с клиента) тоже должно получить фокус.
                 if top || sent.is_none() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
