@@ -446,7 +446,7 @@ pub fn start_server(
                     let (password, dir, state_rx, health_rx) = (password.clone(), dir.clone(), state_rx.clone(), health_rx.clone());
                     let thumbs_rx = thumbs_rx.clone();
                     tokio::spawn(async move {
-                        serve_client(stream, password, dir, state_rx, health_rx, thumbs_rx, &ev, &wake, &clients).await;
+                        serve_client(stream, password, dir, state_rx, health_rx, thumbs_rx, &ev, &wake, &clients, SERVER_SILENCE).await;
                     });
                 }
             };
@@ -475,6 +475,11 @@ pub fn unique_prefix() -> String {
     format!("{ms}_{}", N.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Сколько управляющий клиент может молчать (исправный пингует раз в 2 с): дольше —
+/// канал мёртв, соединение закрываем сами. Симметрия с клиентом (3.0.2): тихая смерть
+/// канала не должна висеть до переполнения TCP-буфера и портить счётчик «N кл.».
+const SERVER_SILENCE: Duration = Duration::from_secs(30);
+
 async fn serve_client(
     stream: TcpStream,
     password: String,
@@ -485,6 +490,7 @@ async fn serve_client(
     ev: &Sender<SrvEvent>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     clients: &AtomicUsize,
+    silence: Duration,
 ) {
     let _ = stream.set_nodelay(true);
     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else { return };
@@ -527,6 +533,14 @@ async fn serve_client(
     // Миниатюры из прошлой рассылки — их клиенту уже отправили.
     let mut sent_thumbs: Vec<(u64, usize)> = Vec::new();
 
+    // Тихая смерть канала (симметрия с клиентом): мёртвое соединение закрываем сами.
+    // Проверяем только после первого Ping: старые клиенты (до 2.2) и загрузочные
+    // соединения на пинги не отвечают — для них молчание норма.
+    let mut last_msg = std::time::Instant::now();
+    let mut got_ping = false;
+    let mut check = tokio::time::interval((silence / 4).clamp(Duration::from_millis(100), Duration::from_secs(5)));
+    let mut silent_drop = false;
+
     loop {
         tokio::select! {
             changed = thumbs_rx.changed(), if !upload_only => {
@@ -549,12 +563,20 @@ async fn serve_client(
                 let s = health_rx.borrow_and_update().clone();
                 if !s.is_empty() && ws.send(Message::text(s)).await.is_err() { break; }
             }
+            _ = check.tick() => {
+                if got_ping && last_msg.elapsed() > silence {
+                    silent_drop = true;
+                    break;
+                }
+            }
             msg = ws.next() => {
                 let Some(Ok(msg)) = msg else { break };
+                last_msg = std::time::Instant::now();
                 match msg {
                     Message::Text(t) => match serde_json::from_str::<C2S>(t.as_str()) {
                         Ok(C2S::Cmd { cmd }) => { let _ = ev.send(SrvEvent::Cmd(cmd)); wake(); }
                         Ok(C2S::Ping { ts }) => {
+                            got_ping = true;
                             if ws.send(js(&S2C::Pong { ts })).await.is_err() { break; }
                         }
                         Ok(C2S::UploadBegin { name, size, background }) => {
@@ -639,6 +661,9 @@ async fn serve_client(
     if let Some((_, path, f, _, _, _)) = upload.take() {
         drop(f);
         let _ = tokio::fs::remove_file(&path).await;
+    }
+    if silent_drop {
+        crate::jlog!("Клиент молчит {} с — соединение закрыто сервером", last_msg.elapsed().as_secs());
     }
     if !upload_only {
         let _ = ev.send(SrvEvent::Clients(clients.fetch_sub(1, Ordering::SeqCst) - 1));

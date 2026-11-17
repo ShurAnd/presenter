@@ -46,8 +46,10 @@ impl Sandbox {
                     (state_rx.clone(), health_rx.clone(), thumbs_rx.clone());
                 tokio::spawn(async move {
                     let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+                    // Боевой порог тишины (30 с) не годится для небыстрых тестов —
+                    // здесь молчание клиента не рвёт соединение.
                     serve_client(stream, TEST_PASSWORD.to_string(), dir, state, health, thumbs,
-                        &ev, &wake, &clients).await;
+                        &ev, &wake, &clients, Duration::from_secs(3600)).await;
                 });
             }
         });
@@ -665,6 +667,55 @@ async fn client_task_breaks_silent_connection_after_pongs_stop() {
     // Пока держим канал запросов живым — «отключились сами» не должно случиться.
     drop(req_tx);
     timeout(WAIT, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn loopback_server_breaks_silent_client_connection() {
+    // Симметрия с клиентским разрывом тишины: клиент попинговал и замолчал, НЕ закрывая
+    // TCP (тихая смерть канала глазами сервера). Раньше такое соединение висело до
+    // переполнения TCP-буфера (Health каждые 2 с — это минуты) и портило счётчик «N кл.».
+    // Теперь молчание дольше `silence` (здесь 800 мс) закрывается сервером: клиент видит
+    // обрыв, счётчик возвращается к нулю.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (ev_tx, _ev_rx) = mpsc::channel();
+    // Отправители держим живыми, иначе watch::Receiver::changed() завершится преждевременно.
+    let (_state, state_rx) = watch::channel(String::new());
+    let (_health, health_rx) = watch::channel(String::new());
+    let (_thumbs, thumbs_rx) = watch::channel(Thumbs::default());
+    let clients = Arc::new(AtomicUsize::new(0));
+    let clients_after = clients.clone();
+    let dir = std::env::temp_dir().join(format!(
+        "presentator_test_silent_{}_{}", std::process::id(), unique_prefix()
+    ));
+    std::fs::create_dir_all(&dir).expect("временный каталог");
+    let task_dir = dir.clone();
+    let task = tokio::spawn(async move {
+        let (stream, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        serve_client(stream, TEST_PASSWORD.to_string(), task_dir, state_rx, health_rx, thumbs_rx,
+            &ev_tx, &wake, &clients, Duration::from_millis(800)).await;
+    });
+    let mut ws = timeout(WAIT, tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/", addr.port())))
+        .await.expect("таймаут WebSocket").expect("подключение WebSocket").0;
+    ws.send(js(&C2S::Hello {
+        password: TEST_PASSWORD.into(), upload: false, version: "test".into(),
+    })).await.expect("Hello");
+    assert!(matches!(next_reply(&mut ws).await, S2C::Welcome), "авторизация тестового клиента");
+    // Один пинг — включаем проверку тишины, дальше молчим и TCP не закрываем.
+    ws.send(js(&C2S::Ping { ts: 1 })).await.unwrap();
+    assert!(matches!(next_reply(&mut ws).await, S2C::Pong { ts: 1 }));
+    let mut closed = false;
+    for _ in 0..100 {
+        match timeout(Duration::from_millis(100), ws.next()).await {
+            Ok(Some(Ok(_))) => continue, // лишних сообщений быть не должно, но пропустим
+            Ok(Some(Err(_))) | Ok(None) | Err(_) => { closed = true; break; }
+        }
+    }
+    assert!(closed, "сервер должен закрыть молчащее соединение сам");
+    timeout(WAIT, task).await.unwrap().unwrap();
+    assert_eq!(clients_after.load(Ordering::SeqCst), 0, "счётчик клиентов должен вернуться к нулю");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
