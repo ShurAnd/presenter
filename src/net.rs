@@ -699,20 +699,34 @@ pub fn start_client(
             }
         };
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
-        let reason = rt.block_on(client_task(host, port, password, rx, &ev, &wake));
+        let reason = rt.block_on(client_task(host, port, password, rx, &ev, &wake, SILENCE));
         let _ = ev.send(CliEvent::Closed(reason));
         wake();
     });
     ClientHandle { tx }
 }
 
-async fn client_task(
+/// Соединение клиента с сервером (ws://, без TLS).
+type ClientWs = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
+
+/// Отправить сообщение серверу. Зависшая отправка (мёртвый TCP, буфер полон) —
+/// то же, что обрыв: не виснем в ожидании, пока TCP сам сдастся, а разрываем соединение.
+async fn send_json(ws: &mut ClientWs, msg: &C2S) -> bool {
+    matches!(tokio::time::timeout(Duration::from_secs(5), ws.send(js(msg))).await, Ok(Ok(())))
+}
+
+/// Сколько сервер может молчать при живых понгах, прежде чем соединение считать мёртвым.
+const SILENCE: Duration = Duration::from_secs(10);
+
+pub(crate) async fn client_task(
     host: String,
     port: u16,
     password: String,
     mut rx: tmpsc::UnboundedReceiver<CliReq>,
     ev: &Sender<CliEvent>,
     wake: &Arc<dyn Fn() + Send + Sync>,
+    // Тихая смерть канала: молчание сервера дольше этого срока — обрыв.
+    silence: Duration,
 ) -> String {
     let url = format!("ws://{host}:{port}");
     // Загрузки — отдельной задачей по своему соединению: команды не ждут, пока едет большой файл.
@@ -742,20 +756,34 @@ async fn client_task(
     // Пинг раз в 2 с: задержка связи и признак того, что сервер жив.
     let started = std::time::Instant::now();
     let mut ping = tokio::time::interval(Duration::from_secs(2));
+    // Соединение может умереть тихо (пропал Wi-Fi, закрылся NAT-канал): TCP узнаёт
+    // об ошибке минутами, наши понги «уходят» в буфер без ответа, и автопереподключение
+    // не начиналось, пока TCP не сдастся сам. Поэтому следим за последним ответом
+    // сервера: молчание дольше `silence` — обрываем соединение сами. Проверяем только
+    // после первого полученного Pong: старые серверы на пинги не отвечают, и молчание
+    // для них — норма.
+    let mut last_reply = std::time::Instant::now();
+    let mut got_pong = false;
+    let mut reason = String::new();
     loop {
         tokio::select! {
             _ = ping.tick() => {
+                let quiet = last_reply.elapsed();
+                if got_pong && quiet > silence {
+                    reason = format!("Сервер не отвечает {} с — соединение разорвано", quiet.as_secs());
+                    break;
+                }
                 let t = started.elapsed().as_millis() as u64;
-                if ws.send(js(&C2S::Ping { ts: t })).await.is_err() { break; }
+                if !send_json(&mut ws, &C2S::Ping { ts: t }).await { break; }
             }
             req = rx.recv() => {
                 let Some(req) = req else {
-                    let _ = ws.close(None).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), ws.close(None)).await;
                     return String::new(); // отключились сами
                 };
                 match req {
                     CliReq::Cmd(cmd) => {
-                        if ws.send(js(&C2S::Cmd { cmd })).await.is_err() { break; }
+                        if !send_json(&mut ws, &C2S::Cmd { cmd }).await { break; }
                     }
                     CliReq::Upload(path) => {
                         let _ = up_tx.send((path, false));
@@ -767,12 +795,14 @@ async fn client_task(
             }
             msg = ws.next() => {
                 let Some(Ok(msg)) = msg else { break };
+                last_reply = std::time::Instant::now();
                 match msg {
                     Message::Text(t) => match serde_json::from_str::<S2C>(t.as_str()) {
                         Ok(S2C::State { state }) => { let _ = ev.send(CliEvent::State(state)); wake(); }
                         Ok(S2C::UploadOk { name }) => { let _ = ev.send(CliEvent::UploadOk(name)); wake(); }
                         Ok(S2C::UploadErr { name, msg }) => { let _ = ev.send(CliEvent::UploadErr { name, msg }); wake(); }
                         Ok(S2C::Pong { ts }) => {
+                            got_pong = true;
                             let ms = (started.elapsed().as_millis() as u64).saturating_sub(ts);
                             let _ = ev.send(CliEvent::Rtt(ms.min(u32::MAX as u64) as u32));
                             wake();
@@ -792,7 +822,7 @@ async fn client_task(
             }
         }
     }
-    "Соединение с сервером потеряно".into()
+    if reason.is_empty() { "Соединение с сервером потеряно".into() } else { reason }
 }
 
 /// Загрузчик файлов на сервер без управляющего соединения — для дублирования на резервный сервер.

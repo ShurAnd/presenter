@@ -626,6 +626,48 @@ async fn loopback_real_client_reports_server_disconnect() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_task_breaks_silent_connection_after_pongs_stop() {
+    // Тихая смерть канала: сервер ответил на первый пинг и замолчал, НЕ закрывая TCP
+    // (так выглядит пропавший Wi-Fi или закрытый NAT). Раньше клиент ждал, пока TCP
+    // сдастся сам, — автопереподключение не начиналось минутами. Теперь молчание
+    // дольше `silence` (здесь 800 мс) разрывает соединение самому — с этого события
+    // и начинается переподключение.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let peer = tokio::spawn(async move {
+        let (socket, _) = timeout(WAIT, listener.accept()).await.unwrap().unwrap();
+        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+        let hello = timeout(WAIT, ws.next()).await.unwrap().unwrap().unwrap();
+        assert!(matches!(hello, Message::Text(_)));
+        ws.send(js(&S2C::Welcome)).await.unwrap();
+        // Первый пинг — Pong, дальше читаем и молчим; соединение не закрываем.
+        let mut answered = false;
+        while let Some(Ok(msg)) = ws.next().await {
+            let Message::Text(text) = msg else { continue };
+            let Ok(C2S::Ping { ts }) = serde_json::from_str::<C2S>(text.as_str()) else { continue };
+            if !answered {
+                answered = true;
+                ws.send(js(&S2C::Pong { ts })).await.unwrap();
+            }
+        }
+    });
+    let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel::<CliReq>();
+    let (ev_tx, _ev_rx) = mpsc::channel();
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let ev = ev_tx.clone();
+    // Тишина — 800 мс, чтобы не ждать боевые 10 с; пинги идут раз в 2 с.
+    let task = tokio::spawn(async move {
+        client_task("127.0.0.1".into(), port, TEST_PASSWORD.into(), req_rx, &ev, &wake,
+            Duration::from_millis(800)).await
+    });
+    let reason = timeout(Duration::from_secs(6), task).await.unwrap().unwrap();
+    assert!(reason.contains("не отвечает"), "тихое молчание должно разрывать соединение: {reason}");
+    // Пока держим канал запросов живым — «отключились сами» не должно случиться.
+    drop(req_tx);
+    timeout(WAIT, peer).await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_real_uploader_reports_missing_file() {
     let server = Sandbox::new().await;
     let (tx, rx) = mpsc::channel();

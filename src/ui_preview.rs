@@ -173,7 +173,7 @@ impl App {
                     ui.add_sized([96.0, 20.0], egui::Label::new(RichText::new(time).size(12.0).color(Color32::from_gray(0x55))));
                     let size = egui::vec2(112.0, 0.0);
                     if m.state == 0 {
-                        if ui.add(cbutton("⏸ Пауза", BLUE).min_size(size)).clicked() {
+                        if ui.add(cbutton("Пауза", BLUE).min_size(size)).clicked() {
                             cmds.push(Cmd::PptMedia { id: m.id, action: MediaAction::Pause });
                         }
                     } else {
@@ -259,7 +259,7 @@ impl App {
                     if icon_button(ui, size, can_out, |p, c, fg| {
                         p.line_segment([c - egui::vec2(8.0, 0.0), c + egui::vec2(8.0, 0.0)], egui::Stroke::new(3.0_f32, fg));
                     })
-                    .on_hover_text("Мельче (клавиша «−»)")
+                    .on_hover_text("Мельче (клавиша «-»)")
                     .clicked()
                     {
                         cmd = Some(Cmd::Zoom { step: -1 });

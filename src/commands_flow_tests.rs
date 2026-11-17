@@ -1519,8 +1519,8 @@ fn ui_monitor_label_marks_primary_display_and_dimensions() {
     };
     let p = main.label(1);
     let s = second.label(2);
-    assert!(p.contains("1920×1080") && p.contains("основной"));
-    assert!(s.contains("2560×1440") && !s.contains("основной"));
+    assert!(p.contains("1920x1080") && p.contains("основной"));
+    assert!(s.contains("2560x1440") && !s.contains("основной"));
 }
 
 #[test]
@@ -2174,6 +2174,20 @@ fn stage8_server_detects_old_protocol_client() {
     a.ui.status.clear();
     stage8_server(&mut a, SrvEvent::Hello { version: env!("CARGO_PKG_VERSION").into() });
     assert!(a.ui.status.is_empty());
+}
+
+#[test]
+fn stage8_role_change_resets_show_cursor() {
+    let mut a = test_app();
+    a.apply(Cmd::Cursor { on: true });
+    assert!(a.stage.show_cursor);
+    // Конец сеанса оператора («Отключиться», запуск сервера) — флаг сбрасывается,
+    // иначе курсор останется видимым на показе окна, ставшего сервером.
+    a.disconnect();
+    assert!(!a.stage.show_cursor);
+    a.apply(Cmd::Cursor { on: true });
+    stage8_server(&mut a, SrvEvent::Started);
+    assert!(!a.stage.show_cursor);
 }
 
 #[test]

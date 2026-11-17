@@ -109,6 +109,23 @@ fn config_reads_null_servers_without_losing_other_settings() {
     assert!(c.servers.is_empty() && c.name.is_empty());
 }
 
+#[test]
+fn config_write_atomic_replaces_file_and_keeps_old_one_on_failure() {
+    let dir = std::env::temp_dir().join(format!("presentator_settings_atomic_{}", net::unique_prefix()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("presentator_settings.json");
+    std::fs::write(&path, r#"{"port":"14999"}"#).unwrap();
+    // Обычная запись: файл заменён, временного файла не остаётся.
+    config::write_atomic(&path, r#"{"port":"15000"}"#).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"port":"15000"}"#);
+    assert!(!path.with_extension("json.tmp").exists());
+    // Сбой посреди записи (временный файл не создаётся — там каталог): прежние настройки целы.
+    std::fs::create_dir(path.with_extension("json.tmp")).unwrap();
+    assert!(config::write_atomic(&path, r#"{"port":"1"}"#).is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), r#"{"port":"15000"}"#);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Переключение презентаций против запущенного `presentator --server`:
 /// TEST_FILES="a.pptx;b.pptx;c.pdf" TEST_SEQ="1,2,1,3,2" TEST_HOLD=4 cargo test --release e2e_switch -- --ignored --nocapture
 /// Печатает момент каждой команды (unix-мс), чтобы сопоставить со снимками экрана.

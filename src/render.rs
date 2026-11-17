@@ -783,7 +783,7 @@ mod tests {
         let v = viewport(aspect, (w as f32, h as f32), 3.0, (0.3, 0.6));
         let region = render_page(&pdf, PageKey { id: 0, page: 0, w, h, thumb: false, view: view_key(v) }).unwrap();
         let big = render_page(&pdf, PageKey { id: 0, page: 0, w: w * 3, h: h * 3, thumb: false, view: FULL_VIEW }).unwrap();
-        println!("страница {}×{}, кусок {:?} → {}×{}, крупная {}×{}", fit.size[0], fit.size[1], v, region.size[0], region.size[1], big.size[0], big.size[1]);
+        println!("страница {}x{}, кусок {:?} -> {}x{}, крупная {}x{}", fit.size[0], fit.size[1], v, region.size[0], region.size[1], big.size[0], big.size[1]);
         // Сравниваем по сетке точек: кусок против того же места крупной страницы.
         let (mut diff, mut n, mut inked) = (0u64, 0u64, 0u32);
         for gy in 1..40 {
@@ -823,7 +823,7 @@ mod tests {
             let tz = Instant::now();
             let view = view_key(viewport(16.0 / 9.0, (w as f32, h as f32), 3.0, (0.5, 0.5)));
             let img = render_page(&pdf, PageKey { id: 0, page, w, h, thumb: false, view }).unwrap();
-            println!("  целиком {full} мс; 300 %: {} мс, {}×{}", tz.elapsed().as_millis(), img.size[0], img.size[1]);
+            println!("  целиком {full} мс; 300 %: {} мс, {}x{}", tz.elapsed().as_millis(), img.size[0], img.size[1]);
             println!("страница {}: {} мс", page + 1, t.elapsed().as_millis());
         }
     }

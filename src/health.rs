@@ -406,7 +406,7 @@ mod win {
         if GetMonitorInfoW(m, &mut info).as_bool() {
             let r = info.rcMonitor;
             let primary = info.dwFlags & 1 != 0; // MONITORINFOF_PRIMARY
-            list.push(format!("{}×{}{}", r.right - r.left, r.bottom - r.top, if primary { ", основной" } else { "" }));
+            list.push(format!("{}x{}{}", r.right - r.left, r.bottom - r.top, if primary { ", основной" } else { "" }));
         }
         true.into()
     }
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn assess_levels() {
-        let h = HealthInfo { cpu: 50.0, ram_used_mb: 15_500, ram_total_mb: 16_000, disk_free_mb: 500, disk_total_mb: 100_000, monitors: vec!["1920×1080".into()], monitors_max: 2, ui_ok: true, ..Default::default() };
+        let h = HealthInfo { cpu: 50.0, ram_used_mb: 15_500, ram_total_mb: 16_000, disk_free_mb: 500, disk_total_mb: 100_000, monitors: vec!["1920x1080".into()], monitors_max: 2, ui_ok: true, ..Default::default() };
         let rows = assess(Some(&h), Some(20), Some(Duration::from_secs(1)));
         let lvl = |name: &str| rows.iter().find(|r| r.name == name).unwrap().level;
         assert_eq!(lvl("Оперативная память"), Level::Bad); // 97 %

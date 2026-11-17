@@ -10,10 +10,10 @@ pub struct Monitor {
 }
 
 impl Monitor {
-    /// Подпись для списка: «2: 3840×2160 (\\.\DISPLAY2)», у основного — «основной».
+    /// Подпись для списка: «2: 3840x2160 (\\.\DISPLAY2)», у основного — «основной».
     pub fn label(&self, n: usize) -> String {
         let (_, _, w, h) = self.rect;
-        format!("{n}: {w}×{h}{} ({})", if self.primary { ", основной" } else { "" }, self.device)
+        format!("{n}: {w}x{h}{} ({})", if self.primary { ", основной" } else { "" }, self.device)
     }
 }
 
@@ -123,7 +123,7 @@ mod stage9_tests {
         let m = Monitor {
             device: r"\\.\DISPLAY2".into(), rect: (-1920, 0, 1920, 1080), primary: false,
         };
-        assert_eq!(m.label(2), r"2: 1920×1080 (\\.\DISPLAY2)");
+        assert_eq!(m.label(2), r"2: 1920x1080 (\\.\DISPLAY2)");
         assert!(!m.label(2).contains("основной"));
         let primary = Monitor { primary: true, ..m };
         assert!(primary.label(1).contains("основной"));

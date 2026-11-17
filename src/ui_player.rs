@@ -30,7 +30,7 @@ impl App {
             .stroke(egui::Stroke::new(1.0_f32, ui_line()))
             .corner_radius(5.0)
             .inner_margin(6.0)
-            .fill(Color32::WHITE)
+            .fill(ui_surface())
             .show(ui, |ui| {
                 ui.set_min_size(ui.available_size());
                 if a.tracks.is_empty() {
@@ -132,7 +132,7 @@ impl App {
                 self.act(Cmd::AudioPrev);
             }
             let (label, color, cmd) = match (ins, if ins { a.insert_state } else { a.state }) {
-                (_, AudioState::Playing) => ("⏸ Пауза", BLUE, Cmd::AudioToggle),
+                (_, AudioState::Playing) => ("Пауза", BLUE, Cmd::AudioToggle),
                 (_, AudioState::Paused) => ("▶ Продолжить", GREEN, Cmd::AudioToggle),
                 _ => match sel.or(a.current).or(a.tracks.first().map(|t| t.id)) {
                     Some(id) => ("▶ Старт", GREEN, Cmd::AudioPlay { id }),

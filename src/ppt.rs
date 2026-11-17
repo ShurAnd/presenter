@@ -1133,6 +1133,15 @@ mod bridge {
             Ok(a)
         }
 
+        /// «Мягкие» настройки показа: неудача не должна ломать показ, но оставляем след
+        /// в журнале — иначе «курсор виден» или «PowerPoint спрашивает о сохранении»
+        /// оказываются без объяснений. Текст ошибки уже содержит имя свойства.
+        fn soft(what: &str, r: R<()>) {
+            if let Err(e) = r {
+                crate::jlog!("PowerPoint: {what}: {e}");
+            }
+        }
+
         fn handle(&mut self, req: Req) {
             match req {
                 Req::Open { sid, path, windowed, monitor, slides, width } => {
@@ -1147,8 +1156,9 @@ mod bridge {
                 Req::Close => self.close_show(),
                 Req::Cursor(c) => {
                     self.cursor = c;
+                    // Показа ещё нет (напоминание перед открытием) — применится при открытии.
                     if let Some(v) = self.win.as_ref().and_then(|w| w.obj("View").ok()) {
-                        let _ = v.put("PointerType", i(c));
+                        Self::soft("не удалось поменять видимость курсора — курсор на показе может быть виден", v.put("PointerType", i(c)));
                     }
                 }
                 Req::Zoom(n, width, file) => match self.zoom(n, width, &file) {
@@ -1213,15 +1223,16 @@ mod bridge {
             let ss = pres.obj("SlideShowSettings")?;
             // 1 — докладчиком (на весь экран), 2 — в окне.
             ss.put("ShowType", i(if windowed { 2 } else { 1 }))?;
-            let _ = ss.put("ShowPresenterView", i(0));
+            Self::soft("не удалось выключить режим докладчика — на экране показа может появиться панель докладчика", ss.put("ShowPresenterView", i(0)));
             let win = ss.obj("Run")?;
             self.win = Some(win.clone());
             // Настройки показа выше меняют презентацию. Помечаем её сохранённой: иначе при закрытии
             // PowerPoint спросит о сохранении файла, открытого только для чтения.
-            let _ = pres.put("Saved", i(-1));
+            Self::soft("не удалось пометить презентацию сохранённой — при закрытии PowerPoint может спросить о сохранении", pres.put("Saved", i(-1)));
             // Указатель мыши: скрыт или стрелка при движении — как выбрано в программе.
-            if let Ok(v) = win.obj("View") {
-                let _ = v.put("PointerType", i(self.cursor));
+            match win.obj("View") {
+                Ok(v) => Self::soft("не удалось настроить курсор слайд-шоу — курсор на показе может быть виден", v.put("PointerType", i(self.cursor))),
+                Err(e) => crate::jlog!("PowerPoint: нет вида показа для настройки курсора — курсор на показе может быть виден: {e}"),
             }
             Ok(())
         }
@@ -1229,11 +1240,13 @@ mod bridge {
         fn close_show(&mut self) {
             // Exit у показа файла, открытого без окна, закрывает и сам файл; Close — на всякий случай.
             if let Some(w) = self.win.take() {
-                if let Ok(v) = w.obj("View") {
-                    let _ = v.call("Exit", &[]);
+                match w.obj("View") {
+                    Ok(v) => Self::soft("не удалось завершить показ — окно слайд-шоу может остаться на экране", v.call("Exit", &[]).map(|_| ())),
+                    Err(e) => crate::jlog!("PowerPoint: нет вида показа, чтобы завершить — окно слайд-шоу может остаться на экране: {e}"),
                 }
             }
             if let Some(p) = self.pres.take() {
+                // После Exit файл обычно уже закрыт — ошибки Saved/Close здесь не значимы, молчим.
                 let _ = p.put("Saved", i(-1));
                 let _ = p.call("Close", &[]);
             }
@@ -1284,7 +1297,7 @@ mod bridge {
                 }
                 Some(Req::Show) => {
                     // Сцена с фоном отпустила экран — выводим слайд-шоу на передний план.
-                    let _ = win.call("Activate", &[]);
+                    Self::soft("не удалось вывести слайд-шоу на передний план", win.call("Activate", &[]).map(|_| ()));
                 }
                 Some(Req::Media(action, id)) => {
                     // Видео на слайде — без мыши: через проигрыватель слайд-шоу.
@@ -1300,7 +1313,7 @@ mod bridge {
             // Опрос PowerPoint лишний раз не трогаем — он может как раз менять слайд.
             if req.is_some() {
                 if let Some(p) = &self.pres {
-                    let _ = p.put("Saved", i(-1));
+                    Self::soft("не удалось пометить презентацию сохранённой", p.put("Saved", i(-1)));
                 }
             }
             let cur = view.int("CurrentShowPosition")?.max(0) as usize;

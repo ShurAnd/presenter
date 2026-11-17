@@ -112,3 +112,16 @@ pub(crate) fn merge_servers(ours: &mut Vec<SavedServer>, other: Vec<SavedServer>
     }
     ours.truncate(MAX_SERVERS);
 }
+
+/// Записать файл настроек через временный файл и переименование — как `save_list` у списка:
+/// сбой посреди записи (нехватка места, выключение) оставит прежний файл целым.
+pub(crate) fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    match std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}

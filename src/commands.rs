@@ -122,6 +122,17 @@ impl App {
         }
     }
 
+    /// «Показать курсор» — настройка одного сеанса роли: смена роли (конец сеанса
+    /// оператора, запуск сервера) сбрасывает её, как и перезапуск программы.
+    /// Иначе включённый раньше флаг останется на весь сеанс и курсор будет виден
+    /// на показе окна, ставшего сервером (в операторе галка управляет чужим
+    /// сервером, а локальный флаг переживает смену роли).
+    pub(crate) fn reset_show_cursor(&mut self) {
+        self.stage.show_cursor = false;
+        self.ppt.host.set_cursor(false);
+        video::set_cursor(false);
+    }
+
     pub(crate) fn apply(&mut self, cmd: Cmd) {
         // В журнал — все команды, кроме ползунков (громкость, перемотка, сдвиг увеличенного слайда).
         if !matches!(cmd, Cmd::AudioVolume { .. } | Cmd::AudioSeek { .. } | Cmd::Pan { .. }) {
@@ -1139,6 +1150,9 @@ impl App {
             match ev {
                 SrvEvent::Started => {
                     self.net.server_online = true;
+                    // Окно стало сервером: «Показать курсор» мог остаться включённым
+                    // с другого сеанса этого окна — сбрасываем, как при запуске программы.
+                    self.reset_show_cursor();
                     // Сервер восстанавливает свой список (если в окне ещё ничего нет).
                     if self.session.items.is_empty() && self.player.engine.tracks.is_empty() {
                         self.load_list(ctx);

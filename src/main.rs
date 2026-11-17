@@ -683,7 +683,8 @@ impl App {
                     return;
                 }
             }
-            if let Err(e) = std::fs::write(&path, s) {
+            // Через временный файл: при сбое посреди записи прежние настройки останутся целыми.
+            if let Err(e) = config::write_atomic(&path, &s) {
                 jlog!("Не удалось сохранить настройки: {e}");
             }
         }

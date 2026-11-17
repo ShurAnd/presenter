@@ -177,7 +177,7 @@ pub(crate) const HELP: &[(&str, &[(&str, &str)])] = &[
         ("Цифры, затем Enter", "Перейти к слайду с этим номером (номер виден внизу окна, на экране показа — нет). Или поле «Слайд №» и «Перейти»."),
         ("Shift+0", "Закрыть показ."),
         ("Показать курсор", "Галочка внизу, рядом со «Справкой»: курсор мыши на экране показа виден, пока мышь двигают, и сам прячется через 3 с. В PowerPoint так можно щёлкнуть по видео в слайде. Работает и у клиента; после перезапуска — снова выключено."),
-        ("Увеличение слайда", "Справа от превью: «+» / «−» — крупнее и мельче (до 400 %), стрелки — сдвинуть увеличенный слайд, кнопка в центре — снова весь слайд. На миниатюре «Сейчас» оранжевой рамкой — то, что видно на экране. С клавиатуры: «+» / «−», Ctrl+стрелки. Перелистнули — слайд снова целиком. PDF, картинки и PowerPoint; у PowerPoint увеличенный слайд — неподвижная картинка (анимация и видео в слайде не идут), первое увеличение слайда — через долю секунды."),
+        ("Увеличение слайда", "Справа от превью: «+» / «-» — крупнее и мельче (до 400 %), стрелки — сдвинуть увеличенный слайд, кнопка в центре — снова весь слайд. На миниатюре «Сейчас» оранжевой рамкой — то, что видно на экране. С клавиатуры: «+» / «-», Ctrl+стрелки. Перелистнули — слайд снова целиком. PDF, картинки и PowerPoint; у PowerPoint увеличенный слайд — неподвижная картинка (анимация и видео в слайде не идут), первое увеличение слайда — через долю секунды."),
         ("Двойной Esc", "На экране показа: закрыть показ. На часах или таймере — вернуть фон. На фоне — убрать сцену. Одиночный Esc ничего не делает."),
         ("Кнопка с клавиатурой", "Зелёная — клавиши в окне программы управляют показом. Серая — не управляют (на самом экране показа клавиши работают всегда)."),
     ]),
@@ -431,7 +431,7 @@ impl App {
         let frame = egui::Frame::new().fill(RED).inner_margin(egui::Margin::symmetric(10, 6));
         egui::TopBottomPanel::top("alarm").frame(frame).show(ctx, |ui| {
             // Две строки: полный текст проблемы, под ним кнопки — ничего не перекрывается.
-            let text = format!("⚠ Проблема на сервере — {}", problems.join("; "));
+            let text = format!("Проблема на сервере — {}", problems.join("; "));
             ui.label(RichText::new(&text).color(Color32::WHITE).strong());
             ui.horizontal(|ui| {
                 if let Some(r) = &reserve {
@@ -722,7 +722,7 @@ impl App {
                 let (t, c) = match v.state {
                     VideoState::Loading => ("Подготовка…", GRAY),
                     VideoState::Armed => ("▶ Старт видео", GREEN),
-                    VideoState::Playing => ("⏸ Пауза видео", BLUE),
+                    VideoState::Playing => ("Пауза видео", BLUE),
                     VideoState::Paused => ("▶ Продолжить видео", GREEN),
                 };
                 if ui.add_enabled(v.state != VideoState::Loading, cbutton(t, c)).on_hover_text("Пробел").clicked() {
@@ -828,7 +828,7 @@ impl App {
                 ui.label("мин : сек");
             }
             ui.add_space(6.0);
-            let (label, color) = if t.running { ("⏸ Пауза", BLUE) } else { ("▶ Старт", GREEN) };
+            let (label, color) = if t.running { ("Пауза", BLUE) } else { ("▶ Старт", GREEN) };
             if btn(ui, label, color).on_hover_text("Пробел").clicked() {
                 self.act(Cmd::TimerRun { run: !t.running });
             }
@@ -1286,7 +1286,7 @@ impl App {
                         self.ui.version_hidden = true;
                     }
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(egui::Label::new(RichText::new(format!("⚠ {text}")).color(Color32::from_gray(0x33)).strong()).wrap());
+                        ui.add(egui::Label::new(RichText::new(text).color(Color32::from_gray(0x33)).strong()).wrap());
                     });
                 });
             });
